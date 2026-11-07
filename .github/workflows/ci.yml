@@ -20,3 +20,31 @@ jobs:
           persist-credentials: false
       - name: Validate documentation
         run: python3 tools/check_docs.py
+
+  llm-acceptance:
+    name: llm-acceptance
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Configure Rust
+        run: rustup component add clippy rustfmt && rustup target add wasm32-unknown-unknown
+      - name: Check Rust formatting
+        run: cargo fmt --all --check
+      - name: Run Clippy
+        run: cargo clippy -p nncoss-llm --all-targets -- -D warnings
+      - name: Test native runtime
+        run: cargo test -p nncoss-llm && cargo test -p nncoss-llm --release
+      - name: Test model exporter validation
+        run: python3 -m unittest discover -s tools -p "test_*.py"
+      - name: Build native runtime
+        run: cargo build -p nncoss-llm --release
+      - name: Build WASM runtime
+        run: cargo build -p nncoss-llm --release --target wasm32-unknown-unknown
+      - name: Install WASM validation runtime
+        run: python3 -m pip install wasmtime==50.0.1
+      - name: Compare native and WASM inference
+        run: python3 tools/check_wasm_llm.py

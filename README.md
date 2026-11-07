@@ -13,7 +13,7 @@ A WebAssembly-based neural network framework for any platform and language, with
 ![deployment](https://img.shields.io/badge/deployment-WASM%20%2B%20native-654ff0)
 ![interface](https://img.shields.io/badge/interface-language%20neutral-dea584)
 
-[项目定位](#项目定位) · [编译流水线](#编译流水线) · [多语言调用](#多语言调用) · [扩展机制](#扩展机制) · [快速开始](#快速开始) · [引擎](#引擎) · [训练](#训练) · [推理](#推理) · [模型迁移](#模型迁移) · [路线图](#路线图)
+[项目定位](#项目定位) · [编译流水线](#编译流水线) · [多语言调用](#多语言调用) · [扩展机制](#扩展机制) · [使用流程草案](#使用流程草案) · [引擎](#引擎) · [训练](#训练) · [推理](#推理) · [WASM LLM 原型](#wasm-llm-推理原型) · [模型迁移](#模型迁移) · [路线图](#路线图)
 
 </div>
 
@@ -25,7 +25,9 @@ WASM 承载可移植的计算与扩展模块；LLVM 负责优化与目标代码�
 
 「枢」是门轴，也是中枢。吻灵枢想做模型的枢纽：外部模型迁移进来，自己的模型训练出来，最终都能部署出去；同时保持克制，只接管你不想写的部分，点到为止。
 
-> **项目状态**：当前仓库包含设计文档及文档验收工具，尚无可安装的框架软件包或可运行的模型示例。下文的能力、平台、API 与命令均为设计目标或使用草案，实际支持情况将随实现与测试公布。
+> **项目状态**：当前仓库包含设计文档、验收工具及 `nncoss-llm` 早期原型。该原型已能构建并执行 WASM decoder-only 推理，但尚无可安装的完整框架软件包、浏览器宿主示例或已完成验收的公开模型。除 [WASM LLM 原型](#wasm-llm-推理原型)明确列出的能力外，下文 API、平台与命令仍为设计目标或使用草案。
+>
+> **当前优先级**：框架主线先完成可复现的最小纵向原型，以 f32 张量、标量 CPU 内核和固定结构的 MLP 为边界，验证 WASM 与原生 CPU 的数值一致性，再打通 MNIST 训练闭环。`nncoss-llm` 作为独立实验原型提前验证 LLM 会话、KV Cache 与 WASM ABI，不代表框架 v0.1 已完成；GPU、通用迁移和更多平台仍在核心链路验证后分批推进。
 
 ## 项目定位
 
@@ -42,7 +44,7 @@ WASM 承载可移植的计算与扩展模块；LLVM 负责优化与目标代码�
 
 ## 核心模块
 
-| 模块 | 负责什么 | 关键能力 |
+| 模块 | 规划职责 | 规划能力 |
 |------|----------|----------|
 | [引擎](#引擎) | 一切计算的地基 | 张量、可移植算子内核、反向自动微分、CPU / GPU 调度 |
 | [训练](#训练) | 把模型训出来 | 层与损失、优化器与学习率调度、Trainer、回调与断点、浏览器内微调 |
@@ -126,9 +128,9 @@ WASM 扩展的 CPU 可移植性与 GPU 内核兼容性分别声明。GPU 编译�
 
 AI 编写的扩展同样只使用 Rust。人类可以选择 C/C++ 或其他语言，按上述任一路径接入。
 
-## 快速开始
+## 使用流程草案
 
-> 以下是实现完成后的预期使用流程，当前命令与示例尚不可运行，仓库地址为占位符。
+> 以下是实现完成后的预期使用流程，用于说明设计目标；当前命令与示例尚不可运行，仓库地址为占位符。
 
 开发 Rust 实现计划使用 Rust 1.85+（edition 2024）；构建 `nncoss-compiler` 另需兼容版本的 LLVM 开发库（初步以 LLVM 20+ 为基础，具体版本随原型验证固定）。使用预编译 WASM 或原生库的应用只需对应运行环境和语言绑定。以下 Rust 与浏览器示例展示预期开发流程，浏览器示例另需 Node.js：
 
@@ -160,7 +162,7 @@ nncoss = { git = "<仓库地址>" }
 
 ## 引擎
 
-引擎提供张量计算与自动微分，在 WASM、原生 CPU 与支持的 GPU 后端保持算子语义一致，并按数据类型与运算定义数值误差容限。其余模块及各语言接口都构建于此。
+引擎规划提供张量计算与自动微分，目标是在 WASM、原生 CPU 与支持的 GPU 后端保持算子语义一致，并按数据类型与运算定义数值误差容限。其余模块及各语言接口都规划构建于此。
 
 - **张量**：f32 / f16 / bf16 / i8 等数据类型；步长视图、广播与切片，转置等视图变换零拷贝。
 - **算子内核**：AI 使用 Rust 编写，人类可用其他语言通过扩展协议提供实现。基础路径提供标量实现，WASM SIMD 与原生向量化是可选优化；原生 AOT 根据目标优化，具体向量宽度与性能以生成代码和基准验证。符合 GPU 内核约束的实现可映射为并行线程。各后端均与标量参考实现对拍测试。
@@ -199,6 +201,8 @@ assert_eq!(grads[&w].dims(), [784, 10]);
 ```
 
 ## 训练
+
+训练模块规划包括以下能力：
 
 - **层与模型**：Linear、Conv2d、BatchNorm / LayerNorm、Embedding、多头注意力等；`#[derive(Module)]` 自动收集参数，一行保存与加载。
 - **损失与优化器**：交叉熵、MSE 等损失；SGD、Adam、AdamW；Warmup、余弦退火等学习率调度。
@@ -271,6 +275,8 @@ epoch 9/10 ━━━━━━━━━━━━━━━━━━━━ 430/430 
 
 ## 推理
 
+推理模块规划包括以下能力：
+
 - **图捕获与优化**：把模型前向捕获为静态计算图，做常量折叠、算子融合（如 Conv + BN + ReLU）与死代码消除。
 - **整模型编译**：将优化后的计算图、权重与所需内核打包为 WASM；再按部署需要通过 LLVM 编译为目标平台的原生二进制。GPU 路径编译符合约束的内核，并保留 CPU 侧的模型控制与设备调度。
 - **内存规划**：按张量生命周期复用缓冲区，压低峰值内存——这对内存受限的 WASM 尤其重要。
@@ -336,9 +342,101 @@ console.log("识别结果：", logits.argmax());
 
 需要自定义前后处理（分词、采样等）时，可将 Rust 或人类编写的其他语言实现接入为 WASM 扩展、原生扩展或宿主回调。规划中的 `examples/web-poetry` 将展示模型与前后处理的组合部署。
 
+## WASM LLM 推理原型
+
+`crates/nncoss-llm` 参考 [ncnn 的 KV Cache 设计](https://github.com/Tencent/ncnn/wiki/kvcache)与 [ncnn_llm](https://github.com/futz12/ncnn_llm) 的嵌入／decoder／LM Head 拆分方式。当前可运行代码是 Rust 标量参考后端，采用会话持有的 KV Cache、prefill 与单 token decode，并复用绑定嵌入权重作为 LM Head；目标部署架构默认复用 ncnn 的 WASM 图执行与 KV Cache，但 ncnn 后端尚未接入，现有 `.wasm` 产物不包含 ncnn。
+
+### 已实现范围
+
+| 能力 | 当前实现 |
+|------|----------|
+| 模型结构 | 单 batch decoder-only；RMSNorm、RoPE、GQA、SwiGLU；可选 QKV bias、QK norm；绑定或独立 LM Head |
+| 数值与算子 | f32 标量 CPU 参考路径；行主序矩阵乘、稳定 softmax 与 SiLU |
+| 会话 | 多 token prefill、单 token decode、KV Cache 几何增长与容量复用、reset、EOS 停止 |
+| 采样 | 贪心、temperature、top-k、top-p；可复现的 SplitMix64 随机序列 |
+| 调用接口 | Rust API 与版本为 1 的 WASM／原生 C ABI；模型从内存加载，会话独立持有权重生命周期 |
+| 验证 | 原生单元测试、增量解码与无缓存参考前向对拍、同一 tiny decoder 的原生／WASM 数值对拍 |
+
+当前验收仅覆盖仓库生成的 tiny decoder，不代表某个公开的 Llama 或 Qwen 模型已经通过数值与性能验收。架构兼容与模型支持必须分别验证。
+
+### ncnn 后端与优化边界
+
+- **默认复用通用能力**：嵌入、矩阵乘、归一化、注意力和 KV Cache 优先使用 ncnn 已支持的 WASM 实现，不再为部署后端重复编写通用算子。Rust 侧负责版本化 ABI、模型与会话管理；如需额外 C/C++ 桥接，由人类按仓库约定维护。
+- **保留参考后端**：当前 Rust 标量路径作为数值参考和最小验收工具，不作为高性能部署承诺。ncnn 后端接入后，需在同一模型与输入上与参考后端逐层或分阶段对拍。
+- **分离构建能力**：ncnn 的基础、WASM SIMD 与多线程构建分别声明和验收，不能把某一构建的结果外推到全部浏览器。
+- **按热点优化**：先分别测量 prefill 延迟、decode ms/token、tokens/s、峰值内存和模块体积，再针对表现不达标的 GEMM、注意力、KV Cache 或采样路径增加自定义 WASM kernel；通用路径不因预设判断而重写。
+- **优化必须可验收**：自定义 kernel 需保留回退路径，并通过标量参考对拍和同输入基准；至少报告相对 ncnn 基线的延迟、吞吐与内存变化。
+
+当前尚未完成 ncnn 后端接入和性能基准，因此本节为实施边界，不是已有性能结果。
+
+### 构建与验收
+
+```bash
+cargo test -p nncoss-llm
+cargo build -p nncoss-llm --release
+rustup target add wasm32-unknown-unknown
+cargo build -p nncoss-llm --release --target wasm32-unknown-unknown
+```
+
+WASM 产物位于 `target/wasm32-unknown-unknown/release/nncoss_llm.wasm`。安装 Python `wasmtime==50.0.1` 后，可以实际执行原生与 WASM 跨目标验收：
+
+```bash
+python3 tools/check_wasm_llm.py
+```
+
+该工具是验收脚本而非 Python 绑定，依次覆盖模型加载、prefill、采样、logits 复制、decode、reset，以及模型句柄释放后的会话生命周期。
+
+### 导出模型
+
+`tools/export_llm.py` 将具有常见 Llama／Qwen 权重命名的本地 safetensors 模型转换为 `.nncossllm`。导出环境需要 `torch` 与 `safetensors`：
+
+```bash
+python3 tools/export_llm.py --model /path/to/local-model --output model.nncossllm
+```
+
+导出器不加载 `.pt/.pth`，仅接受 `model_type` 为 `llama`、`qwen2` 或 `qwen3` 的已知 HalfSplit RoPE 配置，并按名称和形状写入 f32 权重；导出日志会记录该 RoPE 约定。当前拒绝 RoPE scaling、partial rotary 和 sliding window attention；Tokenizer、聊天模板与文本解码由调用方处理。`.nncossllm` 是版本为 1 的原型格式，尚未承诺跨版本兼容。
+
+### Rust 调用
+
+```rust
+use std::sync::Arc;
+use nncoss_llm::{Model, SamplingConfig, Session};
+
+fn generate(model_bytes: &[u8]) -> nncoss_llm::Result<Vec<u32>> {
+    let model = Arc::new(Model::from_bytes(model_bytes)?);
+    let mut session = Session::new(model, 4096)?;
+    session.set_sampler(SamplingConfig {
+        temperature: 0.7,
+        top_k: 40,
+        top_p: 0.9,
+    }, 42)?;
+
+    let prompt = vec![1, 2, 3];
+    session.generate(&prompt, 128, &[4])
+}
+```
+
+### WASM ABI
+
+宿主先通过 `nncoss_llm_alloc` 分配线性内存并写入模型，再调用 `nncoss_llm_model_load`；加载后可释放输入缓冲区。`nncoss_llm_session_new` 创建独立会话，随后循环调用 `nncoss_llm_prefill`、`nncoss_llm_sample` 与 `nncoss_llm_decode`。若采样到 EOS，宿主停止循环且不再 decode 该 token。达到长度上限暂停时，最后一个已采样 token 尚未 decode；恢复同一会话前必须先 decode 它，或 reset 后重建上下文。Rust `Session::generate` 会自动提交所有返回的非 EOS token。
+
+| 接口 | 用途 |
+|------|------|
+| `nncoss_llm_abi_version` / `nncoss_llm_last_error` | 查询 ABI 版本与当前线程最近的错误消息 |
+| `nncoss_llm_alloc` / `nncoss_llm_dealloc` | 分配与释放供宿主写入的线性内存 |
+| `nncoss_llm_model_load` / `nncoss_llm_model_free` | 加载模型与释放模型句柄 |
+| `nncoss_llm_session_new` / `nncoss_llm_session_free` | 创建与释放会话；会话在内部共享模型权重 |
+| `nncoss_llm_prefill` / `nncoss_llm_decode` | 推进提示词与生成 token |
+| `nncoss_llm_set_sampler` / `nncoss_llm_sample` | 配置采样并从最近 logits 选择 token |
+| `nncoss_llm_copy_logits` / `nncoss_llm_session_position` / `nncoss_llm_session_reset` | 读取 logits、查询位置与重置会话 |
+
+返回状态码的操作以 0 表示成功、负数表示失败；`nncoss_llm_alloc` 分配失败返回空指针。错误指针在下一次 API 调用前有效。原生 release 的内部 panic 经 unwind 映射为 `-99`；`wasm32-unknown-unknown` 的内部 panic 按目标约定使当前调用 trap，不能依赖 `catch_unwind` 恢复。宿主必须使用匹配的分配长度释放缓冲区，不得并发调用同一会话。释放模型句柄不会销毁仍被会话引用的权重。
+
+当前尚未实现量化、WASM SIMD、多线程、GPU、浏览器 JavaScript 宿主和流式文本绑定。f32 权重约占每个参数 4 字节，模型、KV Cache 与临时张量必须共同满足 wasm32 地址空间及宿主内存限制。
+
 ## 示例模型
 
-每个示例模型计划提供完整的参考实现：模型定义（位于 `nncoss-models`）、训练与推理程序、测试，部分附浏览器演示。它们既是教程，也是各模块的验收标准；另需验证同一模型通过 WASM 接口与原生 C ABI 被不同语言调用。
+每个示例模型计划提供完整的参考实现：模型定义（位于 `nncoss-models`）、训练与推理程序、测试，部分附浏览器演示。实现完成后，它们将同时作为教程与各模块的验收标准；另需验证同一模型通过 WASM 接口与原生 C ABI 被不同语言调用。
 
 | 模型 | 任务 | 数据 / 权重来源 | 重点展示 |
 |------|------|-----------------|----------|
@@ -357,7 +455,7 @@ cargo run --release --example poetry -- generate --prompt "心有灵犀"
 
 ## 模型迁移
 
-迁移不只是「把权重读进来」：键名要对得上，布局要转换，数值要一致。吻灵枢把这三步都做成了工具。
+迁移不只是「把权重读进来」：键名要对得上，布局要转换，数值要一致。吻灵枢规划将这三步整合为工具，并以参考实现和数值对拍验证迁移结果。
 
 - **多种来源**：safetensors（PyTorch / Hugging Face）、PyTorch `.pt` / `.pth`（只解析张量数据，不执行任意代码）、ONNX 计算图、Hugging Face Hub（`config.json` + 权重）。
 - **映射与转换**：内置常见模型的键名映射规则，也可用正则自定义；自动处理转置、NCHW / NHWC 布局、QKV 拆分与合并、数据类型转换。
@@ -428,13 +526,16 @@ nncoss migrate resnet50.safetensors --model resnet50 \
 - **按需裁剪**：只编译用到的内核，借助 LLVM 的 LTO 与死代码消除，产物保持精简。
 - **中文优先**：文档与示例中文先行；形状不匹配、设备不一致等常见错误附带中文排查建议。
 
-## 项目结构（规划）
+## 项目结构
+
+`crates/nncoss-llm` 为当前已实现的早期原型，其余模块、绑定和示例目录仍为规划结构。
 
 ```text
 nncoss/
 ├── Cargo.toml            # workspace，同时是门面 crate nncoss
 ├── src/                  # 门面：统一 API，按 feature 组合各模块
 ├── crates/
+│   ├── nncoss-llm/       # 已实现的 f32 decoder-only WASM／原生推理原型
 │   ├── nncoss-engine/    # 引擎：张量、自动微分、内存管理、设备调度
 │   ├── nncoss-kernels/   # 内置算子与参考实现：AI 使用 Rust，编译为 WASM
 │   ├── nncoss-compiler/  # 编译器：WASM → LLVM IR → CPU 机器码 / GPU 内核
@@ -456,11 +557,13 @@ nncoss/
 
 ## 路线图
 
-- [ ] **v0.1 可移植核心与原生编译**：f32 张量、逐元素 / 归约 / 矩阵乘内核、接口草案；WASM 执行与 LLVM 原生 AOT，覆盖可执行文件和库产物。验收：同一模块在 WASM 与已支持原生 CPU 上通过数值对拍
-- [ ] **v0.2 多语言调用与扩展**：版本化 WASM 接口和 C ABI、语言绑定、WASM 扩展与原生扩展注册、宿主回调。验收：至少两种宿主语言调用同一模型并使用同一 WASM 算子扩展；非 Rust 语言绑定由人类贡献
-- [ ] **v0.3 训练**：自动微分、常用层与损失、SGD / AdamW、Trainer、断点与 safetensors 读写。验收：MLP / LeNet-5 训练、推理与断点恢复
+路线图按可验证的纵向切片推进：每个阶段以可运行产物、可复现测试和明确的支持范围为完成标准。后续能力可以先行设计，但在对应验收完成前不作为已支持功能宣传。
+
+- [ ] **v0.1 最小计算与双路径验证**：限定 f32 张量、逐元素 / 归约 / 矩阵乘标量内核和固定结构 MLP 前向计算，形成最小张量与会话接口草案；实现一种 WASM 运行时路径和一个原生 CPU 的 LLVM AOT 可执行产物。验收：同一组输入与权重在两条路径上通过数值对拍，并记录目标特性、工具链版本和误差容限
+- [ ] **v0.2 MNIST 训练闭环**：实现反向自动微分、Linear、交叉熵、SGD、数据加载、基础训练循环与断点保存。验收：MLP 在 MNIST 上完成训练、断点恢复和推理，同一模型在 WASM 与已支持原生 CPU 上获得容差内一致的结果
+- [ ] **v0.3 多语言调用与扩展**：提供版本化 WASM 接口和 C ABI，补齐原生动态库与静态库，加入语言绑定、WASM 扩展与原生扩展注册、宿主回调。验收：至少两种宿主语言调用同一 MNIST 模型并使用同一 WASM 算子扩展；非 Rust 语言绑定由人类贡献
 - [ ] **v0.4 推理与部署**：图捕获与优化、整模型 WASM 编译、原生模型库与可执行产物、推理会话。验收：同一模型经浏览器、原生程序及外部语言绑定获得容差内一致的结果
-- [ ] **v0.5 模型迁移**：PyTorch / Hugging Face / ONNX 支持范围、映射规则、数值校验与迁移工具。验收：ResNet-50 / BERT 参考模型迁移及逐层校验
+- [ ] **v0.5 模型迁移**：明确 PyTorch / Hugging Face / ONNX 支持范围，实现映射规则、数值校验与迁移工具。验收：ResNet-50 / BERT 参考模型迁移及逐层校验
 - [ ] **v0.6 GPU 与高级推理**：按后端逐步验证内核子集，接入 NVPTX / AMDGPU / SPIR-V，推进 f16、INT8 与 KV Cache。验收：受支持算子的 CPU / GPU 对拍、训练与推理基准
 - [ ] **v1.0 稳定**：冻结公开 API 与 ABI，发布平台及扩展兼容性矩阵、中文文档和多语言接入教程
 - **持续扩展**：移动与嵌入式平台适配、更多语言绑定、Apple GPU 与浏览器 WebGPU 路径、riscv64 向量扩展调优
@@ -508,7 +611,7 @@ AI 协作的仓库规则见 [AGENTS.md](AGENTS.md)。当前文档阶段的检查
 
 ## 致谢
 
-吻灵枢的设计借鉴了 Rust 生态中的 [burn](https://github.com/tracel-ai/burn)、[candle](https://github.com/huggingface/candle) 与 [tract](https://github.com/sonos/tract)；WASM 到本机代码的编译思路参考了 [WAMR](https://github.com/wasm-micro-runtime/wasm-micro-runtime)、[WasmEdge](https://github.com/WasmEdge/WasmEdge) 等基于 LLVM 的 AOT 编译器；整个项目构建于 [LLVM](https://llvm.org/) 之上，在此致谢。
+吻灵枢的设计借鉴了 Rust 生态中的 [burn](https://github.com/tracel-ai/burn)、[candle](https://github.com/huggingface/candle) 与 [tract](https://github.com/sonos/tract)；LLM 会话与 KV Cache 原型参考了 [ncnn](https://github.com/Tencent/ncnn) 和 [ncnn_llm](https://github.com/futz12/ncnn_llm)；WASM 到本机代码的编译思路参考了 [WAMR](https://github.com/wasm-micro-runtime/wasm-micro-runtime)、[WasmEdge](https://github.com/WasmEdge/WasmEdge) 等基于 LLVM 的 AOT 编译器；整个项目构建于 [LLVM](https://llvm.org/) 之上，在此致谢。
 
 ## 许可证
 

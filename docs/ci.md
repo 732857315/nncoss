@@ -25,6 +25,8 @@
 - 使用 `python3 -m unittest discover -s tools -p "test_*.py"` 验证导出器拒绝不支持的 bias，并检查 QKV bias 与 QK norm 的跨层一致性。
 - 分别构建原生与 `wasm32-unknown-unknown` 发布产物。
 - 使用 Python `wasmtime==50.0.1` 执行 `tools/check_wasm_llm.py`，读取已提交的 tiny decoder 夹具，比较原生与 WASM 的 prefill、采样、decode 和 reset 行为及 logits，以及各错误路径的状态码与错误消息。
+- Rust 集成测试读取 6 组 Hugging Face golden 夹具，验证 Llama/Qwen2/Qwen3 合成模型的逐位置 logits、prefill 切分与贪心生成；CI 另执行 `tools/check_golden_llm.py`，对原生和 WASM 运行同一组独立参考数据。该检查只依赖 `wasmtime`，不安装 PyTorch。
+- 使用 `tools/make_golden_llm.py` 重新生成夹具时，需在仓库外环境安装 `tools/golden_requirements.txt` 的固定依赖；生成器会复现 Hugging Face f64 参考并运行反向变异与不支持检查点拒绝测试。
 
 本地执行完整 LLM 验收需先安装 Rust 的 `wasm32-unknown-unknown` 目标，构建两个发布产物，并在 Python 环境安装对应版本的 `wasmtime`。真实模型导出工具另需 `torch` 与 `safetensors`，默认 CI 不下载公开模型；tiny decoder 对拍通过不代表任何具体公开模型已经完成数值或性能验收。`bench` 示例与 `tools/bench_wasm_llm.py` 仅用于本地记录基线，不属于 CI 检查。
 

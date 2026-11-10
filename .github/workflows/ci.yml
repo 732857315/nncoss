@@ -48,3 +48,5 @@ jobs:
         run: python3 -m pip install wasmtime==50.0.1
       - name: Compare native and WASM inference
         run: python3 tools/check_wasm_llm.py
+      - name: Compare native and WASM against PyTorch goldens
+        run: python3 tools/check_golden_llm.py

@@ -355,7 +355,7 @@ console.log("识别结果：", logits.argmax());
 | 会话 | 多 token prefill、单 token decode、KV Cache 几何增长与容量复用、reset、EOS 停止 |
 | 采样 | 贪心、temperature、top-k、top-p；可复现的 SplitMix64 随机序列 |
 | 调用接口 | Rust API 与版本为 1 的 WASM／原生 C ABI；模型从内存加载，会话独立持有权重生命周期 |
-| 验证 | 原生单元测试、增量解码与无缓存参考前向对拍、同一 tiny decoder 的原生／WASM 数值对拍 |
+| 验证 | 原生单元测试；手算 RoPE 旋转（两种布局、多频率）与 GQA 头映射；增量解码与无缓存参考前向在多层 GQA 模型的绑定／独立 LM Head、QKV bias、QK norm 与 RoPE 布局全部组合上对拍；同一 tiny decoder 夹具的原生／WASM 数值与错误路径对拍 |
 
 当前验收仅覆盖仓库生成的 tiny decoder，不代表某个公开的 Llama 或 Qwen 模型已经通过数值与性能验收。架构兼容与模型支持必须分别验证。
 
@@ -384,7 +384,20 @@ WASM 产物位于 `target/wasm32-unknown-unknown/release/nncoss_llm.wasm`。安�
 python3 tools/check_wasm_llm.py
 ```
 
-该工具是验收脚本而非 Python 绑定，依次覆盖模型加载、prefill、采样、logits 复制、decode、reset，以及模型句柄释放后的会话生命周期。
+该工具是验收脚本而非 Python 绑定，依次覆盖模型加载、prefill、采样、logits 复制、decode、reset，以及模型句柄释放后的会话生命周期；并在两个目标上比较截断模型、越界 token、未 prefill 读取 logits、输出缓冲区过小和非法采样参数的错误码与错误消息。tiny decoder 来自已提交的夹具 `crates/nncoss-llm/tests/fixtures/tiny_v1.nncossllm`，Rust 单元测试会确认测试模型构造器与该夹具逐字节一致。
+
+增量解码对拍中的无缓存参考前向与被测路径共享同一组算子实现，只能证明 KV Cache 与会话状态正确；RoPE 与 GQA 另有手算用例，但整体前向尚未与 PyTorch 等独立实现对拍。
+
+### 基准
+
+`bench` 示例生成确定性的合成 decoder（tiny、small 两档，绑定 LM Head、带 QKV bias），测量模型加载、prefill 与贪心 decode 的中位耗时；WASM 脚本复用同一模型文件与 token 序列，两端输出的 `greedy_checksum` 应一致：
+
+```bash
+cargo run -p nncoss-llm --release --example bench -- --preset small
+python3 tools/bench_wasm_llm.py --preset small
+```
+
+基准用于记录标量参考后端的基线与后续优化前后的对比，结果依赖具体机器，不构成性能承诺，也不纳入 CI 门禁。WASM 脚本的 decode 计时包含 Python 宿主逐 token 调用的开销。
 
 ### 导出模型
 
@@ -430,7 +443,7 @@ fn generate(model_bytes: &[u8]) -> nncoss_llm::Result<Vec<u32>> {
 | `nncoss_llm_set_sampler` / `nncoss_llm_sample` | 配置采样并从最近 logits 选择 token |
 | `nncoss_llm_copy_logits` / `nncoss_llm_session_position` / `nncoss_llm_session_reset` | 读取 logits、查询位置与重置会话 |
 
-返回状态码的操作以 0 表示成功、负数表示失败；`nncoss_llm_alloc` 分配失败返回空指针。错误指针在下一次 API 调用前有效。原生 release 的内部 panic 经 unwind 映射为 `-99`；`wasm32-unknown-unknown` 的内部 panic 按目标约定使当前调用 trap，不能依赖 `catch_unwind` 恢复。宿主必须使用匹配的分配长度释放缓冲区，不得并发调用同一会话。释放模型句柄不会销毁仍被会话引用的权重。
+返回状态码的操作以 0 表示成功、负数表示失败；`nncoss_llm_alloc` 分配失败返回空指针。模型权重与 KV Cache 扩容的分配失败返回 `-9`，不再中止进程；prefill 失败时会话回退到调用前的位置并保留原有 logits，decode 失败不推进位置。Rust 的 `Error` 标记为 `#[non_exhaustive]`，后续可新增变体，已有状态码保持不变。错误指针在下一次 API 调用前有效。原生 release 的内部 panic 经 unwind 映射为 `-99`；`wasm32-unknown-unknown` 的内部 panic 按目标约定使当前调用 trap，不能依赖 `catch_unwind` 恢复。宿主必须使用匹配的分配长度释放缓冲区，不得并发调用同一会话。释放模型句柄不会销毁仍被会话引用的权重。
 
 当前尚未实现量化、WASM SIMD、多线程、GPU、浏览器 JavaScript 宿主和流式文本绑定。f32 权重约占每个参数 4 字节，模型、KV Cache 与临时张量必须共同满足 wasm32 地址空间及宿主内存限制。
 

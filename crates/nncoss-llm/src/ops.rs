@@ -136,6 +136,69 @@ mod tests {
         }
     }
 
+    fn rotate(first: f32, second: f32, angle: f32) -> (f32, f32) {
+        let (sine, cosine) = angle.sin_cos();
+        (
+            first * cosine - second * sine,
+            second * cosine + first * sine,
+        )
+    }
+
+    #[test]
+    fn rope_matches_hand_computed_rotations_at_nonzero_position() {
+        let input = [1.0, 2.0, 3.0, 4.0];
+        let (slow, fast) = (3.0_f32, 0.3_f32);
+
+        let mut half = input.to_vec();
+        apply_rope(&mut half, 1, 4, 3, 100.0, RopeMode::HalfSplit);
+        let (a0, a2) = rotate(1.0, 3.0, slow);
+        let (a1, a3) = rotate(2.0, 4.0, fast);
+        assert_close(&half, &[a0, a1, a2, a3]);
+
+        let mut interleaved = input.to_vec();
+        apply_rope(&mut interleaved, 1, 4, 3, 100.0, RopeMode::Interleaved);
+        let (b0, b1) = rotate(1.0, 2.0, slow);
+        let (b2, b3) = rotate(3.0, 4.0, fast);
+        assert_close(&interleaved, &[b0, b1, b2, b3]);
+
+        assert!(
+            half.iter()
+                .zip(&interleaved)
+                .any(|(l, r)| (l - r).abs() > 1e-3)
+        );
+    }
+
+    #[test]
+    fn rope_depends_on_theta_and_rotates_every_head() {
+        let input = [1.0, 2.0, 3.0, 4.0, 1.0, 2.0, 3.0, 4.0];
+        let mut low = input.to_vec();
+        let mut high = input.to_vec();
+        apply_rope(&mut low, 2, 4, 3, 100.0, RopeMode::HalfSplit);
+        apply_rope(&mut high, 2, 4, 3, 10_000.0, RopeMode::HalfSplit);
+        assert!(low.iter().zip(&high).any(|(l, r)| (l - r).abs() > 1e-3));
+        assert_close(&low[..4], &low[4..]);
+        assert_close(&high[..4], &high[4..]);
+    }
+
+    #[test]
+    fn rope_preserves_vector_norm() {
+        let mut values = vec![0.5, -1.5, 2.0, 0.25, 1.0, -0.75, 0.0, 3.0];
+        let before: f32 = values.iter().map(|v| v * v).sum();
+        for mode in [RopeMode::HalfSplit, RopeMode::Interleaved] {
+            apply_rope(&mut values, 1, 8, 17, 10_000.0, mode);
+            let after: f32 = values.iter().map(|v| v * v).sum();
+            assert!((before - after).abs() < 1e-4);
+        }
+    }
+
+    #[test]
+    fn silu_matches_definition_on_both_branches() {
+        for value in [-20.0_f32, -1.5, 0.0, 0.7, 12.0] {
+            let expected = value / (1.0 + (-value).exp());
+            assert!((silu(value) - expected).abs() < 1e-6);
+        }
+    }
+
     #[test]
     fn softmax_is_normalized() {
         let output = softmax(&[1.0, 2.0, 3.0]);

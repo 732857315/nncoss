@@ -357,7 +357,7 @@ console.log("识别结果：", logits.argmax());
 | 调用接口 | Rust API 与版本为 1 的 WASM／原生 C ABI；模型从内存加载，会话独立持有权重生命周期 |
 | 验证 | 原生单元测试；手算 RoPE 旋转（两种布局、多频率）与 GQA 头映射；增量解码与无缓存参考前向在多层 GQA 模型的绑定／独立 LM Head、QKV bias、QK norm 与 RoPE 布局全部组合上对拍；同一 tiny decoder 夹具的原生／WASM 数值与错误路径对拍 |
 
-当前验收仅覆盖仓库生成的 tiny decoder，不代表某个公开的 Llama 或 Qwen 模型已经通过数值与性能验收。架构兼容与模型支持必须分别验证。
+当前验收覆盖仓库生成的 tiny decoder 和 6 个 Hugging Face 合成小模型，不代表某个公开尺寸的 Llama 或 Qwen 模型已经通过数值与性能验收。架构兼容与模型支持必须分别验证。
 
 ### ncnn 后端与优化边界
 
@@ -386,7 +386,24 @@ python3 tools/check_wasm_llm.py
 
 该工具是验收脚本而非 Python 绑定，依次覆盖模型加载、prefill、采样、logits 复制、decode、reset，以及模型句柄释放后的会话生命周期；并在两个目标上比较截断模型、越界 token、未 prefill 读取 logits、输出缓冲区过小和非法采样参数的错误码与错误消息。tiny decoder 来自已提交的夹具 `crates/nncoss-llm/tests/fixtures/tiny_v1.nncossllm`，Rust 单元测试会确认测试模型构造器与该夹具逐字节一致。
 
-增量解码对拍中的无缓存参考前向与被测路径共享同一组算子实现，只能证明 KV Cache 与会话状态正确；RoPE 与 GQA 另有手算用例，但整体前向尚未与 PyTorch 等独立实现对拍。
+### 独立 PyTorch 黄金对拍
+
+`crates/nncoss-llm/tests/golden.rs` 使用已提交的 Hugging Face 黄金数据，覆盖 Llama、Qwen2、Qwen3 的 6 个合成小模型，包括 MHA、GQA、MQA、绑定／独立 LM Head、QKV bias、QK norm 和 `head_dim != hidden_size / head_count`。参考值来自 float64 无缓存完整前向并转换为 f32；测试比较每个 token 位置的 logits、所有 prefill 切分点和贪心生成，容差为 `1e-4 + 1e-4 × |参考值|`。
+
+原生与 WASM 使用同一组夹具验收，无需安装 PyTorch：
+
+```bash
+python3 tools/check_golden_llm.py
+```
+
+重新生成夹具需要仓库外的隔离 Python 环境和 `tools/golden_requirements.txt` 中的固定测试依赖。`make_golden_llm.py` 还会检查 HF 的 f32/f64 与 KV Cache 一致性，并对 RoPE 和每个导出张量执行反向变异对照：
+
+```bash
+python3 -m pip install -r tools/golden_requirements.txt
+python3 tools/make_golden_llm.py
+```
+
+当前生成器使用 Transformers 4.57.6 的顶层 `rope_theta` 配置；Transformers 5 的 `rope_parameters` 格式暂不支持。黄金对拍验证的是所列合成配置，不替代公开模型的真实权重、Tokenizer 与长上下文验收。
 
 ### 基准
 

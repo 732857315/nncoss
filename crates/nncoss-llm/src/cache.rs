@@ -25,6 +25,13 @@ impl LayerCache {
         let length = capacity
             .checked_mul(kv_dim)
             .ok_or(Error::InvalidArgument("KV Cache 尺寸溢出"))?;
+        let additional = length.saturating_sub(self.keys.len());
+        self.keys
+            .try_reserve_exact(additional)
+            .map_err(|_| Error::Allocation)?;
+        self.values
+            .try_reserve_exact(additional)
+            .map_err(|_| Error::Allocation)?;
         self.keys.resize(length, 0.0);
         self.values.resize(length, 0.0);
         self.capacity = capacity;
@@ -88,6 +95,10 @@ impl KvCache {
     pub fn reset(&mut self) {
         self.len = 0;
     }
+
+    pub fn truncate(&mut self, len: usize) {
+        self.len = self.len.min(len);
+    }
 }
 
 #[cfg(test)]
@@ -111,5 +122,35 @@ mod tests {
         cache.append(0, &[9.0, 1.0], &[8.0, 2.0], 32).unwrap();
         assert_eq!(cache.layers[0].capacity, capacity);
         assert_eq!(cache.key(0, 0, 0, 2), &[9.0, 1.0]);
+    }
+
+    #[test]
+    fn oversized_growth_reports_allocation_error_without_mutation() {
+        let mut layer = LayerCache::new();
+        let result = layer.reserve(1, usize::MAX / 32, usize::MAX);
+        assert_eq!(result, Err(Error::Allocation));
+        assert_eq!(layer.capacity, 0);
+        assert!(layer.keys.is_empty() && layer.values.is_empty());
+    }
+
+    #[test]
+    fn truncate_rewinds_positions_and_keeps_capacity() {
+        let mut cache = KvCache::new(1);
+        for token in 0..5 {
+            cache
+                .append(0, &[token as f32], &[token as f32], 8)
+                .unwrap();
+            cache.finish_token();
+        }
+        let capacity = cache.layers[0].capacity;
+        cache.truncate(2);
+        assert_eq!(cache.len(), 2);
+        cache.truncate(10);
+        assert_eq!(cache.len(), 2);
+        cache.append(0, &[7.0], &[7.0], 8).unwrap();
+        cache.finish_token();
+        assert_eq!(cache.key(0, 2, 0, 1), &[7.0]);
+        assert_eq!(cache.key(0, 1, 0, 1), &[1.0]);
+        assert_eq!(cache.layers[0].capacity, capacity);
     }
 }

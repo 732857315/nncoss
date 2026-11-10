@@ -13,6 +13,8 @@ pub struct Session {
     max_context: usize,
     last_logits: Option<Vec<f32>>,
     sampler: Sampler,
+    #[cfg(test)]
+    fail_at_position: Option<usize>,
 }
 
 impl Session {
@@ -34,6 +36,8 @@ impl Session {
             max_context: maximum,
             last_logits: None,
             sampler: Sampler::new(SamplingConfig::default(), 0)?,
+            #[cfg(test)]
+            fail_at_position: None,
         })
     }
 
@@ -60,15 +64,25 @@ impl Session {
             return Err(Error::InvalidArgument("prefill tokens 不能为空"));
         }
         self.validate_tokens(tokens)?;
+        let start = self.cache.len();
+        let mut logits = None;
         for token in tokens {
-            self.forward_token(*token)?;
+            match self.forward_token(*token) {
+                Ok(next) => logits = Some(next),
+                Err(error) => {
+                    self.cache.truncate(start);
+                    return Err(error);
+                }
+            }
         }
+        self.last_logits = logits;
         Ok(())
     }
 
     pub fn decode(&mut self, token: u32) -> Result<()> {
         self.validate_tokens(&[token])?;
-        self.forward_token(token)
+        self.last_logits = Some(self.forward_token(token)?);
+        Ok(())
     }
 
     pub fn last_logits(&self) -> Result<&[f32]> {
@@ -121,7 +135,7 @@ impl Session {
         Ok(())
     }
 
-    fn forward_token(&mut self, token: u32) -> Result<()> {
+    fn forward_token(&mut self, token: u32) -> Result<Vec<f32>> {
         let config = &self.model.config;
         let hidden = config.hidden_size;
         let position = self.cache.len();
@@ -184,6 +198,11 @@ impl Session {
             );
             self.cache
                 .append(layer_index, &key, &value, self.max_context)?;
+            #[cfg(test)]
+            if self.fail_at_position == Some(position) && layer_index + 1 == self.model.layers.len()
+            {
+                return Err(Error::Allocation);
+            }
             let attended = attention(
                 &query,
                 &self.cache,
@@ -235,14 +254,13 @@ impl Session {
             .lm_head
             .as_deref()
             .unwrap_or(&self.model.token_embedding);
-        self.last_logits = Some(linear(
+        Ok(linear(
             lm_head,
             config.vocab_size,
             hidden,
             &normalized,
             None,
-        ));
-        Ok(())
+        ))
     }
 }
 
@@ -288,7 +306,8 @@ fn attention(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_utils::tiny_model;
+    use crate::RopeMode;
+    use crate::test_utils::{TinySpec, tiny_model};
 
     fn assert_close(actual: &[f32], expected: &[f32]) {
         assert_eq!(actual.len(), expected.len());
@@ -361,6 +380,93 @@ mod tests {
         session.prefill(&[2]).unwrap();
         let expected = reference_logits(&model, &[1, generated[0], generated[1], 2]);
         assert_close(session.last_logits().unwrap(), &expected);
+    }
+
+    #[test]
+    fn every_wide_variant_matches_uncached_reference() {
+        let tokens = [3, 7, 1, 10, 0, 5];
+        for spec in TinySpec::wide_variants() {
+            let model = Arc::new(spec.model());
+            let expected = reference_logits(&model, &tokens);
+            let mut prefill = Session::new(model.clone(), 0).unwrap();
+            prefill.prefill(&tokens).unwrap();
+            assert_close(prefill.last_logits().unwrap(), &expected);
+            let mut incremental = Session::new(model, 0).unwrap();
+            incremental.prefill(&tokens[..2]).unwrap();
+            for token in &tokens[2..] {
+                incremental.decode(*token).unwrap();
+            }
+            assert_close(incremental.last_logits().unwrap(), &expected);
+        }
+    }
+
+    #[test]
+    fn rope_layout_and_theta_change_multi_token_logits() {
+        let logits = |spec: TinySpec| {
+            let mut session = Session::new(Arc::new(spec.model()), 0).unwrap();
+            session.prefill(&[3, 7, 1, 10]).unwrap();
+            session.last_logits().unwrap().to_vec()
+        };
+        let base = logits(TinySpec::WIDE);
+        let interleaved = logits(TinySpec {
+            rope_mode: RopeMode::Interleaved,
+            ..TinySpec::WIDE
+        });
+        let low_theta = logits(TinySpec {
+            rope_theta: 100.0,
+            ..TinySpec::WIDE
+        });
+        let differs =
+            |left: &[f32], right: &[f32]| left.iter().zip(right).any(|(l, r)| (l - r).abs() > 1e-5);
+        assert!(differs(&base, &interleaved));
+        assert!(differs(&base, &low_theta));
+    }
+
+    #[test]
+    fn grouped_query_heads_read_their_shared_kv_head() {
+        let mut cache = KvCache::new(1);
+        cache
+            .append(0, &[0.1, 0.2, 0.3, 0.4], &[1.0, 2.0, 3.0, 4.0], 4)
+            .unwrap();
+        let query = [0.5, -0.5, 1.0, 0.25, -1.0, 2.0, 0.0, 1.0];
+        let output = attention(&query, &cache, 0, 4, 2, 2, 0);
+        assert_close(&output, &[1.0, 2.0, 1.0, 2.0, 3.0, 4.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn failed_prefill_rolls_back_position_and_keeps_previous_logits() {
+        let model = Arc::new(TinySpec::WIDE.model());
+        let mut session = Session::new(model.clone(), 0).unwrap();
+        session.prefill(&[3, 7]).unwrap();
+        let before = session.last_logits().unwrap().to_vec();
+        session.fail_at_position = Some(3);
+        assert_eq!(session.prefill(&[1, 10, 0]), Err(Error::Allocation));
+        assert_eq!(session.position(), 2);
+        assert_eq!(session.last_logits().unwrap(), &before[..]);
+        session.fail_at_position = None;
+        session.prefill(&[1, 10, 0]).unwrap();
+        assert_close(
+            session.last_logits().unwrap(),
+            &reference_logits(&model, &[3, 7, 1, 10, 0]),
+        );
+    }
+
+    #[test]
+    fn failed_decode_keeps_position_and_logits() {
+        let model = Arc::new(TinySpec::WIDE.model());
+        let mut session = Session::new(model.clone(), 0).unwrap();
+        session.prefill(&[3, 7]).unwrap();
+        let before = session.last_logits().unwrap().to_vec();
+        session.fail_at_position = Some(2);
+        assert_eq!(session.decode(1), Err(Error::Allocation));
+        assert_eq!(session.position(), 2);
+        assert_eq!(session.last_logits().unwrap(), &before[..]);
+        session.fail_at_position = None;
+        session.decode(1).unwrap();
+        assert_close(
+            session.last_logits().unwrap(),
+            &reference_logits(&model, &[3, 7, 1]),
+        );
     }
 
     fn reference_logits(model: &Model, tokens: &[u32]) -> Vec<f32> {

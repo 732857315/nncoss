@@ -273,7 +273,10 @@ impl<'a> Reader<'a> {
             .checked_mul(4)
             .ok_or(Error::InvalidModel("张量尺寸溢出"))?;
         let bytes = self.take(byte_count)?;
-        let mut values = Vec::with_capacity(count);
+        let mut values = Vec::new();
+        values
+            .try_reserve_exact(count)
+            .map_err(|_| Error::Allocation)?;
         for chunk in bytes.chunks_exact(4) {
             let value = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
             if !value.is_finite() {
@@ -325,5 +328,90 @@ mod tests {
         let mut bytes = tiny_model_bytes();
         bytes[36..40].copy_from_slice(&4_u32.to_le_bytes());
         assert!(Model::from_bytes(&bytes).is_err());
+    }
+
+    fn patched(offset: usize, value: [u8; 4]) -> Result<Model> {
+        let mut bytes = tiny_model_bytes();
+        bytes[offset..offset + 4].copy_from_slice(&value);
+        Model::from_bytes(&bytes)
+    }
+
+    #[test]
+    fn rejects_unsupported_header_fields() {
+        assert_eq!(
+            patched(8, 2_u32.to_le_bytes()).unwrap_err(),
+            Error::Unsupported("模型格式版本")
+        );
+        assert_eq!(
+            patched(12, 2_u32.to_le_bytes()).unwrap_err(),
+            Error::Unsupported("模型架构")
+        );
+        assert_eq!(
+            patched(48, (6_u32 | 8).to_le_bytes()).unwrap_err(),
+            Error::Unsupported("模型 flags")
+        );
+        assert_eq!(
+            patched(52, 2_u32.to_le_bytes()).unwrap_err(),
+            Error::Unsupported("RoPE 模式")
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_dimensions_and_scalars() {
+        for offset in (16..48).step_by(4) {
+            assert!(
+                matches!(
+                    patched(offset, 0_u32.to_le_bytes()),
+                    Err(Error::InvalidModel(_))
+                ),
+                "zero field at offset {offset} must be rejected"
+            );
+        }
+        assert!(matches!(
+            patched(40, 3_u32.to_le_bytes()),
+            Err(Error::InvalidModel(_))
+        ));
+        for value in [0.0_f32, -1.0, f32::NAN, f32::INFINITY] {
+            assert!(matches!(
+                patched(56, value.to_le_bytes()),
+                Err(Error::InvalidModel(_))
+            ));
+            assert!(matches!(
+                patched(60, value.to_le_bytes()),
+                Err(Error::InvalidModel(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn rejects_non_finite_weights() {
+        for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            assert_eq!(
+                patched(64, value.to_le_bytes()).unwrap_err(),
+                Error::InvalidModel("权重包含非有限值")
+            );
+        }
+    }
+
+    #[test]
+    fn huge_layer_count_fails_as_truncated_model() {
+        assert_eq!(
+            patched(28, u32::MAX.to_le_bytes()).unwrap_err(),
+            Error::InvalidModel("模型数据被截断")
+        );
+    }
+
+    #[test]
+    fn tied_models_omit_the_lm_head_tensor() {
+        use crate::test_utils::TinySpec;
+        let spec = TinySpec {
+            tied: true,
+            ..TinySpec::WIDE
+        };
+        let untied = TinySpec::WIDE.bytes();
+        let tied = spec.bytes();
+        assert_eq!(untied.len() - tied.len(), spec.vocab * spec.hidden * 4);
+        assert!(spec.model().lm_head.is_none());
+        assert!(TinySpec::WIDE.model().lm_head.is_some());
     }
 }

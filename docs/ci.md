@@ -21,12 +21,12 @@
 
 - `cargo fmt --all --check`。
 - `cargo clippy -p nncoss-llm --all-targets -- -D warnings`。
-- 在 debug 与 release 下执行 `cargo test -p nncoss-llm`，覆盖模型解析、算子、采样、KV Cache、增量解码与无缓存参考前向对拍，并验证 release 的原生 ABI panic 映射和分配错误回归。
+- 在 debug 与 release 下执行 `cargo test -p nncoss-llm`，覆盖模型解析与非法头字段、手算 RoPE 与 GQA 头映射、采样、KV Cache 扩容失败与回退、prefill／decode 失败后的状态保持，以及多层 GQA 模型各特性组合上的增量解码与无缓存参考前向对拍，并验证 release 的原生 ABI panic 映射、分配错误回归和测试模型与已提交夹具逐字节一致。
 - 使用 `python3 -m unittest discover -s tools -p "test_*.py"` 验证导出器拒绝不支持的 bias，并检查 QKV bias 与 QK norm 的跨层一致性。
 - 分别构建原生与 `wasm32-unknown-unknown` 发布产物。
-- 使用 Python `wasmtime==50.0.1` 执行 `tools/check_wasm_llm.py`，在同一 tiny decoder 上比较原生与 WASM 的 prefill、采样、decode 和 reset 行为及 logits。
+- 使用 Python `wasmtime==50.0.1` 执行 `tools/check_wasm_llm.py`，读取已提交的 tiny decoder 夹具，比较原生与 WASM 的 prefill、采样、decode 和 reset 行为及 logits，以及各错误路径的状态码与错误消息。
 
-本地执行完整 LLM 验收需先安装 Rust 的 `wasm32-unknown-unknown` 目标，构建两个发布产物，并在 Python 环境安装对应版本的 `wasmtime`。真实模型导出工具另需 `torch` 与 `safetensors`，默认 CI 不下载公开模型；tiny decoder 对拍通过不代表任何具体公开模型已经完成数值或性能验收。
+本地执行完整 LLM 验收需先安装 Rust 的 `wasm32-unknown-unknown` 目标，构建两个发布产物，并在 Python 环境安装对应版本的 `wasmtime`。真实模型导出工具另需 `torch` 与 `safetensors`，默认 CI 不下载公开模型；tiny decoder 对拍通过不代表任何具体公开模型已经完成数值或性能验收。`bench` 示例与 `tools/bench_wasm_llm.py` 仅用于本地记录基线，不属于 CI 检查。
 
 ## GitHub 合并门禁
 

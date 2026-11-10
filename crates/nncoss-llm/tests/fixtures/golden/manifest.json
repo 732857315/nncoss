@@ -1,0 +1,135 @@
+{
+  "format": 1,
+  "generator": {
+    "script": "tools/make_golden_llm.py",
+    "python": "3.11.15",
+    "torch": "2.2.2",
+    "transformers": "4.57.6",
+    "safetensors": "0.8.0"
+  },
+  "reference": "Hugging Face float64 forward without KV cache, rounded to f32",
+  "cases": [
+    {
+      "name": "llama_gqa_untied",
+      "family": "llama",
+      "config": {
+        "vocab_size": 29,
+        "hidden_size": 16,
+        "intermediate_size": 40,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "max_position_embeddings": 32,
+        "rms_norm_eps": 1e-05,
+        "rope_theta": 10000.0,
+        "tie_word_embeddings": false
+      },
+      "prompt_length": 12,
+      "greedy_length": 6,
+      "model_sha256": "0b86bb35968f374fe8564989e960b1e99629d4cde2278e427386bae124fc2b59",
+      "golden_sha256": "d2b0cda8e7c9b9935625b437c8b2455ac6735ee0034109e058862c976edd7890"
+    },
+    {
+      "name": "llama_mha_tied",
+      "family": "llama",
+      "config": {
+        "vocab_size": 23,
+        "hidden_size": 16,
+        "intermediate_size": 24,
+        "num_hidden_layers": 3,
+        "num_attention_heads": 2,
+        "num_key_value_heads": 2,
+        "max_position_embeddings": 48,
+        "rms_norm_eps": 1e-06,
+        "rope_theta": 500000.0,
+        "tie_word_embeddings": true
+      },
+      "prompt_length": 12,
+      "greedy_length": 6,
+      "model_sha256": "9c5c8759a01fac3ed41cb59f57b67f404b6299370aa76dae50123b27edf3915b",
+      "golden_sha256": "2ac3e2b36b020257fbf41790a722929692fac70ad5e3c3a71b0abf44f79f380c"
+    },
+    {
+      "name": "qwen2_gqa_tied",
+      "family": "qwen2",
+      "config": {
+        "vocab_size": 31,
+        "hidden_size": 24,
+        "intermediate_size": 24,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 6,
+        "num_key_value_heads": 2,
+        "max_position_embeddings": 32,
+        "rms_norm_eps": 1e-06,
+        "rope_theta": 1000000.0,
+        "tie_word_embeddings": true
+      },
+      "prompt_length": 12,
+      "greedy_length": 6,
+      "model_sha256": "302c6a6ca65787daea75f9798ac6928efaa51a406b6ed449c2e89784205af63a",
+      "golden_sha256": "7107e93503f47c1e7d133eb8448ebedf362967c8a4c1eb4fa727e6e398ecdf16"
+    },
+    {
+      "name": "qwen2_mqa_untied",
+      "family": "qwen2",
+      "config": {
+        "vocab_size": 19,
+        "hidden_size": 16,
+        "intermediate_size": 24,
+        "num_hidden_layers": 1,
+        "num_attention_heads": 2,
+        "num_key_value_heads": 1,
+        "max_position_embeddings": 24,
+        "rms_norm_eps": 1e-05,
+        "rope_theta": 10000.0,
+        "tie_word_embeddings": false
+      },
+      "prompt_length": 12,
+      "greedy_length": 6,
+      "model_sha256": "67dcef66c407b4ef7b2cdaaddc4b3cbadf5dc8cd9d73b5c6652f252076c65a15",
+      "golden_sha256": "e6c78bf7994f18559a54004b24503d0610171f092f2c72745670b9dfcc58ba29"
+    },
+    {
+      "name": "qwen3_gqa_tied",
+      "family": "qwen3",
+      "config": {
+        "vocab_size": 27,
+        "hidden_size": 16,
+        "intermediate_size": 32,
+        "num_hidden_layers": 2,
+        "num_attention_heads": 4,
+        "num_key_value_heads": 2,
+        "head_dim": 8,
+        "max_position_embeddings": 32,
+        "rms_norm_eps": 1e-06,
+        "rope_theta": 1000000.0,
+        "tie_word_embeddings": true
+      },
+      "prompt_length": 12,
+      "greedy_length": 6,
+      "model_sha256": "9fdc858cc7d790a297feb2f84da332d6b5172c8a480df6cdd5f772a3cdbc8013",
+      "golden_sha256": "88ff8bf1546762a25da6471b3916096fc4c92a57893b55b77b590f02a5e455ca"
+    },
+    {
+      "name": "qwen3_narrow_untied",
+      "family": "qwen3",
+      "config": {
+        "vocab_size": 17,
+        "hidden_size": 24,
+        "intermediate_size": 16,
+        "num_hidden_layers": 1,
+        "num_attention_heads": 2,
+        "num_key_value_heads": 2,
+        "head_dim": 6,
+        "max_position_embeddings": 24,
+        "rms_norm_eps": 1e-05,
+        "rope_theta": 10000.0,
+        "tie_word_embeddings": false
+      },
+      "prompt_length": 12,
+      "greedy_length": 6,
+      "model_sha256": "5c656015620e7a28946baab40d141ccaadc909cb30837c5f393da3c103bf34a7",
+      "golden_sha256": "bc3012b53b7bdb3deea33d0a9f4033f545c7783e1454afeb5bd0208cf89ca99e"
+    }
+  ]
+}

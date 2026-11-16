@@ -4,13 +4,15 @@ use std::ffi::c_char;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::Arc;
 
-use crate::{ABI_VERSION, Error, Model, Result, SamplingConfig, Session};
+use crate::{ABI_VERSION, Error, Model, ModelLoader, Result, SamplingConfig, Session};
 
 thread_local! {
     static LAST_ERROR: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
 }
 
 pub struct ModelHandle(Arc<Model>);
+
+pub struct ModelLoaderHandle(Option<ModelLoader>);
 
 fn clear_error() {
     LAST_ERROR.with(|error| error.borrow_mut().clear());
@@ -160,6 +162,57 @@ pub unsafe extern "C" fn nncoss_llm_model_load(
         let handle = Box::new(ModelHandle(Arc::new(model)));
         Ok(Box::into_raw(handle))
     })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn nncoss_llm_model_loader_new(total_length: usize) -> *mut ModelLoaderHandle {
+    ffi_ptr(|| {
+        let handle = Box::new(ModelLoaderHandle(Some(ModelLoader::new(total_length))));
+        Ok(Box::into_raw(handle))
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nncoss_llm_model_loader_write(
+    loader: *mut ModelLoaderHandle,
+    pointer: *const u8,
+    length: usize,
+) -> i32 {
+    ffi_status(|| {
+        if loader.is_null() {
+            return Err(Error::InvalidArgument("空加载器句柄"));
+        }
+        let bytes = unsafe { raw_bytes(pointer, length) }?;
+        match &mut unsafe { &mut *loader }.0 {
+            Some(loader) => loader.write(bytes),
+            None => Err(Error::InvalidArgument("模型加载器已结束")),
+        }
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nncoss_llm_model_loader_finish(
+    loader: *mut ModelLoaderHandle,
+) -> *mut ModelHandle {
+    ffi_ptr(|| {
+        if loader.is_null() {
+            return Err(Error::InvalidArgument("空加载器句柄"));
+        }
+        let loader = unsafe { &mut *loader }
+            .0
+            .take()
+            .ok_or(Error::InvalidArgument("模型加载器已结束"))?;
+        let model = loader.finish()?;
+        let handle = Box::new(ModelHandle(Arc::new(model)));
+        Ok(Box::into_raw(handle))
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn nncoss_llm_model_loader_free(loader: *mut ModelLoaderHandle) {
+    if !loader.is_null() {
+        drop(unsafe { Box::from_raw(loader) });
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -388,6 +441,108 @@ mod tests {
             assert_eq!(nncoss_llm_dealloc(std::ptr::null_mut(), 1), -1);
             assert_eq!(nncoss_llm_dealloc(std::ptr::null_mut(), 0), 0);
             assert!(nncoss_llm_alloc(usize::MAX).is_null());
+        }
+    }
+
+    unsafe fn stream_model(bytes: &[u8], chunk: usize) -> *mut ModelHandle {
+        unsafe {
+            let loader = nncoss_llm_model_loader_new(bytes.len());
+            assert!(!loader.is_null());
+            let buffer = nncoss_llm_alloc(chunk);
+            assert!(!buffer.is_null());
+            for part in bytes.chunks(chunk) {
+                std::ptr::copy_nonoverlapping(part.as_ptr(), buffer, part.len());
+                assert_eq!(nncoss_llm_model_loader_write(loader, buffer, part.len()), 0);
+            }
+            assert_eq!(nncoss_llm_dealloc(buffer, chunk), 0);
+            let model = nncoss_llm_model_loader_finish(loader);
+            nncoss_llm_model_loader_free(loader);
+            model
+        }
+    }
+
+    unsafe fn prefill_logits(model: *const ModelHandle) -> Vec<f32> {
+        unsafe {
+            let session = nncoss_llm_session_new(model, 0);
+            assert!(!session.is_null());
+            let tokens = [1_u32, 2, 3];
+            assert_eq!(
+                nncoss_llm_prefill(session, tokens.as_ptr(), tokens.len()),
+                0
+            );
+            let mut logits = vec![0.0; nncoss_llm_model_vocab_size(model) as usize];
+            assert_eq!(
+                nncoss_llm_copy_logits(session, logits.as_mut_ptr(), logits.len()),
+                0
+            );
+            nncoss_llm_session_free(session);
+            logits
+        }
+    }
+
+    #[test]
+    fn streaming_loader_abi_matches_buffer_loader() {
+        let bytes = tiny_model_bytes();
+        unsafe {
+            let whole = nncoss_llm_model_load(bytes.as_ptr(), bytes.len());
+            assert!(!whole.is_null());
+            let expected = prefill_logits(whole);
+            nncoss_llm_model_free(whole);
+            for chunk in [1, 7, 64, 4096] {
+                let model = stream_model(&bytes, chunk);
+                assert!(!model.is_null());
+                assert_eq!(nncoss_llm_model_max_context(model), 16);
+                assert_eq!(prefill_logits(model), expected);
+                nncoss_llm_model_free(model);
+            }
+        }
+    }
+
+    #[test]
+    fn streaming_loader_abi_reports_errors_without_panicking() {
+        let bytes = tiny_model_bytes();
+        unsafe {
+            assert_eq!(
+                nncoss_llm_model_loader_write(std::ptr::null_mut(), bytes.as_ptr(), 1),
+                -1
+            );
+            assert!(nncoss_llm_model_loader_finish(std::ptr::null_mut()).is_null());
+            nncoss_llm_model_loader_free(std::ptr::null_mut());
+
+            let loader = nncoss_llm_model_loader_new(bytes.len());
+            assert_eq!(
+                nncoss_llm_model_loader_write(loader, bytes.as_ptr(), bytes.len() - 1),
+                0
+            );
+            assert!(nncoss_llm_model_loader_finish(loader).is_null());
+            assert_ne!(*nncoss_llm_last_error(), 0);
+            assert!(nncoss_llm_model_loader_finish(loader).is_null());
+            assert_eq!(nncoss_llm_model_loader_write(loader, bytes.as_ptr(), 1), -1);
+            nncoss_llm_model_loader_free(loader);
+
+            let loader = nncoss_llm_model_loader_new(4);
+            assert_eq!(nncoss_llm_model_loader_write(loader, bytes.as_ptr(), 8), -1);
+            assert!(nncoss_llm_model_loader_finish(loader).is_null());
+            nncoss_llm_model_loader_free(loader);
+
+            let loader = nncoss_llm_model_loader_new(bytes.len());
+            assert_eq!(
+                nncoss_llm_model_loader_write(loader, std::ptr::null(), 8),
+                -1
+            );
+            assert_eq!(
+                nncoss_llm_model_loader_write(loader, std::ptr::null(), 0),
+                0
+            );
+            assert_eq!(
+                nncoss_llm_model_loader_write(loader, bytes.as_ptr(), bytes.len()),
+                0
+            );
+            let model = nncoss_llm_model_loader_finish(loader);
+            assert!(!model.is_null());
+            nncoss_llm_model_loader_free(loader);
+            assert_eq!(nncoss_llm_model_vocab_size(model), 5);
+            nncoss_llm_model_free(model);
         }
     }
 

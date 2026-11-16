@@ -354,10 +354,10 @@ console.log("识别结果：", logits.argmax());
 | 数值与算子 | f32 标量 CPU 参考路径；行主序矩阵乘、稳定 softmax 与 SiLU |
 | 会话 | 多 token prefill、单 token decode、KV Cache 几何增长与容量复用、reset、EOS 停止 |
 | 采样 | 贪心、temperature、top-k、top-p；可复现的 SplitMix64 随机序列 |
-| 调用接口 | Rust API 与版本为 1 的 WASM／原生 C ABI；模型从内存加载，会话独立持有权重生命周期 |
-| 验证 | 原生单元测试；手算 RoPE 旋转（两种布局、多频率）与 GQA 头映射；增量解码与无缓存参考前向在多层 GQA 模型的绑定／独立 LM Head、QKV bias、QK norm 与 RoPE 布局全部组合上对拍；同一 tiny decoder 夹具的原生／WASM 数值与错误路径对拍 |
+| 调用接口 | Rust API 与版本为 1 的 WASM／原生 C ABI；模型可整块从内存加载，或按声明的总长度分块流式加载；会话独立持有权重生命周期 |
+| 验证 | 原生单元测试；手算 RoPE 旋转（两种布局、多频率）与 GQA 头映射；增量解码与无缓存参考前向在多层 GQA 模型的绑定／独立 LM Head、QKV bias、QK norm 与 RoPE 布局全部组合上对拍；分块加载在全部特性组合、每个二分切点与每个截断长度上与整块加载对拍；同一 tiny decoder 夹具的原生／WASM 数值与错误路径对拍 |
 
-当前验收覆盖仓库生成的 tiny decoder 和 6 个 Hugging Face 合成小模型，不代表某个公开尺寸的 Llama 或 Qwen 模型已经通过数值与性能验收。架构兼容与模型支持必须分别验证。
+CI 验收覆盖仓库生成的 tiny decoder 和 6 个 Hugging Face 合成小模型。Qwen3-0.6B 的 f32 导出另在本地完成了短序列的原生／WASM／Hugging Face 对拍，见[分块加载与真实模型本地对拍](#分块加载与真实模型本地对拍)；该结果不属于 CI 门禁，也不代表该模型已通过长上下文、Tokenizer 或性能验收，其他公开尺寸的 Llama 或 Qwen 模型尚未验证。架构兼容与模型支持必须分别验证。
 
 ### ncnn 后端与优化边界
 
@@ -405,6 +405,32 @@ python3 tools/make_golden_llm.py
 
 当前生成器使用 Transformers 4.57.6 的顶层 `rope_theta` 配置；Transformers 5 的 `rope_parameters` 格式暂不支持。黄金对拍验证的是所列合成配置，不替代公开模型的真实权重、Tokenizer 与长上下文验收。
 
+### 分块加载与真实模型本地对拍
+
+`ModelLoader` 与 `nncoss_llm_model_loader_*` 接口按声明的总长度接收任意大小的连续分块，逐个张量解析 `.nncossllm`，模型格式保持不变。加载器只保留 64 字节的头部与跨分块的不完整数值，每个张量在进入时按文件头给出的尺寸一次性可失败地分配；声明长度不足以容纳下一个张量时，在分配前即报告截断。整块加载 `Model::from_bytes` 与 `nncoss_llm_model_load` 复用同一解析器，已有错误码与错误消息不变。
+
+整块加载要求输入缓冲区与解析后的权重同时驻留内存，且 wasm32 的单次分配不能超过 `isize::MAX`（2 GiB − 1 字节）。分块加载不需要整文件输入缓冲区，最大的单次分配是最大的单个权重张量。
+
+仓库通过 Git LFS 提供 `model/Qwen3-0.6B/qwen3-0.6b-f32.nncossllm`（2,384,199,744 字节）。下列命令以 1 MiB 分块把它分别加载到原生动态库与 `wasm32-unknown-unknown` 产物，执行 5 个 token 的 prefill 与 4 步贪心 decode 并比较 logits；`--hf-model` 为可选项，需要 `tools/golden_requirements.txt` 的依赖，用 Hugging Face f32 eager 前向作为参考：
+
+```bash
+python3 tools/check_real_llm.py
+python3 tools/check_real_llm.py --hf-model model/Qwen3-0.6B
+```
+
+2026-11-16 在 x86_64 macOS、Python `wasmtime==50.0.1` 上的本地结果：
+
+| 项目 | 结果 |
+|------|------|
+| 整块路径（wasm32） | `nncoss_llm_alloc(2384199744)` 返回空指针，无法加载 |
+| 分块路径最大单次分配 | 622,329,856 字节（词嵌入张量），分块缓冲区 1,048,576 字节 |
+| WASM 线性内存 | 初始 1,114,112 字节；加载后 2,390,622,208 字节；上下文容量 11、推进 9 个 token 后仍为 2,390,622,208 字节（wasm32 上限 4,294,967,296 字节） |
+| 原生／WASM | 4 个贪心 token 一致，5 组 logits 最大误差 5.722e-05 |
+| 原生／Hugging Face | 4 个贪心 token 一致，5 组 logits 最大误差 8.965e-05 |
+| WASM／Hugging Face | 4 个贪心 token 一致，5 组 logits 最大误差 1.001e-04 |
+
+该对拍使用固定 token id，不经过 Tokenizer；只覆盖 9 个位置的短序列，不包含长上下文、采样分布或性能验收。KV Cache 随上下文增长，该模型每个 token 占 229,376 字节，更长上下文在 wasm32 的可用余量尚未实测。该脚本依赖本地 LFS 模型，不纳入 CI。
+
 ### 基准
 
 `bench` 示例生成确定性的合成 decoder（tiny、small 两档，绑定 LM Head、带 QKV bias），测量模型加载、prefill 与贪心 decode 的中位耗时；WASM 脚本复用同一模型文件与 token 序列，两端输出的 `greedy_checksum` 应一致：
@@ -446,15 +472,38 @@ fn generate(model_bytes: &[u8]) -> nncoss_llm::Result<Vec<u32>> {
 }
 ```
 
+大模型可以从文件按固定大小分块加载，避免整文件缓冲区：
+
+```rust
+use std::fs::File;
+use std::io::Read;
+use nncoss_llm::{Model, ModelLoader};
+
+fn load(path: &str) -> Result<Model, Box<dyn std::error::Error>> {
+    let mut file = File::open(path)?;
+    let mut loader = ModelLoader::new(usize::try_from(file.metadata()?.len())?);
+    let mut chunk = vec![0_u8; 1 << 20];
+    loop {
+        let length = file.read(&mut chunk)?;
+        if length == 0 {
+            break;
+        }
+        loader.write(&chunk[..length])?;
+    }
+    Ok(loader.finish()?)
+}
+```
+
 ### WASM ABI
 
-宿主先通过 `nncoss_llm_alloc` 分配线性内存并写入模型，再调用 `nncoss_llm_model_load`；加载后可释放输入缓冲区。`nncoss_llm_session_new` 创建独立会话，随后循环调用 `nncoss_llm_prefill`、`nncoss_llm_sample` 与 `nncoss_llm_decode`。若采样到 EOS，宿主停止循环且不再 decode 该 token。达到长度上限暂停时，最后一个已采样 token 尚未 decode；恢复同一会话前必须先 decode 它，或 reset 后重建上下文。Rust `Session::generate` 会自动提交所有返回的非 EOS token。
+宿主先通过 `nncoss_llm_alloc` 分配线性内存并写入模型，再调用 `nncoss_llm_model_load`；加载后可释放输入缓冲区。模型较大时改用分块加载：以模型总字节数调用 `nncoss_llm_model_loader_new`，分配一个固定大小的分块缓冲区，反复写入下一段数据并调用 `nncoss_llm_model_loader_write`，最后调用 `nncoss_llm_model_loader_finish` 取得模型句柄，并用 `nncoss_llm_model_loader_free` 释放加载器。`nncoss_llm_session_new` 创建独立会话，随后循环调用 `nncoss_llm_prefill`、`nncoss_llm_sample` 与 `nncoss_llm_decode`。若采样到 EOS，宿主停止循环且不再 decode 该 token。达到长度上限暂停时，最后一个已采样 token 尚未 decode；恢复同一会话前必须先 decode 它，或 reset 后重建上下文。Rust `Session::generate` 会自动提交所有返回的非 EOS token。
 
 | 接口 | 用途 |
 |------|------|
 | `nncoss_llm_abi_version` / `nncoss_llm_last_error` | 查询 ABI 版本与当前线程最近的错误消息 |
 | `nncoss_llm_alloc` / `nncoss_llm_dealloc` | 分配与释放供宿主写入的线性内存 |
-| `nncoss_llm_model_load` / `nncoss_llm_model_free` | 加载模型与释放模型句柄 |
+| `nncoss_llm_model_load` / `nncoss_llm_model_free` | 整块加载模型与释放模型句柄 |
+| `nncoss_llm_model_loader_new` / `nncoss_llm_model_loader_write` / `nncoss_llm_model_loader_finish` / `nncoss_llm_model_loader_free` | 按声明的总长度分块加载模型；加载器须单独释放 |
 | `nncoss_llm_session_new` / `nncoss_llm_session_free` | 创建与释放会话；会话在内部共享模型权重 |
 | `nncoss_llm_prefill` / `nncoss_llm_decode` | 推进提示词与生成 token |
 | `nncoss_llm_set_sampler` / `nncoss_llm_sample` | 配置采样并从最近 logits 选择 token |
@@ -462,7 +511,9 @@ fn generate(model_bytes: &[u8]) -> nncoss_llm::Result<Vec<u32>> {
 
 返回状态码的操作以 0 表示成功、负数表示失败；`nncoss_llm_alloc` 分配失败返回空指针。模型权重与 KV Cache 扩容的分配失败返回 `-9`，不再中止进程；prefill 失败时会话回退到调用前的位置并保留原有 logits，decode 失败不推进位置。Rust 的 `Error` 标记为 `#[non_exhaustive]`，后续可新增变体，已有状态码保持不变。错误指针在下一次 API 调用前有效。原生 release 的内部 panic 经 unwind 映射为 `-99`；`wasm32-unknown-unknown` 的内部 panic 按目标约定使当前调用 trap，不能依赖 `catch_unwind` 恢复。宿主必须使用匹配的分配长度释放缓冲区，不得并发调用同一会话。释放模型句柄不会销毁仍被会话引用的权重。
 
-当前尚未实现量化、WASM SIMD、多线程、GPU、浏览器 JavaScript 宿主和流式文本绑定。f32 权重约占每个参数 4 字节，模型、KV Cache 与临时张量必须共同满足 wasm32 地址空间及宿主内存限制。
+分块加载接口是 ABI 版本 1 的增量扩展，已有接口的签名与行为不变；宿主可通过导出符号是否存在判断其可用性。分块可以在任意字节处切分，累计写入不得超过声明的总长度。加载器报告模型格式、长度或分配错误后即释放已解析的权重，后续写入与 `finish` 返回同一错误；空句柄、空指针等参数错误不改变加载器状态。数据未写满就调用 `finish` 按截断处理。`finish` 无论成败只能调用一次，加载器句柄始终需要 `nncoss_llm_model_loader_free` 释放，模型句柄的生命周期与加载器无关。
+
+当前尚未实现量化、WASM SIMD、多线程、GPU、浏览器 JavaScript 宿主和流式文本绑定。f32 权重约占每个参数 4 字节，模型、KV Cache 与临时张量必须共同满足 wasm32 地址空间及宿主内存限制；超过 `isize::MAX` 字节的模型文件在 wasm32 上只能分块加载，权重总量接近或超过 4 GiB 的模型无法以当前 f32 格式装入 wasm32。
 
 ## 示例模型
 

@@ -11,7 +11,7 @@ mod session;
 mod test_utils;
 
 pub use error::Error;
-pub use model::{Config, Model, RopeMode};
+pub use model::{Config, Model, ModelLoader, RopeMode};
 pub use sampler::SamplingConfig;
 pub use session::Session;
 

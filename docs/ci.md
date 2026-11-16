@@ -20,10 +20,12 @@
 `llm-acceptance` 执行以下检查：
 
 - `cargo fmt --all --check`。
-- `cargo clippy -p nncoss-llm --all-targets -- -D warnings`。
+- `cargo clippy -p nncoss-llm -p nncoss-web --all-targets -- -D warnings`。
 - 在 debug 与 release 下执行 `cargo test -p nncoss-llm`，覆盖模型解析与非法头字段、分块加载在各特性组合、每个二分切点、每个截断长度与各错误路径上同整块加载的一致性、手算 RoPE 与 GQA 头映射、采样、KV Cache 扩容失败与回退、prefill／decode 失败后的状态保持，以及多层 GQA 模型各特性组合上的增量解码与无缓存参考前向对拍，并验证 release 的原生 ABI panic 映射、分配错误回归和测试模型与已提交夹具逐字节一致。
+- 执行 `cargo test -p nncoss-web`，覆盖表单解码、HTML 转义、Cookie、mock 对话历史和重置。
 - 使用 `python3 -m unittest discover -s tools -p "test_*.py"` 验证导出器拒绝不支持的 bias，并检查 QKV bias 与 QK norm 的跨层一致性。
-- 分别构建原生与 `wasm32-unknown-unknown` 发布产物。
+- 分别构建原生与 `wasm32-unknown-unknown` 发布产物，并构建 `nncoss-web` 原生发布产物。
+- 执行 `tools/check_web_ui.py`，以 `--mock` 启动本地 HTTP 服务，验证健康检查、POST 表单、多轮历史、UTF-8、HTML 转义、空消息、重置和独立 Cookie 会话，不加载模型。
 - 使用 Python `wasmtime==50.0.1` 执行 `tools/check_wasm_llm.py`，读取已提交的 tiny decoder 夹具，比较原生与 WASM 的 prefill、采样、decode 和 reset 行为及 logits，以及各错误路径的状态码与错误消息；同一夹具再以 7 字节分块经 `nncoss_llm_model_loader_*` 加载，要求 logits 与整块加载逐位一致，并比较截断、声明长度不足、超长写入与重复结束的错误。
 - Rust 集成测试读取 6 组 Hugging Face golden 夹具，验证 Llama/Qwen2/Qwen3 合成模型的逐位置 logits、prefill 切分与贪心生成；CI 另执行 `tools/check_golden_llm.py`，对原生和 WASM 运行同一组独立参考数据。该检查只依赖 `wasmtime`，不安装 PyTorch。
 - 使用 `tools/make_golden_llm.py` 重新生成夹具时，需在仓库外环境安装 `tools/golden_requirements.txt` 的固定依赖；生成器会复现 Hugging Face f64 参考并运行反向变异与不支持检查点拒绝测试。

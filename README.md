@@ -431,6 +431,28 @@ python3 tools/check_real_llm.py --hf-model model/Qwen3-0.6B
 
 该对拍使用固定 token id，不经过 Tokenizer；只覆盖 9 个位置的短序列，不包含长上下文、采样分布或性能验收。KV Cache 随上下文增长，该模型每个 token 占 229,376 字节，更长上下文在 wasm32 的可用余量尚未实测。该脚本依赖本地 LFS 模型，不纳入 CI。
 
+### 本地 Web 对话界面
+
+`crates/nncoss-web` 提供本地浏览器聊天界面，使用 Rust HTTP 服务、Rust Tokenizer 和 `nncoss-llm` 原生标量后端，不包含 JavaScript。模型只加载一次，浏览器通过 HttpOnly Cookie 保持独立会话和 KV Cache；每次生成由全局推理锁串行执行，空消息不会进入历史，页面提供清空对话操作。服务默认只绑定 `127.0.0.1`。
+
+```bash
+cargo build -p nncoss-web --release
+target/release/nncoss-web
+```
+
+随后在浏览器打开 `http://127.0.0.1:8765/`。首次生成前需要加载约 2.4 GiB 模型，当前标量后端的每个生成 token 约需 0.8 秒。常用参数：
+
+```bash
+target/release/nncoss-web --decode 32 --temperature 0.6 --top-k 20 --top-p 0.95
+target/release/nncoss-web --model /path/to/model.nncossllm --tokenizer /path/to/tokenizer.json
+```
+
+界面不嵌入 WASM 运行时，使用原生参考后端；WASM 推理仍通过 `nncoss-llm` 的流式 ABI 验证。无模型的 mock 验收会构建服务并检查表单、UTF-8、HTML 转义、Cookie 隔离、空消息和清空操作：
+
+```bash
+python3 tools/check_web_ui.py
+```
+
 ### 基准
 
 `bench` 示例生成确定性的合成 decoder（tiny、small 两档，绑定 LM Head、带 QKV bias），测量模型加载、prefill 与贪心 decode 的中位耗时；WASM 脚本复用同一模型文件与 token 序列，两端输出的 `greedy_checksum` 应一致：

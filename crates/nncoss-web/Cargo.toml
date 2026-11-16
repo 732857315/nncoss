@@ -1,0 +1,18 @@
+[package]
+name = "nncoss-web"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+publish = false
+
+[lib]
+name = "nncoss_web"
+path = "src/lib.rs"
+
+[[bin]]
+name = "nncoss-web"
+path = "src/main.rs"
+
+[dependencies]
+nncoss-llm = { path = "../nncoss-llm" }
+tokenizers = { version = "0.21.4", default-features = false, features = ["fancy-regex"] }

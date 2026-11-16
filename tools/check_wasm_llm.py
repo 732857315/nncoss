@@ -9,9 +9,12 @@ ROOT = Path(__file__).resolve().parents[1]
 FIXTURE = ROOT / "crates" / "nncoss-llm" / "tests" / "fixtures" / "tiny_v1.nncossllm"
 VOCAB = 5
 MAX_CONTEXT = 16
+STREAM_CHUNK = 7
+DEFAULT_MEMORY_RESERVATION = 64 * 1024 * 1024
 
 OK = 0
 INVALID_ARGUMENT = -1
+INVALID_MODEL = -2
 TOKEN_OUT_OF_RANGE = -5
 NO_LOGITS = -6
 OUTPUT_TOO_SMALL = -7
@@ -23,6 +26,10 @@ NATIVE_SIGNATURES = {
     "nncoss_llm_alloc": ([C.c_size_t], C.c_void_p),
     "nncoss_llm_dealloc": ([C.c_void_p, C.c_size_t], C.c_int),
     "nncoss_llm_model_load": ([C.c_void_p, C.c_size_t], C.c_void_p),
+    "nncoss_llm_model_loader_new": ([C.c_size_t], C.c_void_p),
+    "nncoss_llm_model_loader_write": ([C.c_void_p, C.c_void_p, C.c_size_t], C.c_int),
+    "nncoss_llm_model_loader_finish": ([C.c_void_p], C.c_void_p),
+    "nncoss_llm_model_loader_free": ([C.c_void_p], None),
     "nncoss_llm_model_free": ([C.c_void_p], None),
     "nncoss_llm_model_vocab_size": ([C.c_void_p], C.c_uint32),
     "nncoss_llm_model_max_context": ([C.c_void_p], C.c_uint32),
@@ -78,15 +85,15 @@ class NativeTarget:
 class WasmTarget:
     name = "WASM"
 
-    def __init__(self, path):
+    def __init__(self, path, memory_reservation=DEFAULT_MEMORY_RESERVATION):
         try:
             from wasmtime import Config, Engine, Instance, Module, Store
         except ImportError as error:
             raise SystemExit("WASM 验收依赖 wasmtime，请安装 Python wasmtime 包") from error
         config = Config()
         config.memory_guard_size = 1024 * 1024
-        config.memory_reservation = 64 * 1024 * 1024
-        config.memory_reservation_for_growth = 64 * 1024 * 1024
+        config.memory_reservation = memory_reservation
+        config.memory_reservation_for_growth = DEFAULT_MEMORY_RESERVATION
         config.signals_based_traps = False
         config.parallel_compilation = False
         self.store = Store(Engine(config))
@@ -105,6 +112,9 @@ class WasmTarget:
 
     def read(self, pointer, length):
         return bytes(self.memory.read(self.store, pointer, pointer + length))
+
+    def memory_bytes(self):
+        return self.memory.data_len(self.store)
 
     def read_c_string(self, pointer):
         output = bytearray()
@@ -187,6 +197,66 @@ def load_model(target, model_bytes):
     return with_buffer(target, len(model_bytes), run)
 
 
+def split_chunks(data, chunk_size):
+    return (data[start:start + chunk_size] for start in range(0, len(data), chunk_size))
+
+
+def stream_model(target, chunks, total_length, chunk_size):
+    loader = target.call("nncoss_llm_model_loader_new", total_length)
+    expect(loader != 0, target, "模型加载器创建失败")
+
+    def run(pointer):
+        for chunk in chunks:
+            target.write(pointer, chunk)
+            status = target.call("nncoss_llm_model_loader_write", loader, pointer, len(chunk))
+            if status != OK:
+                return 0, status, last_error(target)
+        model = target.call("nncoss_llm_model_loader_finish", loader)
+        return model, OK, error_after(target, model == 0)
+
+    try:
+        return with_buffer(target, chunk_size, run)
+    finally:
+        target.call("nncoss_llm_model_loader_free", loader)
+
+
+def run_stream_scenario(target, model_bytes, expected_logits, errors):
+    total = len(model_bytes)
+    model, _, message = stream_model(target, split_chunks(model_bytes, STREAM_CHUNK), total, STREAM_CHUNK)
+    expect(model != 0, target, "分块加载失败：" + message)
+    session = target.call("nncoss_llm_session_new", model, 8)
+    target.call("nncoss_llm_model_free", model)
+    expect(session != 0, target, "分块加载后会话创建失败")
+    status, _ = prefill(target, session, [1, 2])
+    expect_status(target, status, OK, "stream_prefill", errors)
+    status, logits, _ = copy_logits(target, session, VOCAB)
+    expect_status(target, status, OK, "stream_copy_logits", errors)
+    target.call("nncoss_llm_session_free", session)
+    expect(logits == expected_logits, target, "分块加载与整块加载的 logits 不一致")
+
+    model, status, message = stream_model(target, split_chunks(model_bytes[:-1], STREAM_CHUNK), total, STREAM_CHUNK)
+    expect(model == 0 and status == OK and message, target, "截断的分块数据被错误接受")
+    errors.append(("loader_truncated", None, message))
+    model, status, message = stream_model(target, split_chunks(model_bytes, STREAM_CHUNK), total - 1, STREAM_CHUNK)
+    expect(model == 0, target, "声明长度不足的模型被错误接受")
+    expect_status(target, status, INVALID_MODEL, "loader_short_declared_length", errors, message)
+    model, status, message = stream_model(target, split_chunks(model_bytes + b"\0", STREAM_CHUNK), total, STREAM_CHUNK)
+    expect(model == 0, target, "超过声明长度的写入被错误接受")
+    expect_status(target, status, INVALID_ARGUMENT, "loader_overlong_write", errors, message)
+
+    loader = target.call("nncoss_llm_model_loader_new", total)
+    expect(loader != 0, target, "模型加载器创建失败")
+    expect(target.call("nncoss_llm_model_loader_finish", loader) == 0, target, "空加载器被错误接受")
+    errors.append(("loader_finish_empty", None, last_error(target)))
+    expect(target.call("nncoss_llm_model_loader_finish", loader) == 0, target, "加载器被重复结束")
+    errors.append(("loader_finish_twice", None, last_error(target)))
+    status = target.call("nncoss_llm_model_loader_write", loader, 0, 0)
+    expect_status(target, status, INVALID_ARGUMENT, "loader_write_after_finish", errors)
+    target.call("nncoss_llm_model_loader_free", loader)
+    status = target.call("nncoss_llm_model_loader_write", 0, 0, 0)
+    expect_status(target, status, INVALID_ARGUMENT, "loader_write_null", errors)
+
+
 def run_scenario(target, model_bytes):
     errors = []
     expect(target.call("nncoss_llm_abi_version") == 1, target, "ABI 版本错误")
@@ -234,6 +304,7 @@ def run_scenario(target, model_bytes):
     status, _, message = copy_logits(target, session, VOCAB)
     expect_status(target, status, NO_LOGITS, "copy_logits_after_reset", errors, message)
     target.call("nncoss_llm_session_free", session)
+    run_stream_scenario(target, model_bytes, first_logits, errors)
     return {
         "token": next_token,
         "first_logits": first_logits,

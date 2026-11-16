@@ -6,6 +6,8 @@ const FLAG_TIED_EMBEDDINGS: u32 = 1;
 const FLAG_QKV_BIAS: u32 = 2;
 const FLAG_QK_NORM: u32 = 4;
 const KNOWN_FLAGS: u32 = FLAG_TIED_EMBEDDINGS | FLAG_QKV_BIAS | FLAG_QK_NORM;
+const HEADER_LENGTH: usize = 64;
+const VALUE_LENGTH: usize = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
@@ -89,7 +91,7 @@ impl Config {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub(crate) struct LayerWeights {
     pub attn_norm: Vec<f32>,
     pub q_proj: Vec<f32>,
@@ -118,112 +120,9 @@ pub struct Model {
 
 impl Model {
     pub fn from_bytes(bytes: &[u8]) -> Result<Self> {
-        let mut reader = Reader::new(bytes);
-        if reader.take(MODEL_MAGIC.len())? != MODEL_MAGIC {
-            return Err(Error::InvalidModel("magic 不匹配"));
-        }
-        let version = reader.read_u32()?;
-        if version != MODEL_FORMAT_VERSION {
-            return Err(Error::Unsupported("模型格式版本"));
-        }
-        let architecture = reader.read_u32()?;
-        if architecture != MODEL_ARCHITECTURE {
-            return Err(Error::Unsupported("模型架构"));
-        }
-        let vocab_size = reader.read_u32()? as usize;
-        let hidden_size = reader.read_u32()? as usize;
-        let intermediate_size = reader.read_u32()? as usize;
-        let layer_count = reader.read_u32()? as usize;
-        let head_count = reader.read_u32()? as usize;
-        let kv_head_count = reader.read_u32()? as usize;
-        let head_dim = reader.read_u32()? as usize;
-        let max_context = reader.read_u32()? as usize;
-        let flags = reader.read_u32()?;
-        if flags & !KNOWN_FLAGS != 0 {
-            return Err(Error::Unsupported("模型 flags"));
-        }
-        let rope_mode = RopeMode::try_from(reader.read_u32()?)?;
-        let norm_eps = reader.read_f32()?;
-        let rope_theta = reader.read_f32()?;
-        let config = Config {
-            vocab_size,
-            hidden_size,
-            intermediate_size,
-            layer_count,
-            head_count,
-            kv_head_count,
-            head_dim,
-            max_context,
-            norm_eps,
-            rope_theta,
-            rope_mode,
-            tied_embeddings: flags & FLAG_TIED_EMBEDDINGS != 0,
-            qkv_bias: flags & FLAG_QKV_BIAS != 0,
-            qk_norm: flags & FLAG_QK_NORM != 0,
-        };
-        config.validate()?;
-        let q_dim = config.q_dim();
-        let kv_dim = config.kv_dim();
-        let token_embedding = reader.read_f32s(area(vocab_size, hidden_size)?)?;
-        let mut layers = Vec::new();
-        for _ in 0..layer_count {
-            let attn_norm = reader.read_f32s(hidden_size)?;
-            let q_proj = reader.read_f32s(area(q_dim, hidden_size)?)?;
-            let k_proj = reader.read_f32s(area(kv_dim, hidden_size)?)?;
-            let v_proj = reader.read_f32s(area(kv_dim, hidden_size)?)?;
-            let (q_bias, k_bias, v_bias) = if config.qkv_bias {
-                (
-                    Some(reader.read_f32s(q_dim)?),
-                    Some(reader.read_f32s(kv_dim)?),
-                    Some(reader.read_f32s(kv_dim)?),
-                )
-            } else {
-                (None, None, None)
-            };
-            let (q_norm, k_norm) = if config.qk_norm {
-                (
-                    Some(reader.read_f32s(head_dim)?),
-                    Some(reader.read_f32s(head_dim)?),
-                )
-            } else {
-                (None, None)
-            };
-            let o_proj = reader.read_f32s(area(hidden_size, q_dim)?)?;
-            let ffn_norm = reader.read_f32s(hidden_size)?;
-            let gate_proj = reader.read_f32s(area(intermediate_size, hidden_size)?)?;
-            let up_proj = reader.read_f32s(area(intermediate_size, hidden_size)?)?;
-            let down_proj = reader.read_f32s(area(hidden_size, intermediate_size)?)?;
-            layers.push(LayerWeights {
-                attn_norm,
-                q_proj,
-                k_proj,
-                v_proj,
-                q_bias,
-                k_bias,
-                v_bias,
-                q_norm,
-                k_norm,
-                o_proj,
-                ffn_norm,
-                gate_proj,
-                up_proj,
-                down_proj,
-            });
-        }
-        let final_norm = reader.read_f32s(hidden_size)?;
-        let lm_head = if config.tied_embeddings {
-            None
-        } else {
-            Some(reader.read_f32s(area(vocab_size, hidden_size)?)?)
-        };
-        reader.finish()?;
-        Ok(Self {
-            config,
-            token_embedding,
-            layers,
-            final_norm,
-            lm_head,
-        })
+        let mut loader = ModelLoader::new(bytes.len());
+        loader.write(bytes)?;
+        loader.finish()
     }
 
     pub fn config(&self) -> &Config {
@@ -231,9 +130,383 @@ impl Model {
     }
 }
 
+fn parse_header(bytes: &[u8]) -> Result<Config> {
+    let mut reader = Reader::new(bytes);
+    if reader.take(MODEL_MAGIC.len())? != MODEL_MAGIC {
+        return Err(Error::InvalidModel("magic 不匹配"));
+    }
+    let version = reader.read_u32()?;
+    if version != MODEL_FORMAT_VERSION {
+        return Err(Error::Unsupported("模型格式版本"));
+    }
+    let architecture = reader.read_u32()?;
+    if architecture != MODEL_ARCHITECTURE {
+        return Err(Error::Unsupported("模型架构"));
+    }
+    let vocab_size = reader.read_u32()? as usize;
+    let hidden_size = reader.read_u32()? as usize;
+    let intermediate_size = reader.read_u32()? as usize;
+    let layer_count = reader.read_u32()? as usize;
+    let head_count = reader.read_u32()? as usize;
+    let kv_head_count = reader.read_u32()? as usize;
+    let head_dim = reader.read_u32()? as usize;
+    let max_context = reader.read_u32()? as usize;
+    let flags = reader.read_u32()?;
+    if flags & !KNOWN_FLAGS != 0 {
+        return Err(Error::Unsupported("模型 flags"));
+    }
+    let rope_mode = RopeMode::try_from(reader.read_u32()?)?;
+    let norm_eps = reader.read_f32()?;
+    let rope_theta = reader.read_f32()?;
+    let config = Config {
+        vocab_size,
+        hidden_size,
+        intermediate_size,
+        layer_count,
+        head_count,
+        kv_head_count,
+        head_dim,
+        max_context,
+        norm_eps,
+        rope_theta,
+        rope_mode,
+        tied_embeddings: flags & FLAG_TIED_EMBEDDINGS != 0,
+        qkv_bias: flags & FLAG_QKV_BIAS != 0,
+        qk_norm: flags & FLAG_QK_NORM != 0,
+    };
+    config.validate()?;
+    Ok(config)
+}
+
 fn area(rows: usize, columns: usize) -> Result<usize> {
     rows.checked_mul(columns)
         .ok_or(Error::InvalidModel("张量尺寸溢出"))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Slot {
+    TokenEmbedding,
+    AttnNorm,
+    QProj,
+    KProj,
+    VProj,
+    QBias,
+    KBias,
+    VBias,
+    QNorm,
+    KNorm,
+    OProj,
+    FfnNorm,
+    GateProj,
+    UpProj,
+    DownProj,
+    FinalNorm,
+    LmHead,
+}
+
+impl Slot {
+    fn value_count(self, config: &Config) -> Result<usize> {
+        let hidden = config.hidden_size;
+        match self {
+            Self::TokenEmbedding | Self::LmHead => area(config.vocab_size, hidden),
+            Self::AttnNorm | Self::FfnNorm | Self::FinalNorm => Ok(hidden),
+            Self::QProj => area(config.q_dim(), hidden),
+            Self::KProj | Self::VProj => area(config.kv_dim(), hidden),
+            Self::QBias => Ok(config.q_dim()),
+            Self::KBias | Self::VBias => Ok(config.kv_dim()),
+            Self::QNorm | Self::KNorm => Ok(config.head_dim),
+            Self::OProj => area(hidden, config.q_dim()),
+            Self::GateProj | Self::UpProj => area(config.intermediate_size, hidden),
+            Self::DownProj => area(hidden, config.intermediate_size),
+        }
+    }
+
+    fn next(self, config: &Config, finished_layers: usize) -> Option<Self> {
+        let after_projections = if config.qk_norm {
+            Self::QNorm
+        } else {
+            Self::OProj
+        };
+        Some(match self {
+            Self::TokenEmbedding => Self::AttnNorm,
+            Self::AttnNorm => Self::QProj,
+            Self::QProj => Self::KProj,
+            Self::KProj => Self::VProj,
+            Self::VProj if config.qkv_bias => Self::QBias,
+            Self::VProj => after_projections,
+            Self::QBias => Self::KBias,
+            Self::KBias => Self::VBias,
+            Self::VBias => after_projections,
+            Self::QNorm => Self::KNorm,
+            Self::KNorm => Self::OProj,
+            Self::OProj => Self::FfnNorm,
+            Self::FfnNorm => Self::GateProj,
+            Self::GateProj => Self::UpProj,
+            Self::UpProj => Self::DownProj,
+            Self::DownProj if finished_layers < config.layer_count => Self::AttnNorm,
+            Self::DownProj => Self::FinalNorm,
+            Self::FinalNorm if config.tied_embeddings => return None,
+            Self::FinalNorm => Self::LmHead,
+            Self::LmHead => return None,
+        })
+    }
+}
+
+#[derive(Debug)]
+struct Tensor {
+    slot: Slot,
+    count: usize,
+    values: Vec<f32>,
+    finite: bool,
+}
+
+impl Tensor {
+    fn open(slot: Slot, config: &Config, position: usize, total: usize) -> Result<Self> {
+        let count = slot.value_count(config)?;
+        let byte_count = count
+            .checked_mul(VALUE_LENGTH)
+            .ok_or(Error::InvalidModel("张量尺寸溢出"))?;
+        let end = position
+            .checked_add(byte_count)
+            .ok_or(Error::InvalidModel("模型长度溢出"))?;
+        if end > total {
+            return Err(Error::InvalidModel("模型数据被截断"));
+        }
+        let mut values = Vec::new();
+        values
+            .try_reserve_exact(count)
+            .map_err(|_| Error::Allocation)?;
+        Ok(Self {
+            slot,
+            count,
+            values,
+            finite: true,
+        })
+    }
+
+    fn missing(&self) -> usize {
+        self.count - self.values.len()
+    }
+
+    fn push(&mut self, bytes: &[u8]) {
+        let mut finite = self.finite;
+        self.values
+            .extend(bytes.chunks_exact(VALUE_LENGTH).map(|chunk| {
+                let value = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+                finite &= value.is_finite();
+                value
+            }));
+        self.finite = finite;
+    }
+}
+
+#[derive(Debug)]
+struct Assembly {
+    config: Config,
+    token_embedding: Vec<f32>,
+    layers: Vec<LayerWeights>,
+    layer: LayerWeights,
+    final_norm: Vec<f32>,
+    lm_head: Option<Vec<f32>>,
+    tensor: Option<Tensor>,
+}
+
+impl Assembly {
+    fn open(config: Config, position: usize, total: usize) -> Result<Self> {
+        let tensor = Tensor::open(Slot::TokenEmbedding, &config, position, total)?;
+        Ok(Self {
+            config,
+            token_embedding: Vec::new(),
+            layers: Vec::new(),
+            layer: LayerWeights::default(),
+            final_norm: Vec::new(),
+            lm_head: None,
+            tensor: Some(tensor),
+        })
+    }
+
+    fn store(&mut self, slot: Slot, values: Vec<f32>) -> Result<()> {
+        match slot {
+            Slot::TokenEmbedding => self.token_embedding = values,
+            Slot::AttnNorm => self.layer.attn_norm = values,
+            Slot::QProj => self.layer.q_proj = values,
+            Slot::KProj => self.layer.k_proj = values,
+            Slot::VProj => self.layer.v_proj = values,
+            Slot::QBias => self.layer.q_bias = Some(values),
+            Slot::KBias => self.layer.k_bias = Some(values),
+            Slot::VBias => self.layer.v_bias = Some(values),
+            Slot::QNorm => self.layer.q_norm = Some(values),
+            Slot::KNorm => self.layer.k_norm = Some(values),
+            Slot::OProj => self.layer.o_proj = values,
+            Slot::FfnNorm => self.layer.ffn_norm = values,
+            Slot::GateProj => self.layer.gate_proj = values,
+            Slot::UpProj => self.layer.up_proj = values,
+            Slot::DownProj => {
+                self.layer.down_proj = values;
+                self.layers.try_reserve(1).map_err(|_| Error::Allocation)?;
+                self.layers.push(std::mem::take(&mut self.layer));
+            }
+            Slot::FinalNorm => self.final_norm = values,
+            Slot::LmHead => self.lm_head = Some(values),
+        }
+        Ok(())
+    }
+
+    fn close_tensor(&mut self, position: usize, total: usize) -> Result<()> {
+        let Some(tensor) = self.tensor.take() else {
+            return Ok(());
+        };
+        if !tensor.finite {
+            return Err(Error::InvalidModel("权重包含非有限值"));
+        }
+        self.store(tensor.slot, tensor.values)?;
+        match tensor.slot.next(&self.config, self.layers.len()) {
+            Some(slot) => {
+                self.tensor = Some(Tensor::open(slot, &self.config, position, total)?);
+            }
+            None if position != total => {
+                return Err(Error::InvalidModel("模型末尾存在多余数据"));
+            }
+            None => {}
+        }
+        Ok(())
+    }
+
+    fn into_model(self) -> Result<Model> {
+        if self.tensor.is_some() {
+            return Err(Error::InvalidModel("模型数据被截断"));
+        }
+        Ok(Model {
+            config: self.config,
+            token_embedding: self.token_embedding,
+            layers: self.layers,
+            final_norm: self.final_norm,
+            lm_head: self.lm_head,
+        })
+    }
+}
+
+#[derive(Debug)]
+enum LoaderState {
+    Header,
+    Tensors(Box<Assembly>),
+    Failed(Error),
+}
+
+#[derive(Debug)]
+pub struct ModelLoader {
+    total: usize,
+    position: usize,
+    carry: [u8; HEADER_LENGTH],
+    carry_length: usize,
+    state: LoaderState,
+}
+
+impl ModelLoader {
+    pub fn new(total_length: usize) -> Self {
+        Self {
+            total: total_length,
+            position: 0,
+            carry: [0; HEADER_LENGTH],
+            carry_length: 0,
+            state: LoaderState::Header,
+        }
+    }
+
+    pub fn position(&self) -> usize {
+        self.position
+    }
+
+    pub fn write(&mut self, bytes: &[u8]) -> Result<()> {
+        let result = self.consume(bytes);
+        if let Err(error) = &result {
+            self.state = LoaderState::Failed(error.clone());
+        }
+        result
+    }
+
+    pub fn finish(self) -> Result<Model> {
+        match self.state {
+            LoaderState::Failed(error) => Err(error),
+            LoaderState::Header => {
+                parse_header(&self.carry[..self.carry_length])?;
+                Err(Error::InvalidModel("模型数据被截断"))
+            }
+            LoaderState::Tensors(assembly) => assembly.into_model(),
+        }
+    }
+
+    fn consume(&mut self, mut bytes: &[u8]) -> Result<()> {
+        if let LoaderState::Failed(error) = &self.state {
+            return Err(error.clone());
+        }
+        if bytes.len() > self.total - self.position {
+            return Err(Error::InvalidArgument("写入长度超过声明的模型长度"));
+        }
+        if matches!(self.state, LoaderState::Header) {
+            bytes = self.fill_carry(bytes, HEADER_LENGTH);
+            if self.carry_length < HEADER_LENGTH {
+                return Ok(());
+            }
+            let config = parse_header(&self.carry)?;
+            self.carry_length = 0;
+            let assembly = Assembly::open(config, self.position, self.total)?;
+            self.state = LoaderState::Tensors(Box::new(assembly));
+        }
+        while !bytes.is_empty() {
+            if self.carry_length > 0 || bytes.len() < VALUE_LENGTH {
+                bytes = self.fill_carry(bytes, VALUE_LENGTH);
+                if self.carry_length < VALUE_LENGTH {
+                    return Ok(());
+                }
+                self.carry_length = 0;
+                let value = self.carry;
+                self.push_values(&value[..VALUE_LENGTH])?;
+            } else {
+                let missing = self.missing_values()?;
+                let length = (bytes.len() / VALUE_LENGTH).min(missing) * VALUE_LENGTH;
+                let (values, rest) = bytes.split_at(length);
+                self.position += length;
+                self.push_values(values)?;
+                bytes = rest;
+            }
+        }
+        Ok(())
+    }
+
+    fn fill_carry<'a>(&mut self, bytes: &'a [u8], target: usize) -> &'a [u8] {
+        let length = (target - self.carry_length).min(bytes.len());
+        let (head, rest) = bytes.split_at(length);
+        self.carry[self.carry_length..self.carry_length + length].copy_from_slice(head);
+        self.carry_length += length;
+        self.position += length;
+        rest
+    }
+
+    fn missing_values(&self) -> Result<usize> {
+        match &self.state {
+            LoaderState::Tensors(assembly) => match &assembly.tensor {
+                Some(tensor) => Ok(tensor.missing()),
+                None => Err(Error::InvalidModel("模型末尾存在多余数据")),
+            },
+            _ => Err(Error::InvalidArgument("模型加载器状态无效")),
+        }
+    }
+
+    fn push_values(&mut self, bytes: &[u8]) -> Result<()> {
+        let (position, total) = (self.position, self.total);
+        let LoaderState::Tensors(assembly) = &mut self.state else {
+            return Err(Error::InvalidArgument("模型加载器状态无效"));
+        };
+        let Some(tensor) = &mut assembly.tensor else {
+            return Err(Error::InvalidModel("模型末尾存在多余数据"));
+        };
+        tensor.push(bytes);
+        if tensor.missing() == 0 {
+            assembly.close_tensor(position, total)?;
+        }
+        Ok(())
+    }
 }
 
 struct Reader<'a> {
@@ -266,32 +539,6 @@ impl<'a> Reader<'a> {
 
     fn read_f32(&mut self) -> Result<f32> {
         Ok(f32::from_bits(self.read_u32()?))
-    }
-
-    fn read_f32s(&mut self, count: usize) -> Result<Vec<f32>> {
-        let byte_count = count
-            .checked_mul(4)
-            .ok_or(Error::InvalidModel("张量尺寸溢出"))?;
-        let bytes = self.take(byte_count)?;
-        let mut values = Vec::new();
-        values
-            .try_reserve_exact(count)
-            .map_err(|_| Error::Allocation)?;
-        for chunk in bytes.chunks_exact(4) {
-            let value = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-            if !value.is_finite() {
-                return Err(Error::InvalidModel("权重包含非有限值"));
-            }
-            values.push(value);
-        }
-        Ok(values)
-    }
-
-    fn finish(&self) -> Result<()> {
-        if self.position != self.bytes.len() {
-            return Err(Error::InvalidModel("模型末尾存在多余数据"));
-        }
-        Ok(())
     }
 }
 
@@ -413,5 +660,220 @@ mod tests {
         assert_eq!(untied.len() - tied.len(), spec.vocab * spec.hidden * 4);
         assert!(spec.model().lm_head.is_none());
         assert!(TinySpec::WIDE.model().lm_head.is_some());
+    }
+
+    const TRUNCATED: Error = Error::InvalidModel("模型数据被截断");
+
+    fn weight_bytes(model: &Model) -> Vec<u8> {
+        let mut tensors: Vec<&[f32]> = vec![&model.token_embedding];
+        for layer in &model.layers {
+            tensors.extend(
+                [
+                    &layer.attn_norm,
+                    &layer.q_proj,
+                    &layer.k_proj,
+                    &layer.v_proj,
+                ]
+                .map(Vec::as_slice),
+            );
+            let optional = [
+                &layer.q_bias,
+                &layer.k_bias,
+                &layer.v_bias,
+                &layer.q_norm,
+                &layer.k_norm,
+            ];
+            tensors.extend(optional.into_iter().filter_map(|tensor| tensor.as_deref()));
+            let rest = [
+                &layer.o_proj,
+                &layer.ffn_norm,
+                &layer.gate_proj,
+                &layer.up_proj,
+                &layer.down_proj,
+            ];
+            tensors.extend(rest.map(Vec::as_slice));
+        }
+        tensors.push(&model.final_norm);
+        tensors.extend(model.lm_head.as_deref());
+        tensors
+            .into_iter()
+            .flatten()
+            .flat_map(|value| value.to_le_bytes())
+            .collect()
+    }
+
+    fn load_chunked(bytes: &[u8], total: usize, chunk: usize) -> Result<Model> {
+        let mut loader = ModelLoader::new(total);
+        for part in bytes.chunks(chunk) {
+            loader.write(part)?;
+        }
+        loader.finish()
+    }
+
+    #[test]
+    fn chunked_loading_reproduces_every_tensor_for_all_variants() {
+        use crate::test_utils::TinySpec;
+        let mut specs = TinySpec::wide_variants();
+        specs.push(TinySpec::BASE);
+        for spec in specs {
+            let bytes = spec.bytes();
+            let expected = spec.model();
+            for chunk in [1, 2, 3, 4, 5, 7, 63, 64, 65, 1024, bytes.len()] {
+                let model = load_chunked(&bytes, bytes.len(), chunk).unwrap();
+                assert_eq!(model.config, expected.config);
+                assert_eq!(model.layers.len(), spec.layers);
+                assert_eq!(weight_bytes(&model), &bytes[HEADER_LENGTH..]);
+            }
+        }
+    }
+
+    #[test]
+    fn every_two_part_split_matches_single_write() {
+        let bytes = tiny_model_bytes();
+        for split in 0..=bytes.len() {
+            let mut loader = ModelLoader::new(bytes.len());
+            loader.write(&bytes[..split]).unwrap();
+            assert_eq!(loader.position(), split);
+            loader.write(&bytes[split..]).unwrap();
+            assert_eq!(loader.position(), bytes.len());
+            let model = loader.finish().unwrap();
+            assert_eq!(weight_bytes(&model), &bytes[HEADER_LENGTH..]);
+        }
+    }
+
+    #[test]
+    fn truncated_streams_fail_at_every_length() {
+        let bytes = tiny_model_bytes();
+        for length in 0..bytes.len() {
+            let prefix = &bytes[..length];
+            for chunk in [1, 5, 64, bytes.len()] {
+                assert_eq!(
+                    load_chunked(prefix, bytes.len(), chunk).unwrap_err(),
+                    TRUNCATED,
+                    "stream of {length} bytes in chunks of {chunk}"
+                );
+                assert_eq!(
+                    load_chunked(prefix, length, chunk).unwrap_err(),
+                    TRUNCATED,
+                    "file of {length} bytes in chunks of {chunk}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn stream_errors_are_independent_of_chunking() {
+        let bytes = tiny_model_bytes();
+        let last = bytes.len() - 4;
+        let patches = [
+            (0, 0_u32, Error::InvalidModel("magic 不匹配")),
+            (8, 2, Error::Unsupported("模型格式版本")),
+            (12, 2, Error::Unsupported("模型架构")),
+            (16, 0, Error::InvalidModel("模型维度必须为非零值")),
+            (48, 14, Error::Unsupported("模型 flags")),
+            (52, 2, Error::Unsupported("RoPE 模式")),
+            (
+                64,
+                f32::NAN.to_bits(),
+                Error::InvalidModel("权重包含非有限值"),
+            ),
+            (
+                last,
+                f32::INFINITY.to_bits(),
+                Error::InvalidModel("权重包含非有限值"),
+            ),
+        ];
+        let mut cases: Vec<(Vec<u8>, Error)> = patches
+            .into_iter()
+            .map(|(offset, value, error)| {
+                let mut case = bytes.clone();
+                case[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+                (case, error)
+            })
+            .collect();
+        let mut trailing = bytes.clone();
+        trailing.push(0);
+        cases.push((trailing, Error::InvalidModel("模型末尾存在多余数据")));
+        for (case, expected) in cases {
+            assert_eq!(Model::from_bytes(&case).unwrap_err(), expected);
+            for chunk in [1, 3, 4, 64, 100] {
+                assert_eq!(
+                    load_chunked(&case, case.len(), chunk).unwrap_err(),
+                    expected
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn partial_header_reports_field_errors_before_truncation() {
+        let mut bytes = tiny_model_bytes();
+        bytes[0] ^= 1;
+        let mut loader = ModelLoader::new(bytes.len());
+        loader.write(&bytes[..10]).unwrap();
+        assert_eq!(
+            loader.finish().unwrap_err(),
+            Error::InvalidModel("magic 不匹配")
+        );
+        assert_eq!(
+            Model::from_bytes(&bytes[..10]).unwrap_err(),
+            Error::InvalidModel("magic 不匹配")
+        );
+        assert_eq!(Model::from_bytes(&bytes[..7]).unwrap_err(), TRUNCATED);
+    }
+
+    #[test]
+    fn non_finite_value_is_reported_when_its_tensor_completes() {
+        let mut bytes = tiny_model_bytes();
+        bytes[64..68].copy_from_slice(&f32::NAN.to_le_bytes());
+        let mut loader = ModelLoader::new(bytes.len());
+        loader.write(&bytes[..70]).unwrap();
+        assert_eq!(loader.finish().unwrap_err(), TRUNCATED);
+        let mut loader = ModelLoader::new(bytes.len());
+        loader.write(&bytes[..66]).unwrap();
+        assert_eq!(
+            loader.write(&bytes[66..]).unwrap_err(),
+            Error::InvalidModel("权重包含非有限值")
+        );
+    }
+
+    #[test]
+    fn failed_loader_keeps_reporting_its_first_error() {
+        let bytes = tiny_model_bytes();
+        let mut loader = ModelLoader::new(bytes.len());
+        loader.write(&bytes[..100]).unwrap();
+        let error = loader.write(&bytes[99..]).unwrap_err();
+        assert_eq!(error, Error::InvalidArgument("写入长度超过声明的模型长度"));
+        assert_eq!(loader.position(), 100);
+        assert_eq!(loader.write(&[]).unwrap_err(), error);
+        assert_eq!(loader.finish().unwrap_err(), error);
+
+        let mut invalid = bytes;
+        invalid[0] ^= 1;
+        let mut loader = ModelLoader::new(invalid.len());
+        let error = loader.write(&invalid[..64]).unwrap_err();
+        assert_eq!(error, Error::InvalidModel("magic 不匹配"));
+        assert_eq!(loader.write(&invalid[64..]).unwrap_err(), error);
+        assert_eq!(loader.finish().unwrap_err(), error);
+    }
+
+    #[test]
+    fn declared_length_rejects_oversized_headers_before_allocating() {
+        let mut bytes = tiny_model_bytes();
+        bytes[16..20].copy_from_slice(&u32::MAX.to_le_bytes());
+        let mut loader = ModelLoader::new(bytes.len());
+        assert_eq!(loader.write(&bytes[..64]).unwrap_err(), TRUNCATED);
+        assert_eq!(Model::from_bytes(&bytes).unwrap_err(), TRUNCATED);
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn unsatisfiable_tensor_allocation_fails_without_aborting() {
+        let mut bytes = tiny_model_bytes();
+        bytes[16..20].copy_from_slice(&u32::MAX.to_le_bytes());
+        bytes[20..24].copy_from_slice(&(1_u32 << 20).to_le_bytes());
+        let mut loader = ModelLoader::new(usize::MAX);
+        assert_eq!(loader.write(&bytes[..64]).unwrap_err(), Error::Allocation);
+        assert_eq!(loader.finish().unwrap_err(), Error::Allocation);
     }
 }

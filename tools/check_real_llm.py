@@ -41,12 +41,16 @@ def read_header(path):
     if fields[0] != MODEL_MAGIC:
         raise ValueError("模型文件 magic 不匹配")
     names = ("vocab", "hidden", "intermediate", "layers", "heads", "kv_heads", "head_dim", "max_context", "flags")
-    return dict(zip(names, fields[3:12]))
+    header = dict(zip(names, fields[3:12]))
+    header["quantized"] = bool(header["flags"] & 8)
+    return header
 
 
 def largest_tensor_bytes(header):
     hidden = header["hidden"]
     rows = max(header["vocab"], header["intermediate"], header["heads"] * header["head_dim"])
+    if header["quantized"]:
+        return (rows * (4 + (hidden + 31) // 32 * 17) + 3) // 4 * 4
     return rows * hidden * 4
 
 
@@ -214,6 +218,8 @@ def main():
         parser.error("--decode 需要非负整数，--chunk-bytes 需要正整数")
 
     header = read_header(args.model)
+    if header["quantized"] and args.hf_model is not None:
+        parser.error("Q4 模型不与 f32 Hugging Face 参考直接比较，请分开进行任务质量验收")
     size = args.model.stat().st_size
     if any(token < 0 or token >= header["vocab"] for token in args.prompt):
         parser.error("prompt token 超出词表范围")

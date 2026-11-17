@@ -57,9 +57,10 @@ impl KvCache {
         self.len
     }
 
-    pub fn append(
+    pub fn write(
         &mut self,
         layer: usize,
+        position: usize,
         keys: &[f32],
         values: &[f32],
         maximum: usize,
@@ -68,28 +69,53 @@ impl KvCache {
         if values.len() != kv_dim {
             return Err(Error::InvalidArgument("K/V 维度不一致"));
         }
+        if position >= maximum {
+            return Err(Error::InvalidArgument("KV Cache 位置超出上限"));
+        }
         let cache = &mut self.layers[layer];
-        cache.reserve(self.len + 1, kv_dim, maximum)?;
-        let start = self.len * kv_dim;
+        cache.reserve(position + 1, kv_dim, maximum)?;
+        let start = position * kv_dim;
         cache.keys[start..start + kv_dim].copy_from_slice(keys);
         cache.values[start..start + kv_dim].copy_from_slice(values);
         Ok(())
     }
 
+    #[cfg(test)]
+    pub fn append(
+        &mut self,
+        layer: usize,
+        keys: &[f32],
+        values: &[f32],
+        maximum: usize,
+    ) -> Result<()> {
+        self.write(layer, self.len, keys, values, maximum)
+    }
+
+    pub fn layer(&self, layer: usize) -> (&[f32], &[f32]) {
+        (&self.layers[layer].keys, &self.layers[layer].values)
+    }
+
+    #[cfg(test)]
     pub fn key(&self, layer: usize, position: usize, kv_head: usize, head_dim: usize) -> &[f32] {
         let kv_dim = self.layers[layer].keys.len() / self.layers[layer].capacity;
         let start = position * kv_dim + kv_head * head_dim;
         &self.layers[layer].keys[start..start + head_dim]
     }
 
+    #[cfg(test)]
     pub fn value(&self, layer: usize, position: usize, kv_head: usize, head_dim: usize) -> &[f32] {
         let kv_dim = self.layers[layer].values.len() / self.layers[layer].capacity;
         let start = position * kv_dim + kv_head * head_dim;
         &self.layers[layer].values[start..start + head_dim]
     }
 
+    pub fn finish_tokens(&mut self, count: usize) {
+        self.len += count;
+    }
+
+    #[cfg(test)]
     pub fn finish_token(&mut self) {
-        self.len += 1;
+        self.finish_tokens(1);
     }
 
     pub fn reset(&mut self) {

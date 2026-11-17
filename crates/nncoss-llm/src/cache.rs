@@ -4,6 +4,12 @@ use crate::{Error, Result};
 pub(crate) trait KvValue: Copy + Default + Send + Sync + 'static {
     fn from_f32(value: f32) -> Self;
     fn to_f32(self) -> f32;
+
+    fn store(values: &[f32], output: &mut [Self]) {
+        for (slot, value) in output.iter_mut().zip(values) {
+            *slot = Self::from_f32(*value);
+        }
+    }
 }
 
 impl KvValue for f32 {
@@ -28,6 +34,35 @@ impl KvValue for F16 {
     fn to_f32(self) -> f32 {
         f16_to_f32(self.0)
     }
+
+    fn store(values: &[f32], output: &mut [Self]) {
+        let length = values.len().min(output.len());
+        let mut done = 0;
+        #[cfg(target_arch = "x86_64")]
+        if std::arch::is_x86_feature_detected!("f16c") {
+            done = unsafe { store_f16c(&values[..length], &mut output[..length]) };
+        }
+        for (slot, value) in output[done..length].iter_mut().zip(&values[done..length]) {
+            *slot = Self::from_f32(*value);
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx,f16c")]
+unsafe fn store_f16c(values: &[f32], output: &mut [F16]) -> usize {
+    use std::arch::x86_64::*;
+
+    let blocks = values.len().min(output.len()) / 8;
+    for block in 0..blocks {
+        unsafe {
+            let packed = _mm256_cvtps_ph::<_MM_FROUND_TO_NEAREST_INT>(_mm256_loadu_ps(
+                values.as_ptr().add(block * 8),
+            ));
+            _mm_storeu_si128(output.as_mut_ptr().add(block * 8).cast(), packed);
+        }
+    }
+    blocks * 8
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,12 +133,8 @@ impl<T: KvValue> LayerCache<T> {
             .enumerate()
         {
             let start = (head * self.capacity + position) * head_dim;
-            for (slot, key) in self.keys[start..start + head_dim].iter_mut().zip(keys) {
-                *slot = T::from_f32(*key);
-            }
-            for (slot, value) in self.values[start..start + head_dim].iter_mut().zip(values) {
-                *slot = T::from_f32(*value);
-            }
+            T::store(keys, &mut self.keys[start..start + head_dim]);
+            T::store(values, &mut self.values[start..start + head_dim]);
         }
     }
 
@@ -313,6 +344,19 @@ mod tests {
         );
         assert_eq!(cache.entry(0, 0, 0, true)[1], -2.5);
         assert!((cache.entry(0, 0, 0, true)[0] - 1.0 / 3.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn bulk_f16_store_matches_scalar_conversion() {
+        let values: Vec<f32> = (0..1037_i32)
+            .map(|index| ((index as f32) * 0.731).sin() * 10f32.powi(index % 13 - 6))
+            .chain([0.0, -0.0, 65520.0, -1e-9, f32::INFINITY, 70000.0])
+            .collect();
+        let mut bulk = vec![F16::default(); values.len()];
+        F16::store(&values, &mut bulk);
+        for (value, stored) in values.iter().zip(&bulk) {
+            assert_eq!(stored.0, f32_to_f16(*value), "{value:e}");
+        }
     }
 
     #[test]

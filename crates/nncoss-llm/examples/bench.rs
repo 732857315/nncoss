@@ -136,6 +136,9 @@ struct Options {
     prompt: usize,
     decode: usize,
     greedy: bool,
+    tokens: Option<String>,
+    generate: bool,
+    eos: Vec<u32>,
 }
 
 fn parse_options() -> Result<Options, String> {
@@ -146,6 +149,9 @@ fn parse_options() -> Result<Options, String> {
     let mut prompt = 24;
     let mut decode = 64;
     let mut greedy = false;
+    let mut tokens = None;
+    let mut generate = false;
+    let mut eos = Vec::new();
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         let mut value = || args.next().ok_or(format!("{arg} 需要参数"));
@@ -182,9 +188,18 @@ fn parse_options() -> Result<Options, String> {
                     .ok_or("--decode 需要正整数")?;
             }
             "--greedy" => greedy = true,
+            "--tokens" => tokens = Some(value()?),
+            "--generate" => generate = true,
+            "--eos" => {
+                eos = value()?
+                    .split(',')
+                    .map(|token| token.trim().parse::<u32>())
+                    .collect::<Result<_, _>>()
+                    .map_err(|_| "--eos 需要逗号分隔的 token id".to_string())?;
+            }
             "--help" | "-h" => {
                 return Err(
-                    "用法：bench [--preset tiny|small] [--iterations N] [--write-model PATH]\n      bench --model PATH [--prompt N] [--decode N] [--greedy] [--iterations N]"
+                    "用法：bench [--preset tiny|small] [--iterations N] [--write-model PATH]\n      bench --model PATH [--prompt N | --tokens FILE] [--decode N] [--greedy] [--generate [--eos IDS]] [--iterations N]"
                         .into(),
                 );
             }
@@ -199,6 +214,9 @@ fn parse_options() -> Result<Options, String> {
         prompt,
         decode,
         greedy,
+        tokens,
+        generate,
+        eos,
     })
 }
 
@@ -214,10 +232,25 @@ fn run_model(path: &str, options: &Options) -> Result<(), String> {
     let load_ms = started.elapsed().as_secs_f64() * 1e3;
     drop(bytes);
     let vocab = model.config().vocab_size;
-    let context = options.prompt + options.decode;
-    let prompt: Vec<u32> = (0..options.prompt)
-        .map(|index| ((index * 7919 + 1000) % vocab.min(100_000)) as u32)
-        .collect();
+    let prompt: Vec<u32> = match &options.tokens {
+        Some(file) => std::fs::read_to_string(file)
+            .map_err(|error| format!("读取 {file} 失败：{error}"))?
+            .split(|character: char| character == ',' || character.is_whitespace())
+            .filter(|token| !token.is_empty())
+            .map(|token| {
+                token
+                    .parse::<u32>()
+                    .map_err(|_| format!("{file} 包含无效 token：{token}"))
+            })
+            .collect::<Result<_, _>>()?,
+        None => (0..options.prompt)
+            .map(|index| ((index * 7919 + 1000) % vocab.min(100_000)) as u32)
+            .collect(),
+    };
+    if prompt.is_empty() {
+        return Err("prompt 不能为空".into());
+    }
+    let context = prompt.len() + options.decode + 1;
     let sampling = if options.greedy {
         SamplingConfig::default()
     } else {
@@ -227,6 +260,9 @@ fn run_model(path: &str, options: &Options) -> Result<(), String> {
             top_p: 0.95,
         }
     };
+    if options.generate {
+        return compare_generation(&model, &prompt, context, sampling, options);
+    }
     let mut prefill_ms = Vec::new();
     let mut decode_ms = Vec::new();
     let mut generated = Vec::new();
@@ -285,6 +321,54 @@ fn run_model(path: &str, options: &Options) -> Result<(), String> {
         options.decode as f64 / fastest * 1e3
     );
     println!("token_checksum: {checksum}");
+    Ok(())
+}
+
+fn compare_generation(
+    model: &Arc<Model>,
+    prompt: &[u32],
+    context: usize,
+    sampling: SamplingConfig,
+    options: &Options,
+) -> Result<(), String> {
+    let (history, last) = prompt.split_at(prompt.len() - 1);
+    let mut outputs = Vec::new();
+    for speculation in [false, true] {
+        let mut rates = Vec::new();
+        let mut counts = (0, 0);
+        let mut output = Vec::new();
+        for iteration in 0..=options.iterations {
+            let mut session = Session::new(model.clone(), context).map_err(|e| e.to_string())?;
+            session
+                .set_sampler(sampling, 42)
+                .map_err(|e| e.to_string())?;
+            session.set_speculation(speculation);
+            if !history.is_empty() {
+                session.prefill(history).map_err(|e| e.to_string())?;
+            }
+            let started = Instant::now();
+            let generated = session
+                .generate(last, options.decode, &options.eos)
+                .map_err(|e| e.to_string())?;
+            let seconds = started.elapsed().as_secs_f64();
+            if iteration > 0 {
+                rates.push(generated.len() as f64 / seconds);
+            }
+            counts = session.speculation_counts();
+            output = generated;
+        }
+        let rate = median(&mut rates);
+        println!(
+            "speculation={speculation}: generated={} tokens_per_s={rate:.1} drafted={} accepted={}",
+            output.len(),
+            counts.0,
+            counts.1
+        );
+        outputs.push(output);
+    }
+    if options.greedy {
+        println!("greedy_outputs_identical: {}", outputs[0] == outputs[1]);
+    }
     Ok(())
 }
 

@@ -25,22 +25,92 @@ macro_rules! simd_fn {
     };
 }
 
-pub(crate) fn linear_rows(
+pub(crate) unsafe fn linear_rows(
     weights: &[f32],
     columns: usize,
-    input: &[f32],
+    inputs: &[f32],
     rows: Range<usize>,
     bias: Option<&[f32]>,
-    output: &mut [f32],
+    output: *mut f32,
+    stride: usize,
 ) {
-    debug_assert_eq!(input.len(), columns);
-    for (row, output) in rows.zip(output) {
-        let weights = &weights[row * columns..(row + 1) * columns];
-        let mut sum = bias.map_or(0.0, |values| values[row]);
-        for (weight, value) in weights.iter().zip(input) {
-            sum += weight * value;
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2") {
+        unsafe { linear_rows_avx2(weights, columns, inputs, rows, bias, output, stride) };
+        return;
+    }
+    unsafe {
+        linear_rows_with(
+            weights,
+            columns,
+            inputs,
+            rows,
+            bias,
+            output,
+            stride,
+            dot,
+            |_| {},
+        )
+    };
+}
+
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+unsafe fn linear_rows_with(
+    weights: &[f32],
+    columns: usize,
+    inputs: &[f32],
+    rows: Range<usize>,
+    bias: Option<&[f32]>,
+    output: *mut f32,
+    stride: usize,
+    dot: impl Fn(&[f32], &[f32]) -> f32,
+    prefetch: impl Fn(&[f32]),
+) {
+    for (offset, row) in rows.clone().enumerate() {
+        if row + 1 < rows.end {
+            prefetch(&weights[(row + 1) * columns..(row + 2) * columns]);
         }
-        *output = sum;
+        let weights = &weights[row * columns..(row + 1) * columns];
+        for (token, input) in inputs.chunks_exact(columns).enumerate() {
+            let product = dot(input, weights);
+            let value = match bias {
+                Some(bias) => product + bias[row],
+                None => product,
+            };
+            unsafe { output.add(token * stride + offset).write(value) };
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn linear_rows_avx2(
+    weights: &[f32],
+    columns: usize,
+    inputs: &[f32],
+    rows: Range<usize>,
+    bias: Option<&[f32]>,
+    output: *mut f32,
+    stride: usize,
+) {
+    unsafe {
+        linear_rows_with(
+            weights,
+            columns,
+            inputs,
+            rows,
+            bias,
+            output,
+            stride,
+            |left, right| dot_avx2(left, right),
+            |row| {
+                use std::arch::x86_64::{_MM_HINT_T0, _mm_prefetch};
+                for line in (0..row.len()).step_by(16) {
+                    _mm_prefetch::<_MM_HINT_T0>(row[line..].as_ptr().cast());
+                }
+            },
+        )
     }
 }
 
@@ -54,7 +124,17 @@ pub(crate) fn linear(
 ) -> Vec<f32> {
     debug_assert_eq!(weights.len(), rows * columns);
     let mut output = vec![0.0; rows];
-    linear_rows(weights, columns, input, 0..rows, bias, &mut output);
+    unsafe {
+        linear_rows(
+            weights,
+            columns,
+            input,
+            0..rows,
+            bias,
+            output.as_mut_ptr(),
+            rows,
+        )
+    };
     output
 }
 
@@ -271,7 +351,7 @@ pub(crate) fn apply_rope(
     apply_rope_table(values, heads, head_dim, &table, mode);
 }
 
-#[inline(always)]
+#[cfg(test)]
 fn softmax_in_place(values: &mut [f32]) {
     let maximum = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     for value in values.iter_mut() {
@@ -297,54 +377,57 @@ pub(crate) struct AttentionShape {
     pub head_dim: usize,
 }
 
+pub(crate) const ATTENTION_CHUNK: usize = if cfg!(test) { 8 } else { 256 };
+const PARTIAL_LIMIT: usize = if cfg!(test) { 4096 } else { 1 << 22 };
+
 pub(crate) trait AttendValue: KvValue {
-    fn attend(
+    fn chunk(
         queries: &[f32],
         keys: &[Self],
         values: &[Self],
         head_dim: usize,
         count: usize,
         scores: &mut [f32],
-        output: &mut [f32],
+        partials: &mut [f32],
     );
 }
 
 impl AttendValue for f32 {
-    fn attend(
+    fn chunk(
         queries: &[f32],
         keys: &[f32],
         values: &[f32],
         head_dim: usize,
         count: usize,
         scores: &mut [f32],
-        output: &mut [f32],
+        partials: &mut [f32],
     ) {
         #[cfg(target_arch = "x86_64")]
         if std::arch::is_x86_feature_detected!("avx2") {
             unsafe {
                 if head_dim % (LANES * 2) == 0 {
-                    attend_blocked_f32(queries, keys, values, head_dim, count, scores, output);
+                    chunk_blocked_f32(queries, keys, values, head_dim, count, scores, partials);
                 } else {
-                    attend_f32_avx2(queries, keys, values, head_dim, count, scores, output);
+                    chunk_f32_avx2(queries, keys, values, head_dim, count, scores, partials);
                 }
             }
             return;
         }
-        attend_with(
-            queries, keys, values, head_dim, count, scores, output, dot, axpy,
+        chunk_with(
+            queries, keys, values, head_dim, count, scores, partials, dot, axpy,
         );
     }
 }
 
 impl AttendValue for F16 {
-    fn attend(
+    fn chunk(
         queries: &[f32],
         keys: &[F16],
         values: &[F16],
         head_dim: usize,
         count: usize,
         scores: &mut [f32],
-        output: &mut [f32],
+        partials: &mut [f32],
     ) {
         #[cfg(target_arch = "x86_64")]
         if std::arch::is_x86_feature_detected!("avx2")
@@ -352,16 +435,54 @@ impl AttendValue for F16 {
         {
             unsafe {
                 if head_dim % (LANES * 2) == 0 {
-                    attend_blocked_f16(queries, keys, values, head_dim, count, scores, output);
+                    chunk_blocked_f16(queries, keys, values, head_dim, count, scores, partials);
                 } else {
-                    attend_f16_avx2(queries, keys, values, head_dim, count, scores, output);
+                    chunk_f16_avx2(queries, keys, values, head_dim, count, scores, partials);
                 }
             }
             return;
         }
-        attend_with(
-            queries, keys, values, head_dim, count, scores, output, dot, axpy,
+        chunk_with(
+            queries, keys, values, head_dim, count, scores, partials, dot, axpy,
         );
+    }
+}
+
+const NEGLIGIBLE_EXPONENT: f32 = -41.0;
+
+#[inline(always)]
+fn attention_weight(value: f32) -> f32 {
+    if value < NEGLIGIBLE_EXPONENT {
+        0.0
+    } else {
+        exp(value)
+    }
+}
+
+#[inline(always)]
+fn exponentiate(scores: &mut [f32]) -> (f32, f32) {
+    let maximum = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    for value in scores.iter_mut() {
+        *value = attention_weight(*value - maximum);
+    }
+    (maximum, sum(scores))
+}
+
+fn merge_partial(state: &mut [f32], partial: &[f32]) {
+    let maximum = state[0].max(partial[0]);
+    let old = attention_weight(state[0] - maximum);
+    let new = attention_weight(partial[0] - maximum);
+    state[0] = maximum;
+    state[1] = state[1] * old + partial[1] * new;
+    for (value, update) in state[2..].iter_mut().zip(&partial[2..]) {
+        *value = *value * old + update * new;
+    }
+}
+
+fn finish_partial(state: &[f32], output: &mut [f32]) {
+    let total = state[1];
+    for (output, value) in output.iter_mut().zip(&state[2..]) {
+        *output = value / total;
     }
 }
 
@@ -466,18 +587,19 @@ unsafe fn axpy_f16_avx2(output: &mut [f32], scale: f32, values: &[F16]) {
 
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
-fn attend_with<K: KvValue>(
+fn chunk_with<K: KvValue>(
     queries: &[f32],
     keys: &[K],
     values: &[K],
     head_dim: usize,
     count: usize,
     scores: &mut [f32],
-    output: &mut [f32],
+    partials: &mut [f32],
     dot: impl Fn(&[f32], &[K]) -> f32,
     axpy: impl Fn(&mut [f32], f32, &[K]),
 ) {
     let scale = (head_dim as f32).sqrt().recip();
+    let width = head_dim + 2;
     for index in 0..count {
         let key = &keys[index * head_dim..(index + 1) * head_dim];
         for (query, scores) in queries
@@ -487,40 +609,45 @@ fn attend_with<K: KvValue>(
             scores[index] = dot(query, key) * scale;
         }
     }
-    for scores in scores.chunks_exact_mut(count) {
-        softmax_in_place(scores);
+    for (scores, partial) in scores
+        .chunks_exact_mut(count)
+        .zip(partials.chunks_exact_mut(width))
+    {
+        let (maximum, total) = exponentiate(scores);
+        partial[0] = maximum;
+        partial[1] = total;
+        partial[2..].fill(0.0);
     }
-    output.fill(0.0);
     for index in 0..count {
         let value = &values[index * head_dim..(index + 1) * head_dim];
-        for (context, scores) in output
-            .chunks_exact_mut(head_dim)
+        for (partial, scores) in partials
+            .chunks_exact_mut(width)
             .zip(scores.chunks_exact(count))
         {
-            axpy(context, scores[index], value);
+            axpy(&mut partial[2..], scores[index], value);
         }
     }
 }
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn attend_f32_avx2(
+unsafe fn chunk_f32_avx2(
     queries: &[f32],
     keys: &[f32],
     values: &[f32],
     head_dim: usize,
     count: usize,
     scores: &mut [f32],
-    output: &mut [f32],
+    partials: &mut [f32],
 ) {
-    attend_with(
+    chunk_with(
         queries,
         keys,
         values,
         head_dim,
         count,
         scores,
-        output,
+        partials,
         |left, right| unsafe { dot_avx2(left, right) },
         axpy,
     );
@@ -528,23 +655,23 @@ unsafe fn attend_f32_avx2(
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,f16c")]
-unsafe fn attend_f16_avx2(
+unsafe fn chunk_f16_avx2(
     queries: &[f32],
     keys: &[F16],
     values: &[F16],
     head_dim: usize,
     count: usize,
     scores: &mut [f32],
-    output: &mut [f32],
+    partials: &mut [f32],
 ) {
-    attend_with(
+    chunk_with(
         queries,
         keys,
         values,
         head_dim,
         count,
         scores,
-        output,
+        partials,
         |left, right| unsafe { dot_f16_avx2(left, right) },
         |output, scale, values| unsafe { axpy_f16_avx2(output, scale, values) },
     );
@@ -621,22 +748,23 @@ unsafe fn accumulate_values<K, const VECTORS: usize>(
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
-unsafe fn attend_blocked<K: KvValue>(
+unsafe fn chunk_blocked<K: KvValue>(
     queries: &[f32],
     keys: &[K],
     values: &[K],
     head_dim: usize,
     count: usize,
     scores: &mut [f32],
-    output: &mut [f32],
+    partials: &mut [f32],
     load: impl Fn(*const K) -> std::arch::x86_64::__m256,
 ) {
     const ROWS: usize = 4;
     const WIDE: usize = 8;
     let heads = queries.len() / head_dim;
+    let width = head_dim + 2;
     assert!(head_dim % (LANES * 2) == 0);
     assert!(keys.len() >= count * head_dim && values.len() >= count * head_dim);
-    assert!(scores.len() >= heads * count && output.len() >= heads * head_dim);
+    assert!(scores.len() >= heads * count && partials.len() >= heads * width);
     let scale = (head_dim as f32).sqrt().recip();
     for head in 0..heads {
         let query = queries[head * head_dim..].as_ptr();
@@ -655,11 +783,13 @@ unsafe fn attend_blocked<K: KvValue>(
             scores[index] = unsafe { dot_rows::<K, 1>(query, rows, head_dim, &load) }[0] * scale;
             index += 1;
         }
-        softmax_in_place(scores);
+        let (maximum, total) = exponentiate(scores);
+        partials[head * width] = maximum;
+        partials[head * width + 1] = total;
     }
     for head in 0..heads {
         let probabilities = &scores[head * count..(head + 1) * count];
-        let output = output[head * head_dim..(head + 1) * head_dim].as_mut_ptr();
+        let output = partials[head * width + 2..(head + 1) * width].as_mut_ptr();
         let mut start = 0;
         while start + WIDE * LANES <= head_dim {
             unsafe {
@@ -690,26 +820,26 @@ unsafe fn attend_blocked<K: KvValue>(
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
-unsafe fn attend_blocked_f32(
+unsafe fn chunk_blocked_f32(
     queries: &[f32],
     keys: &[f32],
     values: &[f32],
     head_dim: usize,
     count: usize,
     scores: &mut [f32],
-    output: &mut [f32],
+    partials: &mut [f32],
 ) {
     use std::arch::x86_64::*;
 
     unsafe {
-        attend_blocked(
+        chunk_blocked(
             queries,
             keys,
             values,
             head_dim,
             count,
             scores,
-            output,
+            partials,
             |pointer: *const f32| _mm256_loadu_ps(pointer),
         )
     }
@@ -717,26 +847,26 @@ unsafe fn attend_blocked_f32(
 
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2,f16c")]
-unsafe fn attend_blocked_f16(
+unsafe fn chunk_blocked_f16(
     queries: &[f32],
     keys: &[F16],
     values: &[F16],
     head_dim: usize,
     count: usize,
     scores: &mut [f32],
-    output: &mut [f32],
+    partials: &mut [f32],
 ) {
     use std::arch::x86_64::*;
 
     unsafe {
-        attend_blocked(
+        chunk_blocked(
             queries,
             keys,
             values,
             head_dim,
             count,
             scores,
-            output,
+            partials,
             |pointer: *const F16| _mm256_cvtph_ps(_mm_loadu_si128(pointer.cast())),
         )
     }
@@ -747,7 +877,7 @@ pub(crate) fn attention<K: AttendValue>(
     kv: KvView<'_, K>,
     shape: AttentionShape,
     first: usize,
-    scores: &mut [f32],
+    scratch: &mut Vec<f32>,
     output: &mut [f32],
 ) {
     const PARALLEL_PRODUCTS: usize = 32_768;
@@ -759,42 +889,151 @@ pub(crate) fn attention<K: AttendValue>(
     let q_dim = head_count * head_dim;
     let tokens = queries.len() / q_dim;
     let group = head_count / kv_head_count;
+    let width = head_dim + 2;
     let longest = first + tokens;
-    let scores = &mut scores[..head_count * longest];
     let output = &mut output[..tokens * q_dim];
-    let score_pointer = SharedPtr(scores.as_mut_ptr());
-    let output_pointer = SharedPtr(output.as_mut_ptr());
-    let run = |kv_head: usize| {
-        let (keys, values) = kv.head(kv_head, longest, head_dim);
-        let scores = unsafe {
-            std::slice::from_raw_parts_mut(
-                score_pointer.get().add(kv_head * group * longest),
-                group * longest,
-            )
-        };
-        for token in 0..tokens {
-            let count = first + token + 1;
-            let start = token * q_dim + kv_head * group * head_dim;
-            let output = unsafe {
-                std::slice::from_raw_parts_mut(output_pointer.get().add(start), group * head_dim)
+    let parallel = tokens * q_dim * longest >= PARALLEL_PRODUCTS;
+    let chunks = longest.div_ceil(ATTENTION_CHUNK);
+    let partial_length = tokens * chunks * head_count * width;
+    if chunks > 1 && partial_length <= PARTIAL_LIMIT {
+        let tasks = kv_head_count * chunks;
+        let task_scores = group * ATTENTION_CHUNK;
+        scratch.resize(partial_length + tasks * task_scores, 0.0);
+        let (partials, scores) = scratch.split_at_mut(partial_length);
+        let partial_pointer = SharedPtr(partials.as_mut_ptr());
+        let score_pointer = SharedPtr(scores.as_mut_ptr());
+        let output_pointer = SharedPtr(output.as_mut_ptr());
+        let run = |task: usize| {
+            let (kv_head, chunk) = (task / chunks, task % chunks);
+            let begin = chunk * ATTENTION_CHUNK;
+            let (keys, values) = kv.head(kv_head, longest, head_dim);
+            let scores = unsafe {
+                std::slice::from_raw_parts_mut(
+                    score_pointer.get().add(task * task_scores),
+                    task_scores,
+                )
             };
-            K::attend(
-                &queries[start..start + group * head_dim],
-                keys,
-                values,
-                head_dim,
-                count,
-                &mut scores[..group * count],
-                output,
-            );
+            for token in 0..tokens {
+                let count = first + token + 1;
+                if count <= begin {
+                    continue;
+                }
+                let end = (begin + ATTENTION_CHUNK).min(count);
+                let length = end - begin;
+                let query = token * q_dim + kv_head * group * head_dim;
+                let slot = ((token * chunks + chunk) * head_count + kv_head * group) * width;
+                let partial = unsafe {
+                    std::slice::from_raw_parts_mut(partial_pointer.get().add(slot), group * width)
+                };
+                K::chunk(
+                    &queries[query..query + group * head_dim],
+                    &keys[begin * head_dim..end * head_dim],
+                    &values[begin * head_dim..end * head_dim],
+                    head_dim,
+                    length,
+                    &mut scores[..group * length],
+                    partial,
+                );
+            }
+        };
+        if parallel {
+            parallel_for(tasks, &run);
+        } else {
+            for task in 0..tasks {
+                run(task);
+            }
         }
-    };
-    if tokens * q_dim * longest < PARALLEL_PRODUCTS {
-        for kv_head in 0..kv_head_count {
-            run(kv_head);
+        if chunks > 1 {
+            let merge = |task: usize| {
+                let (token, head) = (task / head_count, task % head_count);
+                let used = (first + token + 1).div_ceil(ATTENTION_CHUNK);
+                let slot = |chunk: usize| ((token * chunks + chunk) * head_count + head) * width;
+                let state = unsafe {
+                    std::slice::from_raw_parts_mut(partial_pointer.get().add(slot(0)), width)
+                };
+                for chunk in 1..used {
+                    let partial = unsafe {
+                        std::slice::from_raw_parts(partial_pointer.get().add(slot(chunk)), width)
+                    };
+                    merge_partial(state, partial);
+                }
+                let output = unsafe {
+                    std::slice::from_raw_parts_mut(
+                        output_pointer.get().add(token * q_dim + head * head_dim),
+                        head_dim,
+                    )
+                };
+                finish_partial(state, output);
+            };
+            if parallel {
+                parallel_for(tokens * head_count, &merge);
+            } else {
+                for task in 0..tokens * head_count {
+                    merge(task);
+                }
+            }
         }
     } else {
-        parallel_for(kv_head_count, &run);
+        let tasks = kv_head_count * tokens;
+        let per_task = group * (ATTENTION_CHUNK + 2 * width);
+        scratch.resize(tasks * per_task, 0.0);
+        let scratch_pointer = SharedPtr(scratch.as_mut_ptr());
+        let output_pointer = SharedPtr(output.as_mut_ptr());
+        let run = |task: usize| {
+            let (token, kv_head) = (task / kv_head_count, task % kv_head_count);
+            let local = unsafe {
+                std::slice::from_raw_parts_mut(scratch_pointer.get().add(task * per_task), per_task)
+            };
+            let (scores, rest) = local.split_at_mut(group * ATTENTION_CHUNK);
+            let (state, partial) = rest.split_at_mut(group * width);
+            let count = first + token + 1;
+            let (keys, values) = kv.head(kv_head, count, head_dim);
+            let query = token * q_dim + kv_head * group * head_dim;
+            let queries = &queries[query..query + group * head_dim];
+            for chunk in 0..count.div_ceil(ATTENTION_CHUNK) {
+                let begin = chunk * ATTENTION_CHUNK;
+                let end = (begin + ATTENTION_CHUNK).min(count);
+                let length = end - begin;
+                let target = if chunk == 0 {
+                    &mut *state
+                } else {
+                    &mut *partial
+                };
+                K::chunk(
+                    queries,
+                    &keys[begin * head_dim..end * head_dim],
+                    &values[begin * head_dim..end * head_dim],
+                    head_dim,
+                    length,
+                    &mut scores[..group * length],
+                    target,
+                );
+                if chunk > 0 {
+                    for head in 0..group {
+                        merge_partial(
+                            &mut state[head * width..(head + 1) * width],
+                            &partial[head * width..(head + 1) * width],
+                        );
+                    }
+                }
+            }
+            let output = unsafe {
+                std::slice::from_raw_parts_mut(output_pointer.get().add(query), group * head_dim)
+            };
+            for head in 0..group {
+                finish_partial(
+                    &state[head * width..(head + 1) * width],
+                    &mut output[head * head_dim..(head + 1) * head_dim],
+                );
+            }
+        };
+        if parallel {
+            parallel_for(tasks, &run);
+        } else {
+            for task in 0..tasks {
+                run(task);
+            }
+        }
     }
 }
 
@@ -813,6 +1052,57 @@ mod tests {
     fn linear_uses_row_major_weights_and_bias() {
         let output = linear(&[1.0, 2.0, 3.0, 4.0], 2, 2, &[2.0, 3.0], Some(&[0.5, -0.5]));
         assert_close(&output, &[8.5, 17.5]);
+    }
+
+    #[test]
+    fn f32_linear_paths_match_bit_for_bit_and_track_f64() {
+        for (rows, columns, tokens) in [(7, 37, 3), (5, 64, 1), (9, 1024, 4)] {
+            let weights = wave(rows * columns, 0.071);
+            let inputs = wave(tokens * columns, 0.13);
+            let bias = wave(rows, 0.5);
+            for bias in [None, Some(&bias[..])] {
+                let mut dispatched = vec![0.0; tokens * rows];
+                let mut generic = vec![0.0; tokens * rows];
+                unsafe {
+                    linear_rows(
+                        &weights,
+                        columns,
+                        &inputs,
+                        0..rows,
+                        bias,
+                        dispatched.as_mut_ptr(),
+                        rows,
+                    );
+                    linear_rows_with(
+                        &weights,
+                        columns,
+                        &inputs,
+                        0..rows,
+                        bias,
+                        generic.as_mut_ptr(),
+                        rows,
+                        dot,
+                        |_| {},
+                    );
+                }
+                assert_eq!(
+                    dispatched.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                    generic.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+                );
+                for token in 0..tokens {
+                    for row in 0..rows {
+                        let expected: f64 = weights[row * columns..(row + 1) * columns]
+                            .iter()
+                            .zip(&inputs[token * columns..(token + 1) * columns])
+                            .map(|(w, x)| f64::from(*w) * f64::from(*x))
+                            .sum::<f64>()
+                            + bias.map_or(0.0, |b| f64::from(b[row]));
+                        let actual = f64::from(dispatched[token * rows + row]);
+                        assert!((actual - expected).abs() < 1e-4, "{actual} != {expected}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -851,14 +1141,106 @@ mod tests {
             .collect()
     }
 
-    fn attention_case<K: AttendValue>(head_dim: usize, group: usize, first: usize) {
+    fn reference_chunks<K: AttendValue>(
+        queries: &[f32],
+        view: KvView<'_, K>,
+        shape: AttentionShape,
+        first: usize,
+    ) -> Vec<f32> {
+        let head_dim = shape.head_dim;
+        let width = head_dim + 2;
+        let q_dim = shape.head_count * head_dim;
+        let tokens = queries.len() / q_dim;
+        let group = shape.head_count / shape.kv_head_count;
+        let mut output = vec![0.0; tokens * q_dim];
+        for token in 0..tokens {
+            let count = first + token + 1;
+            for head in 0..shape.head_count {
+                let (keys, values) = view.head(head / group, count, head_dim);
+                let query = &queries[token * q_dim + head * head_dim..][..head_dim];
+                let mut state = vec![0.0; width];
+                for chunk in 0..count.div_ceil(ATTENTION_CHUNK) {
+                    let begin = chunk * ATTENTION_CHUNK;
+                    let end = (begin + ATTENTION_CHUNK).min(count);
+                    let mut scores = vec![0.0; end - begin];
+                    let mut partial = vec![0.0; width];
+                    chunk_with(
+                        query,
+                        &keys[begin * head_dim..end * head_dim],
+                        &values[begin * head_dim..end * head_dim],
+                        head_dim,
+                        end - begin,
+                        &mut scores,
+                        &mut partial,
+                        dot,
+                        axpy,
+                    );
+                    if chunk == 0 {
+                        state = partial;
+                    } else {
+                        merge_partial(&mut state, &partial);
+                    }
+                }
+                finish_partial(
+                    &state,
+                    &mut output[token * q_dim + head * head_dim..][..head_dim],
+                );
+            }
+        }
+        output
+    }
+
+    fn naive_attention<K: AttendValue>(
+        queries: &[f32],
+        view: KvView<'_, K>,
+        shape: AttentionShape,
+        first: usize,
+    ) -> Vec<f32> {
+        let head_dim = shape.head_dim;
+        let q_dim = shape.head_count * head_dim;
+        let tokens = queries.len() / q_dim;
+        let group = shape.head_count / shape.kv_head_count;
+        let mut output = vec![0.0; tokens * q_dim];
+        for token in 0..tokens {
+            let count = first + token + 1;
+            for head in 0..shape.head_count {
+                let (keys, values) = view.head(head / group, count, head_dim);
+                let query = &queries[token * q_dim + head * head_dim..][..head_dim];
+                let scores: Vec<f64> = (0..count)
+                    .map(|index| {
+                        query
+                            .iter()
+                            .zip(&keys[index * head_dim..(index + 1) * head_dim])
+                            .map(|(q, k)| f64::from(*q) * f64::from(k.to_f32()))
+                            .sum::<f64>()
+                            / (head_dim as f64).sqrt()
+                    })
+                    .collect();
+                let maximum = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                let weights: Vec<f64> = scores.iter().map(|s| (s - maximum).exp()).collect();
+                let total: f64 = weights.iter().sum();
+                for dimension in 0..head_dim {
+                    let value: f64 = weights
+                        .iter()
+                        .enumerate()
+                        .map(|(index, weight)| {
+                            weight * f64::from(values[index * head_dim + dimension].to_f32())
+                        })
+                        .sum();
+                    output[token * q_dim + head * head_dim + dimension] = (value / total) as f32;
+                }
+            }
+        }
+        output
+    }
+
+    fn attention_case<K: AttendValue>(head_dim: usize, group: usize, first: usize, tokens: usize) {
         let shape = AttentionShape {
             head_count: 2 * group,
             kv_head_count: 2,
             head_dim,
         };
         let q_dim = shape.head_count * head_dim;
-        let tokens = 3;
         let longest = first + tokens;
         let capacity = longest + 3;
         let keys: Vec<K> = wave(capacity * 2 * head_dim, 0.37)
@@ -875,51 +1257,47 @@ mod tests {
             capacity,
         };
         let queries = wave(tokens * q_dim, 0.23);
-        let mut scores = vec![0.0; shape.head_count * longest];
+        let mut scratch = Vec::new();
         let mut dispatched = vec![0.0; tokens * q_dim];
-        attention(&queries, view, shape, first, &mut scores, &mut dispatched);
-        let mut generic = vec![0.0; tokens * q_dim];
-        let span = group * head_dim;
-        for token in 0..tokens {
-            let count = first + token + 1;
-            for kv_head in 0..2 {
-                let (keys, values) = view.head(kv_head, count, head_dim);
-                let start = token * q_dim + kv_head * span;
-                attend_with(
-                    &queries[start..start + span],
-                    keys,
-                    values,
-                    head_dim,
-                    count,
-                    &mut scores[..group * count],
-                    &mut generic[start..start + span],
-                    dot,
-                    axpy,
-                );
-            }
-        }
+        attention(&queries, view, shape, first, &mut scratch, &mut dispatched);
+        let reference = reference_chunks(&queries, view, shape, first);
         assert_eq!(
             dispatched.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-            generic.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+            reference.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            "head_dim={head_dim} group={group} first={first} tokens={tokens}"
         );
+        let naive = naive_attention(&queries, view, shape, first);
+        for (actual, expected) in dispatched.iter().zip(&naive) {
+            assert!((actual - expected).abs() < 1e-5, "{actual} != {expected}");
+        }
         assert!(dispatched.iter().any(|value| value.abs() > 1e-3));
-        let mut single = vec![0.0; q_dim];
-        attention(
-            &queries[q_dim..2 * q_dim],
-            view,
-            shape,
-            first + 1,
-            &mut scores,
-            &mut single,
-        );
-        assert_eq!(&single[..], &dispatched[q_dim..2 * q_dim]);
+        for token in 0..tokens {
+            let mut single = vec![0.0; q_dim];
+            attention(
+                &queries[token * q_dim..(token + 1) * q_dim],
+                view,
+                shape,
+                first + token,
+                &mut scratch,
+                &mut single,
+            );
+            assert_eq!(&single[..], &dispatched[token * q_dim..(token + 1) * q_dim]);
+        }
     }
 
     #[test]
     fn attention_paths_match_bit_for_bit() {
-        for (head_dim, group, first) in [(40, 2, 6), (64, 2, 6), (128, 3, 10), (32, 1, 0)] {
-            attention_case::<f32>(head_dim, group, first);
-            attention_case::<F16>(head_dim, group, first);
+        for (head_dim, group, first, tokens) in [
+            (40, 2, 6, 3),
+            (64, 2, 6, 3),
+            (128, 3, 10, 3),
+            (32, 1, 0, 3),
+            (64, 2, 21, 2),
+            (128, 2, 3, 9),
+            (40, 2, 30, 6),
+        ] {
+            attention_case::<f32>(head_dim, group, first, tokens);
+            attention_case::<F16>(head_dim, group, first, tokens);
         }
     }
 

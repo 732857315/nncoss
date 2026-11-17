@@ -38,15 +38,45 @@ impl Sampler {
     }
 
     pub fn sample(&mut self, logits: &[f32]) -> Result<u32> {
-        if logits.is_empty() {
-            return Err(Error::InvalidArgument("logits 不能为空"));
-        }
-        if logits.iter().any(|value| !value.is_finite()) {
-            return Err(Error::NonFiniteLogit);
-        }
         if self.config.temperature == 0.0 {
+            check(logits)?;
             return greedy(logits);
         }
+        let mut candidates = self.candidates(logits)?;
+        let Some(total) = self.weigh(&mut candidates) else {
+            return Ok(candidates[0].0);
+        };
+        Ok(self.pick(&candidates, total))
+    }
+
+    pub fn sample_with_draft(&mut self, logits: &[f32], draft: u32) -> Result<(bool, u32)> {
+        if self.config.temperature == 0.0 {
+            check(logits)?;
+            let token = greedy(logits)?;
+            return Ok((token == draft, token));
+        }
+        let mut candidates = self.candidates(logits)?;
+        let Some(total) = self.weigh(&mut candidates) else {
+            let token = candidates[0].0;
+            return Ok((token == draft, token));
+        };
+        let probability = candidates
+            .iter()
+            .find(|candidate| candidate.0 == draft)
+            .map_or(0.0, |candidate| candidate.1 / total);
+        if probability > 0.0 && self.rng.next_f32() < probability {
+            return Ok((true, draft));
+        }
+        candidates.retain(|candidate| candidate.0 != draft);
+        if candidates.is_empty() {
+            return Ok((true, draft));
+        }
+        let total = candidates.iter().map(|candidate| candidate.1).sum::<f32>();
+        Ok((false, self.pick(&candidates, total)))
+    }
+
+    fn candidates(&self, logits: &[f32]) -> Result<Vec<(u32, f32)>> {
+        check(logits)?;
         let mut candidates = Vec::new();
         if self.config.top_k > 0 && self.config.top_k < logits.len() {
             select_top(logits, self.config.top_k, &mut candidates);
@@ -59,26 +89,25 @@ impl Sampler {
             );
             candidates.sort_by(order);
         }
-        self.draw(candidates)
+        Ok(candidates)
     }
 
-    fn draw(&mut self, mut candidates: Vec<(u32, f32)>) -> Result<u32> {
-        let best = candidates[0].0;
-        for candidate in &mut candidates {
+    fn weigh(&self, candidates: &mut Vec<(u32, f32)>) -> Option<f32> {
+        for candidate in candidates.iter_mut() {
             candidate.1 /= self.config.temperature;
             if !candidate.1.is_finite() {
-                return Ok(best);
+                return None;
             }
         }
         let maximum = candidates[0].1;
         let mut sum = 0.0;
-        for candidate in &mut candidates {
+        for candidate in candidates.iter_mut() {
             candidate.1 = crate::ops::exp(candidate.1 - maximum);
             sum += candidate.1;
         }
         let mut retained = 0;
         let mut cumulative = 0.0;
-        for candidate in &candidates {
+        for candidate in candidates.iter() {
             cumulative += candidate.1 / sum;
             retained += 1;
             if cumulative >= self.config.top_p {
@@ -86,16 +115,29 @@ impl Sampler {
             }
         }
         candidates.truncate(retained);
-        let retained_sum = candidates.iter().map(|candidate| candidate.1).sum::<f32>();
-        let mut threshold = self.rng.next_f32() * retained_sum;
-        for candidate in &candidates {
+        Some(candidates.iter().map(|candidate| candidate.1).sum::<f32>())
+    }
+
+    fn pick(&mut self, candidates: &[(u32, f32)], total: f32) -> u32 {
+        let mut threshold = self.rng.next_f32() * total;
+        for candidate in candidates {
             if threshold < candidate.1 {
-                return Ok(candidate.0);
+                return candidate.0;
             }
             threshold -= candidate.1;
         }
-        Ok(candidates.last().map(|candidate| candidate.0).unwrap_or(0))
+        candidates.last().map(|candidate| candidate.0).unwrap_or(0)
     }
+}
+
+fn check(logits: &[f32]) -> Result<()> {
+    if logits.is_empty() {
+        return Err(Error::InvalidArgument("logits 不能为空"));
+    }
+    if logits.iter().any(|value| !value.is_finite()) {
+        return Err(Error::NonFiniteLogit);
+    }
+    Ok(())
 }
 
 fn order(left: &(u32, f32), right: &(u32, f32)) -> std::cmp::Ordering {
@@ -195,6 +237,58 @@ mod tests {
             select_top(&logits, count, &mut selected);
             assert_eq!(selected, sorted[..count]);
         }
+    }
+
+    #[test]
+    fn draft_verification_preserves_the_sampling_distribution() {
+        let logits = [1.2, 0.3, 2.0, -0.5, 1.7, 0.9];
+        let config = SamplingConfig {
+            temperature: 0.8,
+            top_k: 4,
+            top_p: 0.95,
+        };
+        let trials = 200_000;
+        let mut direct = [0_u32; 6];
+        let mut sampler = Sampler::new(config, 3).unwrap();
+        for _ in 0..trials {
+            direct[sampler.sample(&logits).unwrap() as usize] += 1;
+        }
+        for draft in [2_u32, 4, 3] {
+            let mut verified = [0_u32; 6];
+            let mut accepted = 0;
+            let mut sampler = Sampler::new(config, 11 + u64::from(draft)).unwrap();
+            for _ in 0..trials {
+                let (accept, token) = sampler.sample_with_draft(&logits, draft).unwrap();
+                assert_eq!(accept, token == draft);
+                accepted += u32::from(accept);
+                verified[token as usize] += 1;
+            }
+            for token in 0..6 {
+                let expected = f64::from(direct[token]) / f64::from(trials);
+                let actual = f64::from(verified[token]) / f64::from(trials);
+                assert!(
+                    (expected - actual).abs() < 0.006,
+                    "draft {draft} token {token}: {expected} vs {actual}"
+                );
+            }
+            if draft == 3 {
+                assert_eq!(accepted, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn greedy_draft_verification_matches_argmax() {
+        let mut sampler = Sampler::new(SamplingConfig::default(), 0).unwrap();
+        assert_eq!(
+            sampler.sample_with_draft(&[0.1, 2.0, 1.0], 1).unwrap(),
+            (true, 1)
+        );
+        assert_eq!(
+            sampler.sample_with_draft(&[0.1, 2.0, 1.0], 2).unwrap(),
+            (false, 1)
+        );
+        assert!(sampler.sample_with_draft(&[f32::NAN], 0).is_err());
     }
 
     #[test]

@@ -567,14 +567,17 @@ pub(crate) fn linear_many(inputs: &[f32], activations: &mut [Activation], jobs: 
         let end = (start + plan.chunk).min(plan.rows);
         let output = unsafe { plan.output.get().add(start) };
         match plan.weight {
-            Weight::F32(values) => {
-                for (token, input) in inputs.chunks_exact(columns).enumerate() {
-                    let output = unsafe {
-                        std::slice::from_raw_parts_mut(output.add(token * plan.rows), end - start)
-                    };
-                    crate::ops::linear_rows(values, columns, input, start..end, plan.bias, output);
-                }
-            }
+            Weight::F32(values) => unsafe {
+                crate::ops::linear_rows(
+                    values,
+                    columns,
+                    inputs,
+                    start..end,
+                    plan.bias,
+                    output,
+                    plan.rows,
+                )
+            },
             Weight::Q4(matrix) => unsafe {
                 matrix.compute_rows(activations, start..end, plan.bias, output, plan.rows)
             },

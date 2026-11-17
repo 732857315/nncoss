@@ -11,6 +11,8 @@ use crate::sampler::Sampler;
 use crate::{Error, Result, SamplingConfig};
 
 const PREFILL_BLOCK: usize = 32;
+const DRAFT_NGRAM: usize = 3;
+const DRAFT_MIN_NGRAM: usize = 2;
 
 #[derive(Debug, Default)]
 struct Scratch {
@@ -24,6 +26,7 @@ struct Scratch {
     gate: Vec<f32>,
     up: Vec<f32>,
     hidden: Vec<f32>,
+    block_logits: Vec<f32>,
     scores: Vec<f32>,
     activations: Vec<Activation>,
     rope_frequencies: Vec<f32>,
@@ -69,6 +72,10 @@ pub struct Session {
     has_logits: bool,
     sampler: Sampler,
     scratch: Scratch,
+    history: Vec<u32>,
+    speculation: bool,
+    drafted: usize,
+    accepted: usize,
     #[cfg(test)]
     fail_at_position: Option<usize>,
 }
@@ -104,6 +111,10 @@ impl Session {
             logits: Vec::new(),
             has_logits: false,
             sampler: Sampler::new(SamplingConfig::default(), 0)?,
+            history: Vec::new(),
+            speculation: true,
+            drafted: 0,
+            accepted: 0,
             #[cfg(test)]
             fail_at_position: None,
         })
@@ -119,7 +130,16 @@ impl Session {
 
     pub fn reset(&mut self) {
         self.cache.reset();
+        self.history.clear();
         self.has_logits = false;
+    }
+
+    pub fn set_speculation(&mut self, enabled: bool) {
+        self.speculation = enabled;
+    }
+
+    pub fn speculation_counts(&self) -> (usize, usize) {
+        (self.drafted, self.accepted)
     }
 
     pub fn set_sampler(&mut self, config: SamplingConfig, seed: u64) -> Result<()> {
@@ -134,8 +154,8 @@ impl Session {
         self.validate_tokens(tokens)?;
         let start = self.cache.len();
         for block in tokens.chunks(PREFILL_BLOCK) {
-            if let Err(error) = self.forward(block) {
-                self.cache.truncate(start);
+            if let Err(error) = self.forward(block, false) {
+                self.rewind_to(start);
                 return Err(error);
             }
         }
@@ -145,7 +165,7 @@ impl Session {
 
     pub fn decode(&mut self, token: u32) -> Result<()> {
         self.validate_tokens(&[token])?;
-        self.forward(&[token])?;
+        self.forward(&[token], false)?;
         self.commit_hidden();
         Ok(())
     }
@@ -173,15 +193,97 @@ impl Session {
     ) -> Result<Vec<u32>> {
         self.prefill(prompt)?;
         let mut generated = Vec::with_capacity(max_new_tokens);
-        for _ in 0..max_new_tokens {
-            let token = self.sample_next()?;
-            if eos_tokens.contains(&token) {
+        if max_new_tokens == 0 {
+            return Ok(generated);
+        }
+        let mut pending = self.sample_next()?;
+        loop {
+            if eos_tokens.contains(&pending) {
                 break;
             }
-            generated.push(token);
-            self.decode(token)?;
+            generated.push(pending);
+            let draft = if generated.len() < max_new_tokens {
+                self.draft(pending)
+            } else {
+                None
+            };
+            let Some(draft) = draft else {
+                self.decode(pending)?;
+                if generated.len() == max_new_tokens {
+                    break;
+                }
+                pending = self.sample_next()?;
+                continue;
+            };
+            self.verify(pending, draft)?;
+            self.drafted += 1;
+            let vocab = self.model.config.vocab_size;
+            let (accepted, token) = self
+                .sampler
+                .sample_with_draft(&self.scratch.block_logits[..vocab], draft)?;
+            if !accepted || eos_tokens.contains(&draft) {
+                self.rewind_to(self.cache.len() - 1);
+                self.use_block_logits(0);
+                if accepted {
+                    break;
+                }
+                pending = token;
+                continue;
+            }
+            self.accepted += 1;
+            generated.push(draft);
+            self.use_block_logits(1);
+            if generated.len() == max_new_tokens {
+                break;
+            }
+            pending = self.sample_next()?;
         }
         Ok(generated)
+    }
+
+    fn draft(&self, last: u32) -> Option<u32> {
+        if !self.speculation || self.position() + 2 > self.max_context {
+            return None;
+        }
+        draft_token(&self.history, last)
+    }
+
+    fn verify(&mut self, token: u32, draft: u32) -> Result<()> {
+        self.validate_tokens(&[token, draft])?;
+        self.forward(&[token, draft], true)?;
+        let vocab = self.model.config.vocab_size;
+        let hidden = self.model.config.hidden_size;
+        let Scratch {
+            hidden: states,
+            block_logits,
+            activations,
+            ..
+        } = &mut self.scratch;
+        block_logits.clear();
+        block_logits.resize(2 * vocab, 0.0);
+        linear_many(
+            &states[..2 * hidden],
+            &mut activations[..2],
+            &mut [Linear {
+                weight: self.model.head(),
+                bias: None,
+                output: block_logits,
+            }],
+        );
+        Ok(())
+    }
+
+    fn use_block_logits(&mut self, row: usize) {
+        let vocab = self.model.config.vocab_size;
+        self.logits.clear();
+        self.logits
+            .extend_from_slice(&self.scratch.block_logits[row * vocab..(row + 1) * vocab]);
+        self.has_logits = true;
+    }
+
+    fn rewind_to(&mut self, length: usize) {
+        self.cache.truncate(length);
+        self.history.truncate(length);
     }
 
     fn validate_tokens(&self, tokens: &[u32]) -> Result<()> {
@@ -210,11 +312,16 @@ impl Session {
         let config = &self.model.config;
         self.logits.clear();
         self.logits.resize(config.vocab_size, 0.0);
-        linear_into(self.model.head(), &self.scratch.hidden, &mut self.logits);
+        let hidden = self.model.config.hidden_size;
+        linear_into(
+            self.model.head(),
+            &self.scratch.hidden[..hidden],
+            &mut self.logits,
+        );
         self.has_logits = true;
     }
 
-    fn forward(&mut self, tokens: &[u32]) -> Result<()> {
+    fn forward(&mut self, tokens: &[u32], every: bool) -> Result<()> {
         #[cfg(test)]
         let fail_at_position = self.fail_at_position;
         let Self {
@@ -222,6 +329,7 @@ impl Session {
             cache,
             scratch,
             max_context,
+            history,
             ..
         } = self;
         let config = &model.config;
@@ -235,10 +343,6 @@ impl Session {
             head_dim: config.head_dim,
         };
         scratch.reserve(model, count);
-        let longest = config.head_count * (start + count);
-        if scratch.scores.len() < longest {
-            scratch.scores.resize(longest.next_power_of_two(), 0.0);
-        }
         scratch.rope.clear();
         let mut table = Vec::with_capacity(half);
         for offset in 0..count {
@@ -384,15 +488,38 @@ impl Session {
             );
         }
         cache.finish_tokens(count);
-        let last = &scratch.state[(count - 1) * hidden..count * hidden];
-        rms_norm_into(
-            last,
+        history.extend_from_slice(tokens);
+        let first = if every { 0 } else { count - 1 };
+        scratch.hidden.resize((count - first).max(1) * hidden, 0.0);
+        normalize(
+            &scratch.state[first * hidden..count * hidden],
             &model.final_norm,
             config.norm_eps,
             &mut scratch.hidden,
+            hidden,
         );
         Ok(())
     }
+}
+
+fn draft_token(history: &[u32], last: u32) -> Option<u32> {
+    let length = history.len() + 1;
+    let at = |index: usize| history.get(index).copied().unwrap_or(last);
+    for size in (DRAFT_MIN_NGRAM..=DRAFT_NGRAM).rev() {
+        if length <= size {
+            continue;
+        }
+        let suffix = length - size;
+        'search: for start in (0..suffix).rev() {
+            for offset in 0..size {
+                if at(start + offset) != at(suffix + offset) {
+                    continue 'search;
+                }
+            }
+            return Some(at(start + size));
+        }
+    }
+    None
 }
 
 fn normalize(input: &[f32], weight: &[f32], epsilon: f32, output: &mut [f32], width: usize) {
@@ -543,6 +670,111 @@ mod tests {
                 bits(stepped.last_logits().unwrap())
             );
         }
+    }
+
+    fn repetitive_prompt() -> Vec<u32> {
+        let phrase = [3, 7, 11, 2, 19, 5];
+        phrase.iter().cycle().take(30).copied().collect()
+    }
+
+    #[test]
+    fn speculative_greedy_generation_matches_plain_generation_exactly() {
+        for model in [LONG.model(), LONG.quantized_model()] {
+            let model = Arc::new(model);
+            let prompt = repetitive_prompt();
+            let mut plain = Session::new(model.clone(), 0).unwrap();
+            plain.set_speculation(false);
+            let expected = plain.generate(&prompt, 40, &[]).unwrap();
+            let mut fast = Session::new(model, 0).unwrap();
+            let actual = fast.generate(&prompt, 40, &[]).unwrap();
+            assert_eq!(actual, expected);
+            assert_eq!(fast.position(), plain.position());
+            assert_eq!(
+                bits(fast.last_logits().unwrap()),
+                bits(plain.last_logits().unwrap())
+            );
+            let (drafted, accepted) = fast.speculation_counts();
+            assert!(drafted > 0 && accepted > 0, "{drafted} {accepted}");
+            assert_eq!(plain.speculation_counts(), (0, 0));
+            let more = fast.generate(&[2], 5, &[]).unwrap();
+            assert_eq!(more, plain.generate(&[2], 5, &[]).unwrap());
+        }
+    }
+
+    #[test]
+    fn speculative_sampling_leaves_a_consistent_session() {
+        let model = Arc::new(LONG.quantized_model());
+        let prompt = repetitive_prompt();
+        for seed in 0..4 {
+            let mut session = Session::new(model.clone(), 0).unwrap();
+            session
+                .set_sampler(
+                    SamplingConfig {
+                        temperature: 0.9,
+                        top_k: 8,
+                        top_p: 0.95,
+                    },
+                    seed,
+                )
+                .unwrap();
+            let generated = session.generate(&prompt, 30, &[]).unwrap();
+            assert_eq!(generated.len(), 30);
+            assert_eq!(session.position(), prompt.len() + 30);
+            let mut replay = Session::new(model.clone(), 0).unwrap();
+            replay.prefill(&prompt).unwrap();
+            replay.prefill(&generated).unwrap();
+            assert_eq!(
+                bits(session.last_logits().unwrap()),
+                bits(replay.last_logits().unwrap())
+            );
+            assert_eq!(session.history, replay.history);
+        }
+    }
+
+    #[test]
+    fn speculative_generation_handles_limits_and_eos() {
+        let model = Arc::new(LONG.model());
+        let prompt = repetitive_prompt();
+        let mut session = Session::new(model.clone(), 0).unwrap();
+        assert!(session.generate(&prompt, 0, &[]).unwrap().is_empty());
+        assert_eq!(session.position(), prompt.len());
+        let mut plain = Session::new(model.clone(), 0).unwrap();
+        plain.set_speculation(false);
+        let reference = plain.generate(&prompt, 12, &[]).unwrap();
+        for limit in 1..12 {
+            let mut session = Session::new(model.clone(), 0).unwrap();
+            let generated = session.generate(&prompt, limit, &[]).unwrap();
+            assert_eq!(generated, reference[..limit]);
+            assert_eq!(session.position(), prompt.len() + limit);
+        }
+        for stop in 1..8 {
+            let eos = reference[stop];
+            if reference[..stop].contains(&eos) {
+                continue;
+            }
+            let mut session = Session::new(model.clone(), 0).unwrap();
+            let generated = session.generate(&prompt, 12, &[eos]).unwrap();
+            assert_eq!(generated, reference[..stop]);
+            assert_eq!(session.position(), prompt.len() + stop);
+            let mut replay = Session::new(model.clone(), 0).unwrap();
+            replay.prefill(&prompt).unwrap();
+            replay.prefill(&generated).unwrap();
+            assert_eq!(
+                bits(session.last_logits().unwrap()),
+                bits(replay.last_logits().unwrap())
+            );
+        }
+    }
+
+    #[test]
+    fn draft_lookup_prefers_the_longest_recent_match() {
+        assert_eq!(draft_token(&[], 4), None);
+        assert_eq!(draft_token(&[4], 5), None);
+        assert_eq!(draft_token(&[1, 2, 3, 9, 1, 2], 3), Some(9));
+        assert_eq!(draft_token(&[5, 2, 3, 8, 1, 2], 3), Some(8));
+        assert_eq!(draft_token(&[7, 3, 6, 3, 4, 2], 3), None);
+        assert_eq!(draft_token(&[6, 3, 4, 7, 6], 3), Some(4));
+        assert_eq!(draft_token(&[1, 1, 1], 1), Some(1));
     }
 
     #[test]

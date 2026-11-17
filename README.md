@@ -435,7 +435,7 @@ python3 tools/check_real_llm.py --hf-model model/Qwen3-0.6B
 
 `tools/export_llm.py --outtype q4` 提供项目内的 Q4 权重编码，不改变模型 ABI 或分块加载协议。矩阵按 32 列分组，每个矩阵依次保存三段数据：每行一个 f32 行 scale、每组一个 i8 组倍率（可为负）、每组 16 字节的 4-bit 打包值，末尾补零到 4 字节对齐；权重还原值为 `行 scale × 组倍率 × q`，`q ∈ [-8, 7]`，平均约 4.25 bit／权重。导出器对每组尝试 17 个候选步长与两种符号，用最小二乘重新拟合步长并取还原误差最小者，在 Qwen3-0.6B 上比按 absmax/7 取整的权重相对均方误差低约 32%。Norm 与 bias 保持 f32，嵌入查表和 LM Head 共用同一编码。
 
-推理时线性层的输入按同样的 32 列分组量化为 int8（每组一个 f32 scale），组内做整数点积后乘以 `组倍率 × 输入 scale` 累加。x86_64 在运行时检测到 AVX2 时使用向量化内核和常驻线程池（默认取物理核数，最多 8 个，可用环境变量 `NNCOSS_THREADS` 覆盖），每个线程顺序读取一段连续的权重行；prefill 每批 32 个 token，同一行权重对多个 token 复用。其他目标（包括 WASM）使用标量实现。向量化与标量路径按相同的通道划分和求和顺序计算，RoPE 的幂与正余弦、softmax 与 SiLU 的指数使用只依赖 IEEE 754 基本运算的实现，因此原生与 WASM 的 logits 逐位一致；批量 prefill 与逐 token decode 的结果也逐位一致。
+推理时线性层的输入按同样的 32 列分组量化为 int8（每组一个 f32 scale），组内做整数点积后乘以 `组倍率 × 输入 scale` 累加。x86_64 在运行时检测到 AVX2 时使用向量化内核和常驻线程池（默认取物理核数，最多 8 个，可用环境变量 `NNCOSS_THREADS` 覆盖），每个线程顺序读取一段连续的权重行；prefill 每批 32 个 token，同一行权重对多个 token 复用，注意力按 KV 头并行、同一头的 K/V 对整批 token 复用。KV Cache 按 `[KV 头][位置][head_dim]` 连续存放；Q4 模型的 KV Cache 以 f16 存储（Qwen3-0.6B 每个位置 114,688 字节），f32 模型保持 f32（每个位置 229,376 字节），f16 与 f32 之间的转换使用软件实现的就近舍入，与 F16C 指令逐位一致。其他目标（包括 WASM）使用标量实现。向量化与标量路径按相同的通道划分和求和顺序计算，RoPE 的幂与正余弦、softmax 与 SiLU 的指数使用只依赖 IEEE 754 基本运算的实现，因此原生与 WASM 的 logits 逐位一致；批量 prefill 与逐 token decode 的结果也逐位一致。
 
 ```bash
 python3 tools/export_llm.py --model model/Qwen3-0.6B --output model/Qwen3-0.6B/qwen3-0.6b-q4.nncossllm --outtype q4
@@ -448,14 +448,16 @@ cargo run -p nncoss-llm --release --example bench -- --model model/Qwen3-0.6B/qw
 
 | 场景 | 优化前 | 当前 |
 |------|--------|------|
-| 原生 decode（prompt 24、生成 64、temperature 0.6／top-k 20／top-p 0.95） | 25.1 tokens/s | 74–76 tokens/s |
-| 原生 decode（prompt 128、生成 64） | — | 约 67 tokens/s |
-| 原生 prefill（24 token） | 31.2 tokens/s | 约 200–230 tokens/s |
+| 原生 decode（prompt 24、生成 64、temperature 0.6／top-k 20／top-p 0.95） | 25.1 tokens/s | 78–81 tokens/s |
+| 原生 decode（prompt 256、生成 64） | — | 68–69 tokens/s |
+| 原生 decode（prompt 1024、生成 64） | — | 45–49 tokens/s |
+| 原生 prefill（24 token） | 31.2 tokens/s | 约 230 tokens/s |
+| 原生 prefill（1024 token） | — | 约 7.2 秒（约 140 tokens/s） |
 | WASM decode（wasmtime，标量） | 约 1.2 tokens/s | 约 1.1–1.3 tokens/s |
 
-“优化前”为本次改动之前的 Q4 实现（每组 f32 scale、f32 激活）。单 token decode 每步需要读取全部约 317 MB 权重，另加随上下文增长的 KV Cache（每个位置 229,376 字节），速度受内存带宽限制。该机实测多线程顺序读带宽峰值约 30–33 GB/s，但受其他程序干扰时平均只有约 19–24 GB/s，对应的 decode 上限约为 75–100 tokens/s，当前已接近实际可用带宽。要稳定超过 100 tokens/s，需要更低比特的权重、推测解码或带宽更高的硬件，这些均尚未实现。
+“优化前”为本次改动之前的 Q4 实现（每组 f32 scale、f32 激活）。KV Cache 改为按头连续存放并对 Q4 模型使用 f16 之前，prompt 1024 的 decode 为 31 tokens/s，prefill 1024 个 token 约需 9.8 秒。单 token decode 每步需要读取全部约 317 MB 权重，另加随上下文增长的 KV Cache，速度受内存带宽限制。该机实测多线程顺序读带宽峰值约 30–33 GB/s，但受其他程序干扰时平均只有约 19–24 GB/s，对应的 decode 上限约为 75–100 tokens/s，当前已接近实际可用带宽。要稳定超过 100 tokens/s，需要更低比特的权重、推测解码或带宽更高的硬件，这些均尚未实现。按 prompt lookup 方式起草的推测解码在 7 组中英文多轮对话的贪心生成上做过离线回放：在当前多 token 前向的开销下整体收益约 0–3%，即使把每个起草 token 的验证开销降到单步 decode 的 15%，整体也只有约 15%（代码与摘要类约 30–50%，开放式对话接近 0），因此未实现。
 
-`tools/check_q4_llm.py` 在内置的中文问答、英文问答和 Rust 代码三段文本上按 teacher forcing 比较 Q4 与 f32 模型的下一 token 分布。当前导出结果在 337 个位置上 top-1 一致率为 0.807，平均 KL(f32‖Q4) 为 0.229，困惑度从 8.689 升至 9.613（比值 1.106）。脚本默认阈值按这组结果留出余量，只用于发现回归，不表示 Q4 与 f32 质量相当。该脚本需要 numpy、tokenizers 与本地 LFS 模型，不纳入 CI。
+`tools/check_q4_llm.py` 在内置的中文问答、英文问答和 Rust 代码三段文本上按 teacher forcing 比较 Q4 与 f32 模型的下一 token 分布。当前导出结果（含 f16 KV Cache）在 337 个位置上 top-1 一致率为 0.813，平均 KL(f32‖Q4) 为 0.227，困惑度从 8.689 升至 9.638（比值 1.109）。脚本默认阈值按这组结果留出余量，只用于发现回归，不表示 Q4 与 f32 质量相当。该脚本需要 numpy、tokenizers 与本地 LFS 模型，不纳入 CI。
 
 ### 本地 Web 对话界面
 

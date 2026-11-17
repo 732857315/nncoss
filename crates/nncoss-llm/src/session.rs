@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::cache::KvCache;
+use crate::cache::{KvCache, KvLayer, KvPrecision};
 use crate::model::Model;
 use crate::ops::{
     AttentionShape, add_assign, apply_rope_table, attention, rms_norm_heads, rms_norm_into,
@@ -86,8 +86,18 @@ impl Session {
                 maximum: model.config.max_context,
             });
         }
+        let precision = if model.config.quantized {
+            KvPrecision::F16
+        } else {
+            KvPrecision::F32
+        };
         Ok(Self {
-            cache: KvCache::new(model.config.layer_count),
+            cache: KvCache::new(
+                model.config.layer_count,
+                model.config.kv_head_count,
+                model.config.head_dim,
+                precision,
+            ),
             scratch: Scratch::new(&model),
             model,
             max_context: maximum,
@@ -219,11 +229,10 @@ impl Session {
         let start = cache.len();
         let (hidden, q_dim, kv_dim) = (config.hidden_size, config.q_dim(), config.kv_dim());
         let half = config.head_dim / 2;
-        let shape = |position: usize| AttentionShape {
+        let shape = AttentionShape {
             head_count: config.head_count,
             kv_head_count: config.kv_head_count,
             head_dim: config.head_dim,
-            count: position + 1,
         };
         scratch.reserve(model, count);
         let longest = config.head_count * (start + count);
@@ -312,16 +321,15 @@ impl Session {
             {
                 return Err(Error::Allocation);
             }
-            let (keys, values) = cache.layer(layer_index);
-            for offset in 0..count {
-                attention(
-                    &scratch.query[offset * q_dim..(offset + 1) * q_dim],
-                    keys,
-                    values,
-                    shape(start + offset),
-                    &mut scratch.scores,
-                    &mut scratch.attended[offset * q_dim..(offset + 1) * q_dim],
-                );
+            let queries = &scratch.query[..count * q_dim];
+            let attended = &mut scratch.attended[..count * q_dim];
+            match cache.layer(layer_index) {
+                KvLayer::F32(view) => {
+                    attention(queries, view, shape, start, &mut scratch.scores, attended)
+                }
+                KvLayer::F16(view) => {
+                    attention(queries, view, shape, start, &mut scratch.scores, attended)
+                }
             }
             linear_many(
                 &scratch.attended[..count * q_dim],
@@ -603,21 +611,22 @@ mod tests {
 
     #[test]
     fn grouped_query_heads_read_their_shared_kv_head() {
-        let mut cache = KvCache::new(1);
+        let mut cache = KvCache::new(1, 2, 2, KvPrecision::F32);
         cache
             .append(0, &[0.1, 0.2, 0.3, 0.4], &[1.0, 2.0, 3.0, 4.0], 4)
             .unwrap();
         let query = [0.5, -0.5, 1.0, 0.25, -1.0, 2.0, 0.0, 1.0];
-        let (keys, values) = cache.layer(0);
         let shape = AttentionShape {
             head_count: 4,
             kv_head_count: 2,
             head_dim: 2,
-            count: 1,
         };
         let mut scores = vec![0.0; 4];
         let mut output = vec![0.0; 8];
-        attention(&query, keys, values, shape, &mut scores, &mut output);
+        let KvLayer::F32(view) = cache.layer(0) else {
+            unreachable!()
+        };
+        attention(&query, view, shape, 0, &mut scores, &mut output);
         assert_close(&output, &[1.0, 2.0, 1.0, 2.0, 3.0, 4.0, 3.0, 4.0]);
     }
 

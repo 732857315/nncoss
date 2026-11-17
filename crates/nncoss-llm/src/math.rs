@@ -76,6 +76,57 @@ pub(crate) fn sin_cos(value: f64) -> (f64, f64) {
     }
 }
 
+pub(crate) fn f16_to_f32(bits: u16) -> f32 {
+    let sign = u32::from(bits & 0x8000) << 16;
+    let exponent = u32::from(bits >> 10) & 0x1f;
+    let mantissa = u32::from(bits & 0x03ff);
+    let magnitude = match exponent {
+        0 => {
+            let value = mantissa as f32 * f32::from_bits(0x3380_0000);
+            value.to_bits()
+        }
+        0x1f if mantissa == 0 => 0x7f80_0000,
+        0x1f => 0x7fc0_0000 | (mantissa << 13),
+        _ => ((exponent + 112) << 23) | (mantissa << 13),
+    };
+    f32::from_bits(sign | magnitude)
+}
+
+pub(crate) fn f32_to_f16(value: f32) -> u16 {
+    let bits = value.to_bits();
+    let sign = (bits >> 16) & 0x8000;
+    let exponent = bits & 0x7f80_0000;
+    let mantissa = bits & 0x007f_ffff;
+    if exponent == 0x7f80_0000 {
+        let quiet = if mantissa == 0 { 0 } else { 0x0200 };
+        return (sign | 0x7c00 | quiet | (mantissa >> 13)) as u16;
+    }
+    let half_exponent = (exponent >> 23) as i32 - 127 + 15;
+    if half_exponent >= 0x1f {
+        return (sign | 0x7c00) as u16;
+    }
+    if half_exponent <= 0 {
+        if 14 - half_exponent > 24 {
+            return sign as u16;
+        }
+        let mantissa = mantissa | 0x0080_0000;
+        let shift = (14 - half_exponent) as u32;
+        let mut half = mantissa >> shift;
+        let round = 1 << (shift - 1);
+        if mantissa & round != 0 && mantissa & (3 * round - 1) != 0 {
+            half += 1;
+        }
+        return (sign | half) as u16;
+    }
+    let half = sign | ((half_exponent as u32) << 10) | (mantissa >> 13);
+    let round = 0x1000;
+    if mantissa & round != 0 && mantissa & (3 * round - 1) != 0 {
+        (half + 1) as u16
+    } else {
+        half as u16
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -132,5 +183,81 @@ mod tests {
         }
         assert_eq!(sin_cos(0.0), (0.0, 1.0));
         assert!(sin_cos(f64::INFINITY).0.is_nan() && sin_cos(2e6).1.is_nan());
+    }
+
+    #[test]
+    fn f16_round_trips_and_rounds_to_nearest_even() {
+        for bits in 0..=u16::MAX {
+            let value = f16_to_f32(bits);
+            if value.is_nan() {
+                assert_eq!(f32_to_f16(value) & 0x7e00, 0x7e00);
+            } else {
+                assert_eq!(f32_to_f16(value), bits, "{bits:#06x}");
+            }
+        }
+        assert_eq!(f16_to_f32(0x3c00), 1.0);
+        assert_eq!(f16_to_f32(0x0001), 2.0_f32.powi(-24));
+        assert_eq!(f16_to_f32(0x7bff), 65504.0);
+        assert_eq!(f32_to_f16(65519.0), 0x7bff);
+        assert_eq!(f32_to_f16(65520.0), 0x7c00);
+        assert_eq!(f32_to_f16(1.0 + 2.0_f32.powi(-11)), 0x3c00);
+        assert_eq!(f32_to_f16(1.0 + 3.0 * 2.0_f32.powi(-11)), 0x3c02);
+        assert_eq!(f32_to_f16(2.0_f32.powi(-25)), 0x0000);
+        assert_eq!(f32_to_f16(3.0 * 2.0_f32.powi(-26)), 0x0001);
+        assert_eq!(f32_to_f16(-0.0), 0x8000);
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn f16_conversions_match_f16c() {
+        use std::arch::x86_64::*;
+
+        if !std::arch::is_x86_feature_detected!("f16c") {
+            return;
+        }
+        #[target_feature(enable = "f16c")]
+        unsafe fn hardware_to_f16(value: f32) -> u16 {
+            _mm_extract_epi16::<0>(_mm_cvtps_ph::<_MM_FROUND_TO_NEAREST_INT>(_mm_set_ss(value)))
+                as u16
+        }
+        #[target_feature(enable = "f16c")]
+        unsafe fn hardware_to_f32(bits: u16) -> f32 {
+            _mm_cvtss_f32(_mm_cvtph_ps(_mm_set1_epi16(bits as i16)))
+        }
+        for bits in 0..=u16::MAX {
+            let expected = unsafe { hardware_to_f32(bits) };
+            assert_eq!(
+                f16_to_f32(bits).to_bits(),
+                expected.to_bits(),
+                "{bits:#06x}"
+            );
+        }
+        let mut bits = 0_u32;
+        loop {
+            let value = f32::from_bits(bits);
+            assert_eq!(
+                f32_to_f16(value),
+                unsafe { hardware_to_f16(value) },
+                "{bits:#010x}"
+            );
+            let (next, overflow) = bits.overflowing_add(65_521);
+            if overflow {
+                break;
+            }
+            bits = next;
+        }
+        for half in 0..0x7c00_u16 {
+            let base = f16_to_f32(half).to_bits();
+            for offset in [0x0fff_u32, 0x1000, 0x1001, 0x1fff, 0x2000] {
+                let value = f32::from_bits(base + offset);
+                for value in [value, -value] {
+                    assert_eq!(
+                        f32_to_f16(value),
+                        unsafe { hardware_to_f16(value) },
+                        "{value:e}"
+                    );
+                }
+            }
+        }
     }
 }

@@ -344,14 +344,14 @@ console.log("识别结果：", logits.argmax());
 
 ## WASM LLM 推理原型
 
-`crates/nncoss-llm` 参考 [ncnn 的 KV Cache 设计](https://github.com/Tencent/ncnn/wiki/kvcache)与 [ncnn_llm](https://github.com/futz12/ncnn_llm) 的嵌入／decoder／LM Head 拆分方式。当前可运行代码是 Rust 标量参考后端，采用会话持有的 KV Cache、prefill 与单 token decode，并复用绑定嵌入权重作为 LM Head；目标部署架构默认复用 ncnn 的 WASM 图执行与 KV Cache，但 ncnn 后端尚未接入，现有 `.wasm` 产物不包含 ncnn。
+`crates/nncoss-llm` 参考 [ncnn 的 KV Cache 设计](https://github.com/Tencent/ncnn/wiki/kvcache)与 [ncnn_llm](https://github.com/futz12/ncnn_llm) 的嵌入／decoder／LM Head 拆分方式。当前可运行代码是 Rust 实现：标量路径作为参考与 WASM 后端，x86_64 原生目标在检测到 AVX2 时启用向量化内核与线程池；采用会话持有的 KV Cache、prefill 与单 token decode，并复用绑定嵌入权重作为 LM Head；目标部署架构默认复用 ncnn 的 WASM 图执行与 KV Cache，但 ncnn 后端尚未接入，现有 `.wasm` 产物不包含 ncnn。
 
 ### 已实现范围
 
 | 能力 | 当前实现 |
 |------|----------|
 | 模型结构 | 单 batch decoder-only；RMSNorm、RoPE、GQA、SwiGLU；可选 QKV bias、QK norm；绑定或独立 LM Head |
-| 数值与算子 | f32 标量 CPU 参考路径；行主序矩阵乘、稳定 softmax 与 SiLU |
+| 数值与算子 | f32 标量 CPU 参考路径；行主序矩阵乘、稳定 softmax 与 SiLU；可选 Q4 权重与按组 int8 激活的整数点积；x86_64 AVX2 内核与原生线程池，与标量路径逐位一致；RoPE 与指数函数使用不依赖平台 libm 的实现 |
 | 会话 | 多 token prefill、单 token decode、KV Cache 几何增长与容量复用、reset、EOS 停止 |
 | 采样 | 贪心、temperature、top-k、top-p；可复现的 SplitMix64 随机序列 |
 | 调用接口 | Rust API 与版本为 1 的 WASM／原生 C ABI；模型可整块从内存加载，或按声明的总长度分块流式加载；会话独立持有权重生命周期 |
@@ -431,23 +431,49 @@ python3 tools/check_real_llm.py --hf-model model/Qwen3-0.6B
 
 该对拍使用固定 token id，不经过 Tokenizer；只覆盖 9 个位置的短序列，不包含长上下文、采样分布或性能验收。KV Cache 随上下文增长，该模型每个 token 占 229,376 字节，更长上下文在 wasm32 的可用余量尚未实测。该脚本依赖本地 LFS 模型，不纳入 CI。
 
+### Q4 量化与原生加速
+
+`tools/export_llm.py --outtype q4` 提供项目内的 Q4 权重编码，不改变模型 ABI 或分块加载协议。矩阵按 32 列分组，每个矩阵依次保存三段数据：每行一个 f32 行 scale、每组一个 i8 组倍率（可为负）、每组 16 字节的 4-bit 打包值，末尾补零到 4 字节对齐；权重还原值为 `行 scale × 组倍率 × q`，`q ∈ [-8, 7]`，平均约 4.25 bit／权重。导出器对每组尝试 17 个候选步长与两种符号，用最小二乘重新拟合步长并取还原误差最小者，在 Qwen3-0.6B 上比按 absmax/7 取整的权重相对均方误差低约 32%。Norm 与 bias 保持 f32，嵌入查表和 LM Head 共用同一编码。
+
+推理时线性层的输入按同样的 32 列分组量化为 int8（每组一个 f32 scale），组内做整数点积后乘以 `组倍率 × 输入 scale` 累加。x86_64 在运行时检测到 AVX2 时使用向量化内核和常驻线程池（默认取物理核数，最多 8 个，可用环境变量 `NNCOSS_THREADS` 覆盖），每个线程顺序读取一段连续的权重行；prefill 每批 32 个 token，同一行权重对多个 token 复用。其他目标（包括 WASM）使用标量实现。向量化与标量路径按相同的通道划分和求和顺序计算，RoPE 的幂与正余弦、softmax 与 SiLU 的指数使用只依赖 IEEE 754 基本运算的实现，因此原生与 WASM 的 logits 逐位一致；批量 prefill 与逐 token decode 的结果也逐位一致。
+
+```bash
+python3 tools/export_llm.py --model model/Qwen3-0.6B --output model/Qwen3-0.6B/qwen3-0.6b-q4.nncossllm --outtype q4
+python3 tools/check_real_llm.py --model model/Qwen3-0.6B/qwen3-0.6b-q4.nncossllm --targets native,wasm
+python3 tools/check_q4_llm.py
+cargo run -p nncoss-llm --release --example bench -- --model model/Qwen3-0.6B/qwen3-0.6b-q4.nncossllm --prompt 24 --decode 64
+```
+
+本地 Qwen3-0.6B Q4 文件为 318,862,912 字节，约 304.1 MiB；导出约需 6 分钟。以下数据在一台 Intel Core i7-9750H（6 核 12 线程、16 GiB、macOS、接通电源）上测得，均为本地结果，不纳入 CI，也不构成性能承诺：
+
+| 场景 | 优化前 | 当前 |
+|------|--------|------|
+| 原生 decode（prompt 24、生成 64、temperature 0.6／top-k 20／top-p 0.95） | 25.1 tokens/s | 74–76 tokens/s |
+| 原生 decode（prompt 128、生成 64） | — | 约 67 tokens/s |
+| 原生 prefill（24 token） | 31.2 tokens/s | 约 200–230 tokens/s |
+| WASM decode（wasmtime，标量） | 约 1.2 tokens/s | 约 1.1–1.3 tokens/s |
+
+“优化前”为本次改动之前的 Q4 实现（每组 f32 scale、f32 激活）。单 token decode 每步需要读取全部约 317 MB 权重，另加随上下文增长的 KV Cache（每个位置 229,376 字节），速度受内存带宽限制。该机实测多线程顺序读带宽峰值约 30–33 GB/s，但受其他程序干扰时平均只有约 19–24 GB/s，对应的 decode 上限约为 75–100 tokens/s，当前已接近实际可用带宽。要稳定超过 100 tokens/s，需要更低比特的权重、推测解码或带宽更高的硬件，这些均尚未实现。
+
+`tools/check_q4_llm.py` 在内置的中文问答、英文问答和 Rust 代码三段文本上按 teacher forcing 比较 Q4 与 f32 模型的下一 token 分布。当前导出结果在 337 个位置上 top-1 一致率为 0.807，平均 KL(f32‖Q4) 为 0.229，困惑度从 8.689 升至 9.613（比值 1.106）。脚本默认阈值按这组结果留出余量，只用于发现回归，不表示 Q4 与 f32 质量相当。该脚本需要 numpy、tokenizers 与本地 LFS 模型，不纳入 CI。
+
 ### 本地 Web 对话界面
 
-`crates/nncoss-web` 提供本地浏览器聊天界面，使用 Rust HTTP 服务、Rust Tokenizer 和 `nncoss-llm` 原生标量后端，不包含 JavaScript。模型只加载一次，浏览器通过 HttpOnly Cookie 保持独立会话和 KV Cache；每次生成由全局推理锁串行执行，空消息不会进入历史，页面提供清空对话操作。服务默认只绑定 `127.0.0.1`。
+`crates/nncoss-web` 提供本地浏览器聊天界面，使用 Rust HTTP 服务、Rust Tokenizer 和 `nncoss-llm` 原生后端（见 [Q4 量化与原生加速](#q4-量化与原生加速)），不包含 JavaScript。模型只加载一次，浏览器通过 HttpOnly Cookie 保持独立会话和 KV Cache；每次生成由全局推理锁串行执行，空消息不会进入历史，页面提供清空对话操作。服务默认只绑定 `127.0.0.1`。
 
 ```bash
 cargo build -p nncoss-web --release
 target/release/nncoss-web
 ```
 
-随后在浏览器打开 `http://127.0.0.1:8765/`。首次生成前需要加载约 2.4 GiB 模型，当前标量后端的每个生成 token 约需 0.8 秒。常用参数：
+随后在浏览器打开 `http://127.0.0.1:8765/`。未指定 `--model` 时，若本地已导出 `model/Qwen3-0.6B/qwen3-0.6b-q4.nncossllm` 则优先加载该 Q4 模型（约 304 MiB），否则加载仓库中约 2.4 GiB 的 f32 模型；启动日志会打印实际加载的路径。f32 模型走逐元素累加的参考路径，在上述测试机上 decode 约 8 tokens/s。常用参数：
 
 ```bash
 target/release/nncoss-web --decode 32 --temperature 0.6 --top-k 20 --top-p 0.95
 target/release/nncoss-web --model /path/to/model.nncossllm --tokenizer /path/to/tokenizer.json
 ```
 
-界面不嵌入 WASM 运行时，使用原生参考后端；WASM 推理仍通过 `nncoss-llm` 的流式 ABI 验证。无模型的 mock 验收会构建服务并检查表单、UTF-8、HTML 转义、Cookie 隔离、空消息和清空操作：
+界面不嵌入 WASM 运行时，使用原生后端；WASM 推理仍通过 `nncoss-llm` 的流式 ABI 验证。无模型的 mock 验收会构建服务并检查表单、UTF-8、HTML 转义、Cookie 隔离、空消息和清空操作：
 
 ```bash
 python3 tools/check_web_ui.py
@@ -462,7 +488,9 @@ cargo run -p nncoss-llm --release --example bench -- --preset small
 python3 tools/bench_wasm_llm.py --preset small
 ```
 
-基准用于记录标量参考后端的基线与后续优化前后的对比，结果依赖具体机器，不构成性能承诺，也不纳入 CI 门禁。WASM 脚本的 decode 计时包含 Python 宿主逐 token 调用的开销。
+传入 `--model` 时改为测量真实模型：`--prompt`、`--decode` 设置 token 数，默认使用 temperature 0.6／top-k 20／top-p 0.95 采样，`--greedy` 改为贪心；输出 decode 的中位与最佳 tokens/s。
+
+基准用于记录基线与优化前后的对比，结果依赖具体机器，不构成性能承诺，也不纳入 CI 门禁。WASM 脚本的 decode 计时包含 Python 宿主逐 token 调用的开销。
 
 ### 导出模型
 
@@ -472,7 +500,7 @@ python3 tools/bench_wasm_llm.py --preset small
 python3 tools/export_llm.py --model /path/to/local-model --output model.nncossllm
 ```
 
-导出器不加载 `.pt/.pth`，仅接受 `model_type` 为 `llama`、`qwen2` 或 `qwen3` 的已知 HalfSplit RoPE 配置，并按名称和形状写入 f32 权重；导出日志会记录该 RoPE 约定。当前拒绝 RoPE scaling、partial rotary 和 sliding window attention；Tokenizer、聊天模板与文本解码由调用方处理。`.nncossllm` 是版本为 1 的原型格式，尚未承诺跨版本兼容。
+导出器不加载 `.pt/.pth`，仅接受 `model_type` 为 `llama`、`qwen2` 或 `qwen3` 的已知 HalfSplit RoPE 配置，并按名称和形状写入 f32 权重（`--outtype q4` 时二维矩阵改写为 Q4，见 [Q4 量化与原生加速](#q4-量化与原生加速)）；导出日志会记录该 RoPE 约定。当前拒绝 RoPE scaling、partial rotary 和 sliding window attention；Tokenizer、聊天模板与文本解码由调用方处理。`.nncossllm` 是版本为 1 的原型格式，尚未承诺跨版本兼容。
 
 ### Rust 调用
 
@@ -535,7 +563,7 @@ fn load(path: &str) -> Result<Model, Box<dyn std::error::Error>> {
 
 分块加载接口是 ABI 版本 1 的增量扩展，已有接口的签名与行为不变；宿主可通过导出符号是否存在判断其可用性。分块可以在任意字节处切分，累计写入不得超过声明的总长度。加载器报告模型格式、长度或分配错误后即释放已解析的权重，后续写入与 `finish` 返回同一错误；空句柄、空指针等参数错误不改变加载器状态。数据未写满就调用 `finish` 按截断处理。`finish` 无论成败只能调用一次，加载器句柄始终需要 `nncoss_llm_model_loader_free` 释放，模型句柄的生命周期与加载器无关。
 
-当前尚未实现量化、WASM SIMD、多线程、GPU、浏览器 JavaScript 宿主和流式文本绑定。f32 权重约占每个参数 4 字节，模型、KV Cache 与临时张量必须共同满足 wasm32 地址空间及宿主内存限制；超过 `isize::MAX` 字节的模型文件在 wasm32 上只能分块加载，权重总量接近或超过 4 GiB 的模型无法以当前 f32 格式装入 wasm32。
+当前已实现 Q4 权重量化与原生多线程；尚未实现 WASM SIMD、WASM 多线程、GPU、浏览器 JavaScript 宿主和流式文本绑定。f32 权重约占每个参数 4 字节，Q4 约 0.53 字节，模型、KV Cache 与临时张量必须共同满足 wasm32 地址空间及宿主内存限制；超过 `isize::MAX` 字节的模型文件在 wasm32 上只能分块加载，权重总量接近或超过 4 GiB 的模型无法以当前 f32 格式装入 wasm32。
 
 ## 示例模型
 

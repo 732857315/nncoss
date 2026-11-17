@@ -119,6 +119,18 @@ const PAGE_END: &str = r#"
 </html>
 "#;
 
+const DEFAULT_Q4_MODEL: &str = "model/Qwen3-0.6B/qwen3-0.6b-q4.nncossllm";
+const DEFAULT_F32_MODEL: &str = "model/Qwen3-0.6B/qwen3-0.6b-f32.nncossllm";
+
+fn default_model() -> PathBuf {
+    let q4 = PathBuf::from(DEFAULT_Q4_MODEL);
+    if q4.is_file() {
+        q4
+    } else {
+        PathBuf::from(DEFAULT_F32_MODEL)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Options {
     pub host: String,
@@ -140,7 +152,7 @@ impl Default for Options {
             host: "127.0.0.1".to_string(),
             port: 8765,
             mock: false,
-            model: PathBuf::from("model/Qwen3-0.6B/qwen3-0.6b-f32.nncossllm"),
+            model: default_model(),
             tokenizer: PathBuf::from("model/Qwen3-0.6B/tokenizer.json"),
             decode: 32,
             temperature: 0.6,
@@ -822,6 +834,9 @@ fn load_engine(options: &Options) -> Result<Engine, String> {
 }
 
 pub fn serve(options: Options) -> Result<(), String> {
+    if !options.mock {
+        eprintln!("nncoss-web 正在加载模型 {}", options.model.display());
+    }
     let engine = load_engine(&options)?;
     let app = Arc::new(App::new(engine));
     let listener = TcpListener::bind((options.host.as_str(), options.port))
@@ -846,7 +861,8 @@ pub fn usage() -> &'static str {
      --host <地址>          监听地址，默认 127.0.0.1\n\
      --port <端口>          监听端口，默认 8765\n\
      --mock                 使用确定性模拟回复，不加载模型\n\
-     --model <路径>         模型文件，默认 model/Qwen3-0.6B/qwen3-0.6b-f32.nncossllm\n\
+     --model <路径>         模型文件，默认优先 model/Qwen3-0.6B/qwen3-0.6b-q4.nncossllm，\n\
+                            不存在时使用 model/Qwen3-0.6B/qwen3-0.6b-f32.nncossllm\n\
      --tokenizer <路径>     分词器文件，默认 model/Qwen3-0.6B/tokenizer.json\n\
      --decode <数量>        每次回复最多生成的 token 数，默认 32\n\
      --temperature <值>     采样温度，默认 0.6\n\

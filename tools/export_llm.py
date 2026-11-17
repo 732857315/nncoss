@@ -23,9 +23,10 @@ REQUIRED_CONFIG_KEYS = (
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="将 Llama/Qwen 风格的 safetensors 权重复制为 nncoss LLM f32 模型")
+    parser = argparse.ArgumentParser(description="将 Llama/Qwen 风格的 safetensors 权重复制为 nncoss LLM f32 或 Q4 模型")
     parser.add_argument("--model", type=Path, required=True, help="包含 config.json 和 safetensors 的本地模型目录")
     parser.add_argument("--output", type=Path, required=True, help="输出的 .nncossllm 文件")
+    parser.add_argument("--outtype", choices=("f32", "q4"), default="f32", help="权重编码，默认 f32")
     return parser.parse_args()
 
 
@@ -59,6 +60,75 @@ def write_tensor(output, sources, name, shape, torch):
     if sys.byteorder != "little":
         array = array.byteswap()
     output.write(array.tobytes())
+
+
+Q4_GROUP = 32
+Q4_CHUNK_ROWS = 4096
+Q4_STEP_MULTIPLIERS = tuple(0.8 + 0.025 * index for index in range(17))
+Q4_ROW_HEADROOM = 1.3
+
+
+def quantize_q4(array):
+    import numpy as np
+
+    rows, columns = array.shape
+    groups = (columns + Q4_GROUP - 1) // Q4_GROUP
+    if not np.isfinite(array).all():
+        raise ValueError("权重包含非有限值")
+    padded = np.zeros((rows, groups * Q4_GROUP), dtype=np.float32)
+    padded[:, :columns] = array
+    blocks = padded.reshape(rows, groups, Q4_GROUP)
+    base = np.abs(blocks).max(axis=2) / np.float32(7.0)
+    row_scale = (base.max(axis=1) * np.float32(Q4_ROW_HEADROOM / 127.0)).astype(np.float32)
+    if not np.isfinite(row_scale).all():
+        raise ValueError("Q4 行 scale 超出 float32 范围")
+    safe_scale = np.where(row_scale > 0, row_scale, np.float32(1.0))[:, None]
+    best_error = np.full(base.shape, np.inf, dtype=np.float32)
+    best_code = np.zeros(base.shape, dtype=np.int8)
+    for multiplier in Q4_STEP_MULTIPLIERS:
+        for sign in (1.0, -1.0):
+            trial = base * np.float32(multiplier * sign)
+            trial = np.where(trial != 0, trial, np.float32(1.0))
+            quantized = np.clip(np.rint(blocks / trial[:, :, None]), -8, 7)
+            numerator = (blocks * quantized).sum(axis=2)
+            denominator = (quantized * quantized).sum(axis=2)
+            fitted = numerator / np.where(denominator > 0, denominator, np.float32(1.0))
+            code = np.clip(np.rint(fitted / safe_scale), -127, 127)
+            step = (code * safe_scale).astype(np.float32)
+            divisor = np.where(step != 0, step, np.float32(1.0))
+            requantized = np.clip(np.rint(blocks / divisor[:, :, None]), -8, 7)
+            error = ((requantized * step[:, :, None] - blocks) ** 2).sum(axis=2)
+            better = error < best_error
+            best_error = np.where(better, error, best_error)
+            best_code = np.where(better, code.astype(np.int8), best_code)
+    step = (best_code.astype(np.float32) * safe_scale).astype(np.float32)
+    divisor = np.where(step != 0, step, np.float32(1.0))
+    quantized = np.clip(np.rint(blocks / divisor[:, :, None]), -8, 7).astype(np.int8)
+    quantized = np.where(step[:, :, None] != 0, quantized, 0).astype(np.int8)
+    unsigned = (quantized + 8).astype(np.uint8)
+    packed = unsigned[:, :, 0::2] | (unsigned[:, :, 1::2] << 4)
+    return row_scale, best_code.view(np.uint8), packed.astype(np.uint8)
+
+
+def write_q4_matrix(output, sources, name, shape, torch):
+    if len(shape) != 2:
+        raise ValueError(f"Q4 只支持二维矩阵：{name}")
+    tensor = read_tensor(sources, name)
+    if list(tensor.shape) != list(shape):
+        raise ValueError(f"权重 {name} 形状为 {list(tensor.shape)}，预期为 {list(shape)}")
+    array = tensor.detach().to(dtype=torch.float32).cpu().contiguous().numpy()
+    scales, codes, nibbles = [], [], []
+    for start in range(0, shape[0], Q4_CHUNK_ROWS):
+        row_scale, row_codes, row_nibbles = quantize_q4(array[start:start + Q4_CHUNK_ROWS])
+        scales.append(row_scale.astype("<f4").tobytes())
+        codes.append(row_codes.tobytes())
+        nibbles.append(row_nibbles.tobytes())
+    written = 0
+    for section in (scales, codes, nibbles):
+        for chunk in section:
+            output.write(chunk)
+            written += len(chunk)
+    output.write(bytes(-written % 4))
 
 
 def validate_layer_features(sources, layers):
@@ -211,7 +281,7 @@ def validate_tied_head(sources, torch):
         raise ValueError("tie_word_embeddings 为 true，但 lm_head.weight 与 model.embed_tokens.weight 不一致")
 
 
-def export(model_dir, output_path):
+def export(model_dir, output_path, outtype="f32"):
     try:
         import torch
         from safetensors import safe_open
@@ -233,6 +303,8 @@ def export(model_dir, output_path):
             if spec["tied"]:
                 validate_tied_head(sources, torch)
             flags = int(spec["tied"]) | (int(has_qkv_bias) << 1) | (int(has_qk_norm) << 2)
+            if outtype == "q4":
+                flags |= 8
             with temporary.open("wb") as output:
                 output.write(b"NNCSLLM\0")
                 output.write(struct.pack(
@@ -252,20 +324,23 @@ def export(model_dir, output_path):
                 ))
                 output.write(struct.pack("<2f", spec["epsilon"], spec["theta"]))
                 for name, shape in plan:
-                    write_tensor(output, sources, name, shape, torch)
+                    if outtype == "q4" and len(shape) == 2:
+                        write_q4_matrix(output, sources, name, shape, torch)
+                    else:
+                        write_tensor(output, sources, name, shape, torch)
         temporary.replace(output_path)
     except Exception:
         temporary.unlink(missing_ok=True)
         raise
     print(
         f"已导出 {output_path}：type={spec['model_type']}, layers={spec['layers']}, hidden={spec['hidden']}, "
-        f"heads={spec['heads']}/{spec['kv_heads']}, vocab={spec['vocab']}, rope=HalfSplit, f32"
+        f"heads={spec['heads']}/{spec['kv_heads']}, vocab={spec['vocab']}, rope=HalfSplit, {outtype}"
     )
 
 
 def main():
     args = parse_args()
-    export(args.model, args.output)
+    export(args.model, args.output, args.outtype)
 
 
 if __name__ == "__main__":

@@ -2,7 +2,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Instant;
 
-use nncoss_llm::{MODEL_FORMAT_VERSION, Model, Session};
+use nncoss_llm::{MODEL_FORMAT_VERSION, Model, SamplingConfig, Session};
 
 #[derive(Clone, Copy)]
 struct Preset {
@@ -132,12 +132,20 @@ struct Options {
     preset: Preset,
     iterations: usize,
     write_model: Option<String>,
+    model: Option<String>,
+    prompt: usize,
+    decode: usize,
+    greedy: bool,
 }
 
 fn parse_options() -> Result<Options, String> {
     let mut preset = PRESETS[0];
     let mut iterations = 5;
     let mut write_model = None;
+    let mut model = None;
+    let mut prompt = 24;
+    let mut decode = 64;
+    let mut greedy = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         let mut value = || args.next().ok_or(format!("{arg} 需要参数"));
@@ -158,9 +166,25 @@ fn parse_options() -> Result<Options, String> {
                 }
             }
             "--write-model" => write_model = Some(value()?),
+            "--model" => model = Some(value()?),
+            "--prompt" => {
+                prompt = value()?
+                    .parse()
+                    .ok()
+                    .filter(|count| *count > 0)
+                    .ok_or("--prompt 需要正整数")?;
+            }
+            "--decode" => {
+                decode = value()?
+                    .parse()
+                    .ok()
+                    .filter(|count| *count > 0)
+                    .ok_or("--decode 需要正整数")?;
+            }
+            "--greedy" => greedy = true,
             "--help" | "-h" => {
                 return Err(
-                    "用法：bench [--preset tiny|small] [--iterations N] [--write-model PATH]"
+                    "用法：bench [--preset tiny|small] [--iterations N] [--write-model PATH]\n      bench --model PATH [--prompt N] [--decode N] [--greedy] [--iterations N]"
                         .into(),
                 );
             }
@@ -171,6 +195,10 @@ fn parse_options() -> Result<Options, String> {
         preset,
         iterations,
         write_model,
+        model,
+        prompt,
+        decode,
+        greedy,
     })
 }
 
@@ -179,7 +207,91 @@ fn median(values: &mut [f64]) -> f64 {
     values[values.len() / 2]
 }
 
+fn run_model(path: &str, options: &Options) -> Result<(), String> {
+    let bytes = std::fs::read(path).map_err(|error| format!("读取 {path} 失败：{error}"))?;
+    let started = Instant::now();
+    let model = Arc::new(Model::from_bytes(&bytes).map_err(|error| error.to_string())?);
+    let load_ms = started.elapsed().as_secs_f64() * 1e3;
+    drop(bytes);
+    let vocab = model.config().vocab_size;
+    let context = options.prompt + options.decode;
+    let prompt: Vec<u32> = (0..options.prompt)
+        .map(|index| ((index * 7919 + 1000) % vocab.min(100_000)) as u32)
+        .collect();
+    let sampling = if options.greedy {
+        SamplingConfig::default()
+    } else {
+        SamplingConfig {
+            temperature: 0.6,
+            top_k: 20,
+            top_p: 0.95,
+        }
+    };
+    let mut prefill_ms = Vec::new();
+    let mut decode_ms = Vec::new();
+    let mut generated = Vec::new();
+    for iteration in 0..=options.iterations {
+        let mut session = Session::new(model.clone(), context).map_err(|e| e.to_string())?;
+        session
+            .set_sampler(sampling, 42)
+            .map_err(|e| e.to_string())?;
+        let started = Instant::now();
+        session.prefill(&prompt).map_err(|e| e.to_string())?;
+        let prefill = started.elapsed().as_secs_f64() * 1e3;
+        let mut tokens = Vec::with_capacity(options.decode);
+        let started = Instant::now();
+        for _ in 0..options.decode {
+            let token = session.sample_next().map_err(|e| e.to_string())?;
+            session.decode(token).map_err(|e| e.to_string())?;
+            tokens.push(token);
+        }
+        let decode = started.elapsed().as_secs_f64() * 1e3;
+        if iteration > 0 {
+            prefill_ms.push(prefill);
+            decode_ms.push(decode);
+        }
+        if !generated.is_empty() && generated != tokens {
+            return Err("同一输入与种子的解码在迭代之间不一致".into());
+        }
+        generated = tokens;
+    }
+    let prefill = median(&mut prefill_ms);
+    let decode = median(&mut decode_ms);
+    let fastest = decode_ms.iter().copied().fold(f64::INFINITY, f64::min);
+    let checksum = generated.iter().fold(0_u64, |acc, token| {
+        acc.wrapping_mul(31).wrapping_add(u64::from(*token))
+    });
+    println!("target: native ({})", std::env::consts::ARCH);
+    println!(
+        "model: {path} prompt={} decode={} iterations={} sampler={}",
+        options.prompt,
+        options.decode,
+        options.iterations,
+        if options.greedy {
+            "greedy"
+        } else {
+            "t0.6/k20/p0.95"
+        }
+    );
+    println!("load_ms: {load_ms:.2}");
+    println!(
+        "prefill_ms: {prefill:.2}  prefill_tok_s: {:.1}",
+        options.prompt as f64 / prefill * 1e3
+    );
+    println!(
+        "decode_ms_per_token: {:.3}  decode_tok_s: {:.1}  best_decode_tok_s: {:.1}",
+        decode / options.decode as f64,
+        options.decode as f64 / decode * 1e3,
+        options.decode as f64 / fastest * 1e3
+    );
+    println!("token_checksum: {checksum}");
+    Ok(())
+}
+
 fn run(options: Options) -> Result<(), String> {
+    if let Some(path) = options.model.clone() {
+        return run_model(&path, &options);
+    }
     let preset = options.preset;
     let bytes = preset.model_bytes();
     if let Some(path) = options.write_model {

@@ -3,8 +3,11 @@
 mod abi;
 mod cache;
 mod error;
+mod math;
 mod model;
 mod ops;
+mod pool;
+mod q4;
 mod sampler;
 mod session;
 #[cfg(test)]

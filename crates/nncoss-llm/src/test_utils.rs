@@ -1,4 +1,6 @@
 use crate::model::MODEL_MAGIC;
+use crate::q4::test_support::encode;
+use crate::q4::{Q4Matrix, Weight};
 use crate::{Model, RopeMode};
 
 #[derive(Debug, Clone, Copy)]
@@ -111,6 +113,27 @@ impl TinySpec {
         Model::from_bytes(&self.bytes()).unwrap()
     }
 
+    pub fn quantized_model(&self) -> Model {
+        let mut model = self.model();
+        let config = model.config.clone();
+        let (hidden, q_dim, kv_dim) = (config.hidden_size, config.q_dim(), config.kv_dim());
+        let inner = config.intermediate_size;
+        quantize(&mut model.token_embedding, config.vocab_size, hidden);
+        if let Some(head) = &mut model.lm_head {
+            quantize(head, config.vocab_size, hidden);
+        }
+        for layer in &mut model.layers {
+            quantize(&mut layer.q_proj, q_dim, hidden);
+            quantize(&mut layer.k_proj, kv_dim, hidden);
+            quantize(&mut layer.v_proj, kv_dim, hidden);
+            quantize(&mut layer.o_proj, hidden, q_dim);
+            quantize(&mut layer.gate_proj, inner, hidden);
+            quantize(&mut layer.up_proj, inner, hidden);
+            quantize(&mut layer.down_proj, hidden, inner);
+        }
+        model
+    }
+
     pub fn wide_variants() -> Vec<Self> {
         let mut variants = Vec::new();
         for tied in [false, true] {
@@ -130,6 +153,12 @@ impl TinySpec {
         }
         variants
     }
+}
+
+fn quantize(weight: &mut Weight, rows: usize, columns: usize) {
+    let values = std::mem::take(weight).into_f32();
+    let bytes = encode(&values, rows, columns);
+    *weight = Weight::Q4(Q4Matrix::new(rows, columns, bytes).unwrap());
 }
 
 pub(crate) fn tiny_model() -> Model {

@@ -47,22 +47,33 @@ impl Sampler {
         if self.config.temperature == 0.0 {
             return greedy(logits);
         }
-        let mut candidates = Vec::with_capacity(logits.len());
-        for (index, value) in logits.iter().enumerate() {
-            let scaled = value / self.config.temperature;
-            if !scaled.is_finite() {
-                return greedy(logits);
-            }
-            candidates.push((index as u32, scaled));
+        let mut candidates = Vec::new();
+        if self.config.top_k > 0 && self.config.top_k < logits.len() {
+            select_top(logits, self.config.top_k, &mut candidates);
+        } else {
+            candidates.extend(
+                logits
+                    .iter()
+                    .enumerate()
+                    .map(|(index, value)| (index as u32, *value)),
+            );
+            candidates.sort_by(order);
         }
-        candidates.sort_by(|left, right| right.1.total_cmp(&left.1));
-        if self.config.top_k > 0 {
-            candidates.truncate(self.config.top_k.min(candidates.len()));
+        self.draw(candidates)
+    }
+
+    fn draw(&mut self, mut candidates: Vec<(u32, f32)>) -> Result<u32> {
+        let best = candidates[0].0;
+        for candidate in &mut candidates {
+            candidate.1 /= self.config.temperature;
+            if !candidate.1.is_finite() {
+                return Ok(best);
+            }
         }
         let maximum = candidates[0].1;
         let mut sum = 0.0;
         for candidate in &mut candidates {
-            candidate.1 = (candidate.1 - maximum).exp();
+            candidate.1 = crate::ops::exp(candidate.1 - maximum);
             sum += candidate.1;
         }
         let mut retained = 0;
@@ -84,6 +95,32 @@ impl Sampler {
             threshold -= candidate.1;
         }
         Ok(candidates.last().map(|candidate| candidate.0).unwrap_or(0))
+    }
+}
+
+fn order(left: &(u32, f32), right: &(u32, f32)) -> std::cmp::Ordering {
+    right.1.total_cmp(&left.1).then(left.0.cmp(&right.0))
+}
+
+fn select_top(logits: &[f32], count: usize, candidates: &mut Vec<(u32, f32)>) {
+    candidates.clear();
+    let mut floor = f32::NEG_INFINITY;
+    for (index, value) in logits.iter().enumerate() {
+        if candidates.len() == count && *value <= floor {
+            continue;
+        }
+        let candidate = (index as u32, *value);
+        let position = candidates.partition_point(|existing| order(existing, &candidate).is_lt());
+        if position >= count {
+            continue;
+        }
+        if candidates.len() == count {
+            candidates.pop();
+        }
+        candidates.insert(position, candidate);
+        if candidates.len() == count {
+            floor = candidates[count - 1].1;
+        }
     }
 }
 
@@ -140,6 +177,24 @@ mod tests {
         )
         .unwrap();
         assert_eq!(top_k.sample(&logits).unwrap(), 1);
+    }
+
+    #[test]
+    fn top_k_selection_matches_full_sort() {
+        let logits: Vec<f32> = (0..500)
+            .map(|index| ((index * 37 % 101) as f32 * 0.25).sin() * 4.0)
+            .collect();
+        let mut sorted: Vec<(u32, f32)> = logits
+            .iter()
+            .enumerate()
+            .map(|(index, value)| (index as u32, *value))
+            .collect();
+        sorted.sort_by(order);
+        for count in [1, 2, 20, 499] {
+            let mut selected = Vec::new();
+            select_top(&logits, count, &mut selected);
+            assert_eq!(selected, sorted[..count]);
+        }
     }
 
     #[test]

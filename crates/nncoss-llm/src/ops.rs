@@ -1,5 +1,49 @@
-use crate::RopeMode;
+use std::ops::Range;
 
+use crate::RopeMode;
+use crate::pool::{SharedPtr, parallel_for};
+
+macro_rules! simd_fn {
+    ($(#[$meta:meta])* $vis:vis fn $name:ident($($arg:ident: $ty:ty),* $(,)?) $body:block) => {
+        $(#[$meta])*
+        $vis fn $name($($arg: $ty),*) {
+            #[inline(always)]
+            fn body($($arg: $ty),*) $body
+            #[cfg(target_arch = "x86_64")]
+            {
+                #[target_feature(enable = "avx2")]
+                unsafe fn accelerated($($arg: $ty),*) {
+                    body($($arg),*)
+                }
+                if std::arch::is_x86_feature_detected!("avx2") {
+                    return unsafe { accelerated($($arg),*) };
+                }
+            }
+            body($($arg),*)
+        }
+    };
+}
+
+pub(crate) fn linear_rows(
+    weights: &[f32],
+    columns: usize,
+    input: &[f32],
+    rows: Range<usize>,
+    bias: Option<&[f32]>,
+    output: &mut [f32],
+) {
+    debug_assert_eq!(input.len(), columns);
+    for (row, output) in rows.zip(output) {
+        let weights = &weights[row * columns..(row + 1) * columns];
+        let mut sum = bias.map_or(0.0, |values| values[row]);
+        for (weight, value) in weights.iter().zip(input) {
+            sum += weight * value;
+        }
+        *output = sum;
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn linear(
     weights: &[f32],
     rows: usize,
@@ -8,44 +52,204 @@ pub(crate) fn linear(
     bias: Option<&[f32]>,
 ) -> Vec<f32> {
     debug_assert_eq!(weights.len(), rows * columns);
-    debug_assert_eq!(input.len(), columns);
-    let mut output = Vec::with_capacity(rows);
-    for row in 0..rows {
-        let weights = &weights[row * columns..(row + 1) * columns];
-        let mut sum = bias.map_or(0.0, |values| values[row]);
-        for (weight, value) in weights.iter().zip(input) {
-            sum += weight * value;
-        }
-        output.push(sum);
-    }
+    let mut output = vec![0.0; rows];
+    linear_rows(weights, columns, input, 0..rows, bias, &mut output);
     output
 }
 
-pub(crate) fn rms_norm(input: &[f32], weight: &[f32], epsilon: f32) -> Vec<f32> {
-    debug_assert_eq!(input.len(), weight.len());
-    let mean_square = input.iter().map(|value| value * value).sum::<f32>() / input.len() as f32;
-    let scale = (mean_square + epsilon).sqrt().recip();
-    input
-        .iter()
-        .zip(weight)
-        .map(|(value, weight)| value * scale * weight)
-        .collect()
+const LANES: usize = 8;
+
+#[inline(always)]
+fn sum_lanes(lanes: [f32; LANES]) -> f32 {
+    ((lanes[0] + lanes[4]) + (lanes[2] + lanes[6]))
+        + ((lanes[1] + lanes[5]) + (lanes[3] + lanes[7]))
 }
 
-pub(crate) fn rms_norm_heads(
-    values: &mut [f32],
-    heads: usize,
-    head_dim: usize,
-    weight: &[f32],
-    epsilon: f32,
-) {
-    for head in 0..heads {
-        let start = head * head_dim;
-        let normalized = rms_norm(&values[start..start + head_dim], weight, epsilon);
-        values[start..start + head_dim].copy_from_slice(&normalized);
+#[inline(always)]
+fn sum(values: &[f32]) -> f32 {
+    let mut lanes = [0.0_f32; LANES];
+    let chunks = values.chunks_exact(LANES);
+    let rest = chunks.remainder();
+    for chunk in chunks {
+        for (lane, value) in lanes.iter_mut().zip(chunk) {
+            *lane += value;
+        }
+    }
+    let mut total = sum_lanes(lanes);
+    for value in rest {
+        total += value;
+    }
+    total
+}
+
+#[inline(always)]
+fn sum_squares(values: &[f32]) -> f32 {
+    let mut lanes = [0.0_f32; LANES];
+    let chunks = values.chunks_exact(LANES);
+    let rest = chunks.remainder();
+    for chunk in chunks {
+        for (lane, value) in lanes.iter_mut().zip(chunk) {
+            *lane += value * value;
+        }
+    }
+    let mut total = sum_lanes(lanes);
+    for value in rest {
+        total += value * value;
+    }
+    total
+}
+
+#[inline(always)]
+fn dot(left: &[f32], right: &[f32]) -> f32 {
+    const WIDE: usize = LANES * 2;
+    let mut lanes = [0.0_f32; WIDE];
+    let left_chunks = left.chunks_exact(WIDE);
+    let right_chunks = right.chunks_exact(WIDE);
+    let rest = left_chunks.remainder().iter().zip(right_chunks.remainder());
+    for (left, right) in left_chunks.zip(right_chunks) {
+        for ((lane, left), right) in lanes.iter_mut().zip(left).zip(right) {
+            *lane += left * right;
+        }
+    }
+    let mut folded = [0.0_f32; LANES];
+    for (index, lane) in folded.iter_mut().enumerate() {
+        *lane = lanes[index] + lanes[index + LANES];
+    }
+    let mut total = sum_lanes(folded);
+    for (left, right) in rest {
+        total += left * right;
+    }
+    total
+}
+
+#[inline(always)]
+pub(crate) fn exp(value: f32) -> f32 {
+    use std::f32::consts::LOG2_E;
+    const LN2_HIGH: f32 = 0.693_359_4;
+    const LN2_LOW: f32 = -2.121_944_4e-4;
+    #[allow(clippy::manual_clamp)]
+    let clamped = value.max(-87.0).min(88.0);
+    let exponent = (clamped * LOG2_E).round_ties_even();
+    let reduced = clamped - exponent * LN2_HIGH - exponent * LN2_LOW;
+    let mut series = 1.987_569_1e-4_f32;
+    series = series * reduced + 1.398_199_9e-3;
+    series = series * reduced + 8.333_452e-3;
+    series = series * reduced + 4.166_579_6e-2;
+    series = series * reduced + 1.666_666_5e-1;
+    series = series * reduced + 5.0e-1;
+    let result = series * (reduced * reduced) + reduced + 1.0;
+    let exponent = unsafe { exponent.to_int_unchecked::<i32>() };
+    let power = f32::from_bits(((exponent + 127) as u32) << 23);
+    result * power + value * 0.0
+}
+
+#[inline(always)]
+pub(crate) fn silu(value: f32) -> f32 {
+    value / (1.0 + exp(-value))
+}
+
+simd_fn! {
+    pub(crate) fn rms_norm_into(input: &[f32], weight: &[f32], epsilon: f32, output: &mut [f32]) {
+        debug_assert_eq!(input.len(), weight.len());
+        debug_assert_eq!(input.len(), output.len());
+        let mean_square = sum_squares(input) / input.len() as f32;
+        let scale = (mean_square + epsilon).sqrt().recip();
+        for ((output, value), weight) in output.iter_mut().zip(input).zip(weight) {
+            *output = value * scale * weight;
+        }
     }
 }
 
+simd_fn! {
+    pub(crate) fn rms_norm_heads(
+        values: &mut [f32],
+        heads: usize,
+        head_dim: usize,
+        weight: &[f32],
+        epsilon: f32,
+    ) {
+        for head in values[..heads * head_dim].chunks_exact_mut(head_dim) {
+            let mean_square = sum_squares(head) / head_dim as f32;
+            let scale = (mean_square + epsilon).sqrt().recip();
+            for (value, weight) in head.iter_mut().zip(weight) {
+                *value = *value * scale * weight;
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn rms_norm(input: &[f32], weight: &[f32], epsilon: f32) -> Vec<f32> {
+    let mut output = vec![0.0; input.len()];
+    rms_norm_into(input, weight, epsilon, &mut output);
+    output
+}
+
+simd_fn! {
+    pub(crate) fn swiglu(gate: &mut [f32], up: &[f32]) {
+        for (gate, up) in gate.iter_mut().zip(up) {
+            *gate = silu(*gate) * up;
+        }
+    }
+}
+
+simd_fn! {
+    pub(crate) fn add_assign(state: &mut [f32], delta: &[f32]) {
+        for (state, delta) in state.iter_mut().zip(delta) {
+            *state += delta;
+        }
+    }
+}
+
+pub(crate) fn rope_frequencies(head_dim: usize, theta: f32) -> Vec<f32> {
+    (0..head_dim / 2)
+        .map(|index| {
+            let power = (2 * index) as f32 / head_dim as f32;
+            1.0 / crate::math::pow(f64::from(theta), f64::from(power)) as f32
+        })
+        .collect()
+}
+
+pub(crate) fn rope_table(frequencies: &[f32], position: usize, table: &mut Vec<(f32, f32)>) {
+    table.clear();
+    table.extend(frequencies.iter().map(|frequency| {
+        let angle = position as f32 * frequency;
+        let (sine, cosine) = crate::math::sin_cos(f64::from(angle));
+        (sine as f32, cosine as f32)
+    }));
+}
+
+pub(crate) fn apply_rope_table(
+    values: &mut [f32],
+    heads: usize,
+    head_dim: usize,
+    table: &[(f32, f32)],
+    mode: RopeMode,
+) {
+    let half = head_dim / 2;
+    debug_assert_eq!(table.len(), half);
+    for head in values[..heads * head_dim].chunks_exact_mut(head_dim) {
+        match mode {
+            RopeMode::HalfSplit => {
+                let (left, right) = head.split_at_mut(half);
+                for ((left, right), (sine, cosine)) in left.iter_mut().zip(right).zip(table) {
+                    let (first, second) = (*left, *right);
+                    *left = first * cosine - second * sine;
+                    *right = second * cosine + first * sine;
+                }
+            }
+            RopeMode::Interleaved => {
+                for (pair, (sine, cosine)) in head.chunks_exact_mut(2).zip(table) {
+                    let (first, second) = (pair[0], pair[1]);
+                    pair[0] = first * cosine - second * sine;
+                    pair[1] = second * cosine + first * sine;
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn apply_rope(
     values: &mut [f32],
     heads: usize,
@@ -54,51 +258,202 @@ pub(crate) fn apply_rope(
     theta: f32,
     mode: RopeMode,
 ) {
-    let half = head_dim / 2;
-    for head in 0..heads {
-        let base = head * head_dim;
-        for index in 0..half {
-            let frequency = theta.powf(-((2 * index) as f32) / head_dim as f32);
-            let angle = position as f32 * frequency;
-            let (sine, cosine) = angle.sin_cos();
-            match mode {
-                RopeMode::HalfSplit => {
-                    let left = base + index;
-                    let right = left + half;
-                    let first = values[left];
-                    let second = values[right];
-                    values[left] = first * cosine - second * sine;
-                    values[right] = second * cosine + first * sine;
-                }
-                RopeMode::Interleaved => {
-                    let left = base + 2 * index;
-                    let right = left + 1;
-                    let first = values[left];
-                    let second = values[right];
-                    values[left] = first * cosine - second * sine;
-                    values[right] = second * cosine + first * sine;
-                }
+    let mut table = Vec::new();
+    rope_table(&rope_frequencies(head_dim, theta), position, &mut table);
+    apply_rope_table(values, heads, head_dim, &table, mode);
+}
+
+#[inline(always)]
+fn softmax_in_place(values: &mut [f32]) {
+    let maximum = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    for value in values.iter_mut() {
+        *value = exp(*value - maximum);
+    }
+    let total = sum(values);
+    for value in values.iter_mut() {
+        *value /= total;
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn softmax(values: &[f32]) -> Vec<f32> {
+    let mut output = values.to_vec();
+    softmax_in_place(&mut output);
+    output
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct AttentionShape {
+    pub head_count: usize,
+    pub kv_head_count: usize,
+    pub head_dim: usize,
+    pub count: usize,
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn dot_avx2(left: &[f32], right: &[f32]) -> f32 {
+    use std::arch::x86_64::*;
+
+    let length = left.len().min(right.len());
+    let blocks = length / (LANES * 2);
+    let mut low = _mm256_setzero_ps();
+    let mut high = _mm256_setzero_ps();
+    for block in 0..blocks {
+        unsafe {
+            let left = left.as_ptr().add(block * LANES * 2);
+            let right = right.as_ptr().add(block * LANES * 2);
+            low = _mm256_add_ps(
+                low,
+                _mm256_mul_ps(_mm256_loadu_ps(left), _mm256_loadu_ps(right)),
+            );
+            high = _mm256_add_ps(
+                high,
+                _mm256_mul_ps(
+                    _mm256_loadu_ps(left.add(LANES)),
+                    _mm256_loadu_ps(right.add(LANES)),
+                ),
+            );
+        }
+    }
+    let mut folded = [0.0_f32; LANES];
+    unsafe { _mm256_storeu_ps(folded.as_mut_ptr(), _mm256_add_ps(low, high)) };
+    let mut total = sum_lanes(folded);
+    for index in blocks * LANES * 2..length {
+        total += left[index] * right[index];
+    }
+    total
+}
+
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+fn attend_group_with(
+    queries: &[f32],
+    keys: &[f32],
+    values: &[f32],
+    shape: AttentionShape,
+    kv_head: usize,
+    scores: &mut [f32],
+    output: &mut [f32],
+    dot: impl Fn(&[f32], &[f32]) -> f32,
+) {
+    let AttentionShape {
+        head_dim, count, ..
+    } = shape;
+    let kv_dim = shape.kv_head_count * head_dim;
+    let offset = kv_head * head_dim;
+    let scale = (head_dim as f32).sqrt().recip();
+    for index in 0..count {
+        let key = &keys[index * kv_dim + offset..][..head_dim];
+        for (query, scores) in queries
+            .chunks_exact(head_dim)
+            .zip(scores.chunks_exact_mut(count))
+        {
+            scores[index] = dot(query, key) * scale;
+        }
+    }
+    for scores in scores.chunks_exact_mut(count) {
+        softmax_in_place(scores);
+    }
+    output.fill(0.0);
+    for index in 0..count {
+        let value = &values[index * kv_dim + offset..][..head_dim];
+        for (context, scores) in output
+            .chunks_exact_mut(head_dim)
+            .zip(scores.chunks_exact(count))
+        {
+            let probability = scores[index];
+            for (context, value) in context.iter_mut().zip(value) {
+                *context += probability * value;
             }
         }
     }
 }
 
-pub(crate) fn softmax(values: &[f32]) -> Vec<f32> {
-    let maximum = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let mut output: Vec<f32> = values.iter().map(|value| (value - maximum).exp()).collect();
-    let sum = output.iter().sum::<f32>();
-    for value in &mut output {
-        *value /= sum;
-    }
-    output
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn attend_group_avx2(
+    queries: &[f32],
+    keys: &[f32],
+    values: &[f32],
+    shape: AttentionShape,
+    kv_head: usize,
+    scores: &mut [f32],
+    output: &mut [f32],
+) {
+    attend_group_with(
+        queries,
+        keys,
+        values,
+        shape,
+        kv_head,
+        scores,
+        output,
+        |left, right| unsafe { dot_avx2(left, right) },
+    );
 }
 
-pub(crate) fn silu(value: f32) -> f32 {
-    if value >= 0.0 {
-        value / (1.0 + (-value).exp())
+fn attend_group(
+    queries: &[f32],
+    keys: &[f32],
+    values: &[f32],
+    shape: AttentionShape,
+    kv_head: usize,
+    scores: &mut [f32],
+    output: &mut [f32],
+) {
+    #[cfg(target_arch = "x86_64")]
+    if std::arch::is_x86_feature_detected!("avx2") {
+        unsafe { attend_group_avx2(queries, keys, values, shape, kv_head, scores, output) };
+        return;
+    }
+    attend_group_with(queries, keys, values, shape, kv_head, scores, output, dot);
+}
+
+pub(crate) fn attention(
+    queries: &[f32],
+    keys: &[f32],
+    values: &[f32],
+    shape: AttentionShape,
+    scores: &mut [f32],
+    output: &mut [f32],
+) {
+    const PARALLEL_PRODUCTS: usize = 32_768;
+    let AttentionShape {
+        head_count,
+        kv_head_count,
+        head_dim,
+        count,
+    } = shape;
+    let group = head_count / kv_head_count;
+    let scores = &mut scores[..head_count * count];
+    let output = &mut output[..head_count * head_dim];
+    let queries = &queries[..head_count * head_dim];
+    let score_pointer = SharedPtr(scores.as_mut_ptr());
+    let output_pointer = SharedPtr(output.as_mut_ptr());
+    let run = |kv_head: usize| {
+        let (scores, output) = unsafe {
+            (
+                std::slice::from_raw_parts_mut(
+                    score_pointer.get().add(kv_head * group * count),
+                    group * count,
+                ),
+                std::slice::from_raw_parts_mut(
+                    output_pointer.get().add(kv_head * group * head_dim),
+                    group * head_dim,
+                ),
+            )
+        };
+        let queries = &queries[kv_head * group * head_dim..(kv_head + 1) * group * head_dim];
+        attend_group(queries, keys, values, shape, kv_head, scores, output);
+    };
+    if head_count * head_dim * count < PARALLEL_PRODUCTS {
+        for kv_head in 0..kv_head_count {
+            run(kv_head);
+        }
     } else {
-        let exponential = value.exp();
-        value * exponential / (1.0 + exponential)
+        parallel_for(kv_head_count, &run);
     }
 }
 
@@ -117,6 +472,85 @@ mod tests {
     fn linear_uses_row_major_weights_and_bias() {
         let output = linear(&[1.0, 2.0, 3.0, 4.0], 2, 2, &[2.0, 3.0], Some(&[0.5, -0.5]));
         assert_close(&output, &[8.5, 17.5]);
+    }
+
+    #[test]
+    fn exp_matches_std_within_relative_tolerance() {
+        let mut value = -87.0_f32;
+        while value <= 88.0 {
+            let expected = value.exp();
+            let actual = exp(value);
+            assert!(
+                (actual - expected).abs() <= expected * 4e-7,
+                "exp({value}) = {actual}, expected {expected}"
+            );
+            value += 0.137;
+        }
+        assert_eq!(exp(0.0), 1.0);
+        assert!(exp(-1000.0) > 0.0 && exp(-1000.0) < 1e-37);
+        assert!(exp(1000.0).is_finite());
+        assert!(exp(f32::NAN).is_nan() && exp(f32::INFINITY).is_nan());
+    }
+
+    #[test]
+    fn lane_reductions_match_sequential_sums() {
+        let values: Vec<f32> = (0..37).map(|index| (index as f32 - 18.0) / 7.0).collect();
+        let other: Vec<f32> = (0..37).map(|index| (index as f32 * 0.31).sin()).collect();
+        let expected_sum: f32 = values.iter().sum();
+        let expected_squares: f32 = values.iter().map(|value| value * value).sum();
+        let expected_dot: f32 = values.iter().zip(&other).map(|(l, r)| l * r).sum();
+        assert!((sum(&values) - expected_sum).abs() < 1e-4);
+        assert!((sum_squares(&values) - expected_squares).abs() < 1e-4);
+        assert!((dot(&values, &other) - expected_dot).abs() < 1e-4);
+    }
+
+    #[test]
+    fn attention_paths_match_bit_for_bit() {
+        let shape = AttentionShape {
+            head_count: 4,
+            kv_head_count: 2,
+            head_dim: 40,
+            count: 9,
+        };
+        let kv_dim = shape.kv_head_count * shape.head_dim;
+        let wave = |count: usize, step: f32| -> Vec<f32> {
+            (0..count)
+                .map(|index| (index as f32 * step).sin())
+                .collect()
+        };
+        let keys = wave(kv_dim * shape.count, 0.37);
+        let values = wave(kv_dim * shape.count, 0.11);
+        let queries = wave(shape.head_count * shape.head_dim, 0.23);
+        let mut scores = vec![0.0; shape.head_count * shape.count];
+        let mut dispatched = vec![0.0; shape.head_count * shape.head_dim];
+        attention(
+            &queries,
+            &keys,
+            &values,
+            shape,
+            &mut scores,
+            &mut dispatched,
+        );
+        let mut generic = vec![0.0; shape.head_count * shape.head_dim];
+        let group = shape.head_count / shape.kv_head_count;
+        for kv_head in 0..shape.kv_head_count {
+            let span = kv_head * group * shape.head_dim..(kv_head + 1) * group * shape.head_dim;
+            attend_group_with(
+                &queries[span.clone()],
+                &keys,
+                &values,
+                shape,
+                kv_head,
+                &mut scores[..group * shape.count],
+                &mut generic[span],
+                dot,
+            );
+        }
+        assert_eq!(
+            dispatched.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            generic.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+        );
+        assert!(dispatched.iter().any(|value| value.abs() > 1e-3));
     }
 
     #[test]

@@ -1,3 +1,4 @@
+use crate::q4::{Weight, matrix_bytes as q4_matrix_bytes};
 use crate::{Error, MODEL_FORMAT_VERSION, Result};
 
 pub(crate) const MODEL_MAGIC: &[u8; 8] = b"NNCSLLM\0";
@@ -5,7 +6,8 @@ const MODEL_ARCHITECTURE: u32 = 1;
 const FLAG_TIED_EMBEDDINGS: u32 = 1;
 const FLAG_QKV_BIAS: u32 = 2;
 const FLAG_QK_NORM: u32 = 4;
-const KNOWN_FLAGS: u32 = FLAG_TIED_EMBEDDINGS | FLAG_QKV_BIAS | FLAG_QK_NORM;
+const FLAG_Q4_WEIGHTS: u32 = 8;
+const KNOWN_FLAGS: u32 = FLAG_TIED_EMBEDDINGS | FLAG_QKV_BIAS | FLAG_QK_NORM | FLAG_Q4_WEIGHTS;
 const HEADER_LENGTH: usize = 64;
 const VALUE_LENGTH: usize = 4;
 
@@ -44,6 +46,7 @@ pub struct Config {
     pub tied_embeddings: bool,
     pub qkv_bias: bool,
     pub qk_norm: bool,
+    pub quantized: bool,
 }
 
 impl Config {
@@ -94,28 +97,28 @@ impl Config {
 #[derive(Debug, Default)]
 pub(crate) struct LayerWeights {
     pub attn_norm: Vec<f32>,
-    pub q_proj: Vec<f32>,
-    pub k_proj: Vec<f32>,
-    pub v_proj: Vec<f32>,
+    pub q_proj: Weight,
+    pub k_proj: Weight,
+    pub v_proj: Weight,
     pub q_bias: Option<Vec<f32>>,
     pub k_bias: Option<Vec<f32>>,
     pub v_bias: Option<Vec<f32>>,
     pub q_norm: Option<Vec<f32>>,
     pub k_norm: Option<Vec<f32>>,
-    pub o_proj: Vec<f32>,
+    pub o_proj: Weight,
     pub ffn_norm: Vec<f32>,
-    pub gate_proj: Vec<f32>,
-    pub up_proj: Vec<f32>,
-    pub down_proj: Vec<f32>,
+    pub gate_proj: Weight,
+    pub up_proj: Weight,
+    pub down_proj: Weight,
 }
 
 #[derive(Debug)]
 pub struct Model {
     pub(crate) config: Config,
-    pub(crate) token_embedding: Vec<f32>,
+    pub(crate) token_embedding: Weight,
     pub(crate) layers: Vec<LayerWeights>,
     pub(crate) final_norm: Vec<f32>,
-    pub(crate) lm_head: Option<Vec<f32>>,
+    pub(crate) lm_head: Option<Weight>,
 }
 
 impl Model {
@@ -127,6 +130,10 @@ impl Model {
 
     pub fn config(&self) -> &Config {
         &self.config
+    }
+
+    pub(crate) fn head(&self) -> &Weight {
+        self.lm_head.as_ref().unwrap_or(&self.token_embedding)
     }
 }
 
@@ -173,6 +180,7 @@ fn parse_header(bytes: &[u8]) -> Result<Config> {
         tied_embeddings: flags & FLAG_TIED_EMBEDDINGS != 0,
         qkv_bias: flags & FLAG_QKV_BIAS != 0,
         qk_norm: flags & FLAG_QK_NORM != 0,
+        quantized: flags & FLAG_Q4_WEIGHTS != 0,
     };
     config.validate()?;
     Ok(config)
@@ -205,19 +213,50 @@ enum Slot {
 }
 
 impl Slot {
-    fn value_count(self, config: &Config) -> Result<usize> {
+    fn shape(self, config: &Config) -> (usize, usize) {
         let hidden = config.hidden_size;
         match self {
-            Self::TokenEmbedding | Self::LmHead => area(config.vocab_size, hidden),
-            Self::AttnNorm | Self::FfnNorm | Self::FinalNorm => Ok(hidden),
-            Self::QProj => area(config.q_dim(), hidden),
-            Self::KProj | Self::VProj => area(config.kv_dim(), hidden),
-            Self::QBias => Ok(config.q_dim()),
-            Self::KBias | Self::VBias => Ok(config.kv_dim()),
-            Self::QNorm | Self::KNorm => Ok(config.head_dim),
-            Self::OProj => area(hidden, config.q_dim()),
-            Self::GateProj | Self::UpProj => area(config.intermediate_size, hidden),
-            Self::DownProj => area(hidden, config.intermediate_size),
+            Self::TokenEmbedding | Self::LmHead => (config.vocab_size, hidden),
+            Self::AttnNorm | Self::FfnNorm | Self::FinalNorm => (1, hidden),
+            Self::QProj => (config.q_dim(), hidden),
+            Self::KProj | Self::VProj => (config.kv_dim(), hidden),
+            Self::QBias => (1, config.q_dim()),
+            Self::KBias | Self::VBias => (1, config.kv_dim()),
+            Self::QNorm | Self::KNorm => (1, config.head_dim),
+            Self::OProj => (hidden, config.q_dim()),
+            Self::GateProj | Self::UpProj => (config.intermediate_size, hidden),
+            Self::DownProj => (hidden, config.intermediate_size),
+        }
+    }
+
+    fn value_count(self, config: &Config) -> Result<usize> {
+        let (rows, columns) = self.shape(config);
+        area(rows, columns)
+    }
+
+    fn is_matrix(self) -> bool {
+        matches!(
+            self,
+            Self::TokenEmbedding
+                | Self::QProj
+                | Self::KProj
+                | Self::VProj
+                | Self::OProj
+                | Self::GateProj
+                | Self::UpProj
+                | Self::DownProj
+                | Self::LmHead
+        )
+    }
+
+    fn byte_count(self, config: &Config) -> Result<usize> {
+        let (rows, columns) = self.shape(config);
+        if config.quantized && self.is_matrix() {
+            q4_matrix_bytes(rows, columns).ok_or(Error::InvalidModel("Q4 张量尺寸溢出"))
+        } else {
+            self.value_count(config)?
+                .checked_mul(VALUE_LENGTH)
+                .ok_or(Error::InvalidModel("张量尺寸溢出"))
         }
     }
 
@@ -255,59 +294,70 @@ impl Slot {
 #[derive(Debug)]
 struct Tensor {
     slot: Slot,
-    count: usize,
-    values: Vec<f32>,
-    finite: bool,
+    byte_count: usize,
+    rows: usize,
+    columns: usize,
+    quantized: bool,
+    values: Vec<u8>,
 }
 
 impl Tensor {
     fn open(slot: Slot, config: &Config, position: usize, total: usize) -> Result<Self> {
-        let count = slot.value_count(config)?;
-        let byte_count = count
-            .checked_mul(VALUE_LENGTH)
-            .ok_or(Error::InvalidModel("张量尺寸溢出"))?;
+        let byte_count = slot.byte_count(config)?;
         let end = position
             .checked_add(byte_count)
             .ok_or(Error::InvalidModel("模型长度溢出"))?;
         if end > total {
             return Err(Error::InvalidModel("模型数据被截断"));
         }
+        let (rows, columns) = slot.shape(config);
         let mut values = Vec::new();
         values
-            .try_reserve_exact(count)
+            .try_reserve_exact(byte_count)
             .map_err(|_| Error::Allocation)?;
         Ok(Self {
             slot,
-            count,
+            byte_count,
+            rows,
+            columns,
+            quantized: config.quantized && slot.is_matrix(),
             values,
-            finite: true,
         })
     }
 
     fn missing(&self) -> usize {
-        self.count - self.values.len()
+        self.byte_count - self.values.len()
     }
 
     fn push(&mut self, bytes: &[u8]) {
-        let mut finite = self.finite;
-        self.values
-            .extend(bytes.chunks_exact(VALUE_LENGTH).map(|chunk| {
-                let value = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
-                finite &= value.is_finite();
-                value
-            }));
-        self.finite = finite;
+        self.values.extend_from_slice(bytes);
+    }
+
+    fn into_weight(self) -> Result<Weight> {
+        if self.quantized && self.rows * self.columns != 0 {
+            let matrix = crate::q4::Q4Matrix::new(self.rows, self.columns, self.values)?;
+            return Ok(Weight::Q4(matrix));
+        }
+        let mut values = Vec::with_capacity(self.byte_count / VALUE_LENGTH);
+        for chunk in self.values.chunks_exact(VALUE_LENGTH) {
+            let value = f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+            if !value.is_finite() {
+                return Err(Error::InvalidModel("权重包含非有限值"));
+            }
+            values.push(value);
+        }
+        Ok(Weight::F32(values))
     }
 }
 
 #[derive(Debug)]
 struct Assembly {
     config: Config,
-    token_embedding: Vec<f32>,
+    token_embedding: Weight,
     layers: Vec<LayerWeights>,
     layer: LayerWeights,
     final_norm: Vec<f32>,
-    lm_head: Option<Vec<f32>>,
+    lm_head: Option<Weight>,
     tensor: Option<Tensor>,
 }
 
@@ -316,7 +366,7 @@ impl Assembly {
         let tensor = Tensor::open(Slot::TokenEmbedding, &config, position, total)?;
         Ok(Self {
             config,
-            token_embedding: Vec::new(),
+            token_embedding: Weight::default(),
             layers: Vec::new(),
             layer: LayerWeights::default(),
             final_norm: Vec::new(),
@@ -325,20 +375,20 @@ impl Assembly {
         })
     }
 
-    fn store(&mut self, slot: Slot, values: Vec<f32>) -> Result<()> {
+    fn store(&mut self, slot: Slot, values: Weight) -> Result<()> {
         match slot {
             Slot::TokenEmbedding => self.token_embedding = values,
-            Slot::AttnNorm => self.layer.attn_norm = values,
+            Slot::AttnNorm => self.layer.attn_norm = values.into_f32(),
             Slot::QProj => self.layer.q_proj = values,
             Slot::KProj => self.layer.k_proj = values,
             Slot::VProj => self.layer.v_proj = values,
-            Slot::QBias => self.layer.q_bias = Some(values),
-            Slot::KBias => self.layer.k_bias = Some(values),
-            Slot::VBias => self.layer.v_bias = Some(values),
-            Slot::QNorm => self.layer.q_norm = Some(values),
-            Slot::KNorm => self.layer.k_norm = Some(values),
+            Slot::QBias => self.layer.q_bias = Some(values.into_f32()),
+            Slot::KBias => self.layer.k_bias = Some(values.into_f32()),
+            Slot::VBias => self.layer.v_bias = Some(values.into_f32()),
+            Slot::QNorm => self.layer.q_norm = Some(values.into_f32()),
+            Slot::KNorm => self.layer.k_norm = Some(values.into_f32()),
             Slot::OProj => self.layer.o_proj = values,
-            Slot::FfnNorm => self.layer.ffn_norm = values,
+            Slot::FfnNorm => self.layer.ffn_norm = values.into_f32(),
             Slot::GateProj => self.layer.gate_proj = values,
             Slot::UpProj => self.layer.up_proj = values,
             Slot::DownProj => {
@@ -346,7 +396,7 @@ impl Assembly {
                 self.layers.try_reserve(1).map_err(|_| Error::Allocation)?;
                 self.layers.push(std::mem::take(&mut self.layer));
             }
-            Slot::FinalNorm => self.final_norm = values,
+            Slot::FinalNorm => self.final_norm = values.into_f32(),
             Slot::LmHead => self.lm_head = Some(values),
         }
         Ok(())
@@ -356,11 +406,10 @@ impl Assembly {
         let Some(tensor) = self.tensor.take() else {
             return Ok(());
         };
-        if !tensor.finite {
-            return Err(Error::InvalidModel("权重包含非有限值"));
-        }
-        self.store(tensor.slot, tensor.values)?;
-        match tensor.slot.next(&self.config, self.layers.len()) {
+        let slot = tensor.slot;
+        let values = tensor.into_weight()?;
+        self.store(slot, values)?;
+        match slot.next(&self.config, self.layers.len()) {
             Some(slot) => {
                 self.tensor = Some(Tensor::open(slot, &self.config, position, total)?);
             }
@@ -464,7 +513,7 @@ impl ModelLoader {
                 self.push_values(&value[..VALUE_LENGTH])?;
             } else {
                 let missing = self.missing_values()?;
-                let length = (bytes.len() / VALUE_LENGTH).min(missing) * VALUE_LENGTH;
+                let length = (missing.min(bytes.len()) / VALUE_LENGTH) * VALUE_LENGTH;
                 let (values, rest) = bytes.split_at(length);
                 self.position += length;
                 self.push_values(values)?;
@@ -594,7 +643,7 @@ mod tests {
             Error::Unsupported("模型架构")
         );
         assert_eq!(
-            patched(48, (6_u32 | 8).to_le_bytes()).unwrap_err(),
+            patched(48, (6_u32 | 16).to_le_bytes()).unwrap_err(),
             Error::Unsupported("模型 flags")
         );
         assert_eq!(
@@ -665,17 +714,14 @@ mod tests {
     const TRUNCATED: Error = Error::InvalidModel("模型数据被截断");
 
     fn weight_bytes(model: &Model) -> Vec<u8> {
-        let mut tensors: Vec<&[f32]> = vec![&model.token_embedding];
+        let mut tensors: Vec<Vec<f32>> = vec![model.token_embedding.clone().into_f32()];
         for layer in &model.layers {
-            tensors.extend(
-                [
-                    &layer.attn_norm,
-                    &layer.q_proj,
-                    &layer.k_proj,
-                    &layer.v_proj,
-                ]
-                .map(Vec::as_slice),
-            );
+            tensors.extend([
+                layer.attn_norm.clone(),
+                layer.q_proj.clone().into_f32(),
+                layer.k_proj.clone().into_f32(),
+                layer.v_proj.clone().into_f32(),
+            ]);
             let optional = [
                 &layer.q_bias,
                 &layer.k_bias,
@@ -683,18 +729,17 @@ mod tests {
                 &layer.q_norm,
                 &layer.k_norm,
             ];
-            tensors.extend(optional.into_iter().filter_map(|tensor| tensor.as_deref()));
-            let rest = [
-                &layer.o_proj,
-                &layer.ffn_norm,
-                &layer.gate_proj,
-                &layer.up_proj,
-                &layer.down_proj,
-            ];
-            tensors.extend(rest.map(Vec::as_slice));
+            tensors.extend(optional.into_iter().filter_map(|tensor| tensor.clone()));
+            tensors.extend([
+                layer.o_proj.clone().into_f32(),
+                layer.ffn_norm.clone(),
+                layer.gate_proj.clone().into_f32(),
+                layer.up_proj.clone().into_f32(),
+                layer.down_proj.clone().into_f32(),
+            ]);
         }
-        tensors.push(&model.final_norm);
-        tensors.extend(model.lm_head.as_deref());
+        tensors.push(model.final_norm.clone());
+        tensors.extend(model.lm_head.clone().map(Weight::into_f32));
         tensors
             .into_iter()
             .flatten()
@@ -770,7 +815,7 @@ mod tests {
             (8, 2, Error::Unsupported("模型格式版本")),
             (12, 2, Error::Unsupported("模型架构")),
             (16, 0, Error::InvalidModel("模型维度必须为非零值")),
-            (48, 14, Error::Unsupported("模型 flags")),
+            (48, 22, Error::Unsupported("模型 flags")),
             (52, 2, Error::Unsupported("RoPE 模式")),
             (
                 64,

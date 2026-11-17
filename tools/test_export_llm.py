@@ -1,6 +1,9 @@
+import importlib.util
 import unittest
 
-from export_llm import validate_layer_features
+from export_llm import quantize_q4, validate_layer_features
+
+HAS_NUMPY = importlib.util.find_spec("numpy") is not None
 
 
 class LayerFeatureValidationTests(unittest.TestCase):
@@ -59,6 +62,52 @@ class LayerFeatureValidationTests(unittest.TestCase):
     def test_rejects_empty_layer_count(self):
         with self.assertRaisesRegex(ValueError, "大于 0"):
             validate_layer_features({}, 0)
+
+
+@unittest.skipUnless(HAS_NUMPY, "需要 numpy")
+class Q4QuantizationTests(unittest.TestCase):
+    def dequantize(self, row_scale, codes, packed, columns):
+        import numpy as np
+
+        unsigned = np.empty(packed.shape[:2] + (32,), dtype=np.int16)
+        unsigned[:, :, 0::2] = packed & 15
+        unsigned[:, :, 1::2] = packed >> 4
+        steps = row_scale[:, None] * codes.view(np.int8).astype(np.float32)
+        values = (unsigned - 8) * steps[:, :, None]
+        return values.reshape(len(row_scale), -1)[:, :columns]
+
+    def test_layout_and_error_bound(self):
+        import numpy as np
+
+        generator = np.random.default_rng(7)
+        array = generator.standard_normal((5, 70)).astype(np.float32)
+        array[1] *= 1e-3
+        array[2, 40:] = 0.0
+        array[3] = 0.0
+        row_scale, codes, packed = quantize_q4(array)
+        self.assertEqual(row_scale.dtype, np.float32)
+        self.assertEqual(codes.shape, (5, 3))
+        self.assertEqual(packed.shape, (5, 3, 16))
+        self.assertTrue((codes.view(np.int8) != -128).all())
+        restored = self.dequantize(row_scale, codes, packed, 70)
+        self.assertTrue((restored[3] == 0).all())
+        self.assertTrue((restored[2, 64:] == 0).all())
+        for row in range(5):
+            for group in range(3):
+                block = array[row, group * 32:(group + 1) * 32]
+                error = np.abs(restored[row, group * 32:(group + 1) * 32] - block).max()
+                self.assertLessEqual(error, np.abs(block).max() / 7 + 1e-12)
+
+    def test_search_beats_absmax_rounding(self):
+        import numpy as np
+
+        array = np.random.default_rng(11).standard_normal((64, 256)).astype(np.float32)
+        row_scale, codes, packed = quantize_q4(array)
+        searched = ((self.dequantize(row_scale, codes, packed, 256) - array) ** 2).sum()
+        blocks = array.reshape(64, 8, 32)
+        step = np.abs(blocks).max(axis=2, keepdims=True) / 7
+        naive = ((np.clip(np.rint(blocks / step), -8, 7) * step - blocks) ** 2).sum()
+        self.assertLess(searched, naive * 0.85)
 
 
 if __name__ == "__main__":

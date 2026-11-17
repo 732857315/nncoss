@@ -2,17 +2,73 @@ use std::sync::Arc;
 
 use crate::cache::KvCache;
 use crate::model::Model;
-use crate::ops::{apply_rope, linear, rms_norm, rms_norm_heads, silu, softmax};
+use crate::ops::{
+    AttentionShape, add_assign, apply_rope_table, attention, rms_norm_heads, rms_norm_into,
+    rope_frequencies, rope_table, swiglu,
+};
+use crate::q4::{Activation, Linear, linear_into, linear_many};
 use crate::sampler::Sampler;
 use crate::{Error, Result, SamplingConfig};
+
+const PREFILL_BLOCK: usize = 32;
+
+#[derive(Debug, Default)]
+struct Scratch {
+    state: Vec<f32>,
+    normalized: Vec<f32>,
+    query: Vec<f32>,
+    key: Vec<f32>,
+    value: Vec<f32>,
+    attended: Vec<f32>,
+    projected: Vec<f32>,
+    gate: Vec<f32>,
+    up: Vec<f32>,
+    hidden: Vec<f32>,
+    scores: Vec<f32>,
+    activations: Vec<Activation>,
+    rope_frequencies: Vec<f32>,
+    rope: Vec<(f32, f32)>,
+}
+
+impl Scratch {
+    fn new(model: &Model) -> Self {
+        let config = &model.config;
+        Self {
+            hidden: vec![0.0; config.hidden_size],
+            rope_frequencies: rope_frequencies(config.head_dim, config.rope_theta),
+            ..Self::default()
+        }
+    }
+
+    fn reserve(&mut self, model: &Model, tokens: usize) {
+        let config = &model.config;
+        let hidden = config.hidden_size;
+        for (buffer, width) in [
+            (&mut self.state, hidden),
+            (&mut self.normalized, hidden),
+            (&mut self.query, config.q_dim()),
+            (&mut self.key, config.kv_dim()),
+            (&mut self.value, config.kv_dim()),
+            (&mut self.attended, config.q_dim()),
+            (&mut self.projected, hidden),
+            (&mut self.gate, config.intermediate_size),
+            (&mut self.up, config.intermediate_size),
+        ] {
+            buffer.resize(tokens * width, 0.0);
+        }
+        self.activations.resize_with(tokens, Activation::default);
+    }
+}
 
 #[derive(Debug)]
 pub struct Session {
     model: Arc<Model>,
     cache: KvCache,
     max_context: usize,
-    last_logits: Option<Vec<f32>>,
+    logits: Vec<f32>,
+    has_logits: bool,
     sampler: Sampler,
+    scratch: Scratch,
     #[cfg(test)]
     fail_at_position: Option<usize>,
 }
@@ -32,9 +88,11 @@ impl Session {
         }
         Ok(Self {
             cache: KvCache::new(model.config.layer_count),
+            scratch: Scratch::new(&model),
             model,
             max_context: maximum,
-            last_logits: None,
+            logits: Vec::new(),
+            has_logits: false,
             sampler: Sampler::new(SamplingConfig::default(), 0)?,
             #[cfg(test)]
             fail_at_position: None,
@@ -51,7 +109,7 @@ impl Session {
 
     pub fn reset(&mut self) {
         self.cache.reset();
-        self.last_logits = None;
+        self.has_logits = false;
     }
 
     pub fn set_sampler(&mut self, config: SamplingConfig, seed: u64) -> Result<()> {
@@ -65,33 +123,36 @@ impl Session {
         }
         self.validate_tokens(tokens)?;
         let start = self.cache.len();
-        let mut logits = None;
-        for token in tokens {
-            match self.forward_token(*token) {
-                Ok(next) => logits = Some(next),
-                Err(error) => {
-                    self.cache.truncate(start);
-                    return Err(error);
-                }
+        for block in tokens.chunks(PREFILL_BLOCK) {
+            if let Err(error) = self.forward(block) {
+                self.cache.truncate(start);
+                return Err(error);
             }
         }
-        self.last_logits = logits;
+        self.commit_hidden();
         Ok(())
     }
 
     pub fn decode(&mut self, token: u32) -> Result<()> {
         self.validate_tokens(&[token])?;
-        self.last_logits = Some(self.forward_token(token)?);
+        self.forward(&[token])?;
+        self.commit_hidden();
         Ok(())
     }
 
     pub fn last_logits(&self) -> Result<&[f32]> {
-        self.last_logits.as_deref().ok_or(Error::NoLogits)
+        if self.has_logits {
+            Ok(&self.logits)
+        } else {
+            Err(Error::NoLogits)
+        }
     }
 
     pub fn sample_next(&mut self) -> Result<u32> {
-        let logits = self.last_logits.as_deref().ok_or(Error::NoLogits)?;
-        self.sampler.sample(logits)
+        if !self.has_logits {
+            return Err(Error::NoLogits);
+        }
+        self.sampler.sample(&self.logits)
     }
 
     pub fn generate(
@@ -135,178 +196,212 @@ impl Session {
         Ok(())
     }
 
-    fn forward_token(&mut self, token: u32) -> Result<Vec<f32>> {
+    fn commit_hidden(&mut self) {
         let config = &self.model.config;
-        let hidden = config.hidden_size;
-        let position = self.cache.len();
-        let start = token as usize * hidden;
-        let mut state = self.model.token_embedding[start..start + hidden].to_vec();
-        for (layer_index, layer) in self.model.layers.iter().enumerate() {
-            let normalized = rms_norm(&state, &layer.attn_norm, config.norm_eps);
-            let mut query = linear(
-                &layer.q_proj,
-                config.q_dim(),
+        self.logits.clear();
+        self.logits.resize(config.vocab_size, 0.0);
+        linear_into(self.model.head(), &self.scratch.hidden, &mut self.logits);
+        self.has_logits = true;
+    }
+
+    fn forward(&mut self, tokens: &[u32]) -> Result<()> {
+        #[cfg(test)]
+        let fail_at_position = self.fail_at_position;
+        let Self {
+            model,
+            cache,
+            scratch,
+            max_context,
+            ..
+        } = self;
+        let config = &model.config;
+        let count = tokens.len();
+        let start = cache.len();
+        let (hidden, q_dim, kv_dim) = (config.hidden_size, config.q_dim(), config.kv_dim());
+        let half = config.head_dim / 2;
+        let shape = |position: usize| AttentionShape {
+            head_count: config.head_count,
+            kv_head_count: config.kv_head_count,
+            head_dim: config.head_dim,
+            count: position + 1,
+        };
+        scratch.reserve(model, count);
+        let longest = config.head_count * (start + count);
+        if scratch.scores.len() < longest {
+            scratch.scores.resize(longest.next_power_of_two(), 0.0);
+        }
+        scratch.rope.clear();
+        let mut table = Vec::with_capacity(half);
+        for offset in 0..count {
+            rope_table(&scratch.rope_frequencies, start + offset, &mut table);
+            scratch.rope.extend_from_slice(&table);
+        }
+        for (token, state) in tokens.iter().zip(scratch.state.chunks_exact_mut(hidden)) {
+            model.token_embedding.row_into(*token as usize, state);
+        }
+        for (layer_index, layer) in model.layers.iter().enumerate() {
+            normalize(
+                &scratch.state,
+                &layer.attn_norm,
+                config.norm_eps,
+                &mut scratch.normalized,
                 hidden,
-                &normalized,
-                layer.q_bias.as_deref(),
             );
-            let mut key = linear(
-                &layer.k_proj,
-                config.kv_dim(),
-                hidden,
-                &normalized,
-                layer.k_bias.as_deref(),
+            linear_many(
+                &scratch.normalized[..count * hidden],
+                &mut scratch.activations[..count],
+                &mut [
+                    Linear {
+                        weight: &layer.q_proj,
+                        bias: layer.q_bias.as_deref(),
+                        output: &mut scratch.query[..count * q_dim],
+                    },
+                    Linear {
+                        weight: &layer.k_proj,
+                        bias: layer.k_bias.as_deref(),
+                        output: &mut scratch.key[..count * kv_dim],
+                    },
+                    Linear {
+                        weight: &layer.v_proj,
+                        bias: layer.v_bias.as_deref(),
+                        output: &mut scratch.value[..count * kv_dim],
+                    },
+                ],
             );
-            let value = linear(
-                &layer.v_proj,
-                config.kv_dim(),
-                hidden,
-                &normalized,
-                layer.v_bias.as_deref(),
-            );
-            if let (Some(q_norm), Some(k_norm)) = (&layer.q_norm, &layer.k_norm) {
-                rms_norm_heads(
-                    &mut query,
+            for offset in 0..count {
+                let query = &mut scratch.query[offset * q_dim..(offset + 1) * q_dim];
+                let key = &mut scratch.key[offset * kv_dim..(offset + 1) * kv_dim];
+                let value = &scratch.value[offset * kv_dim..(offset + 1) * kv_dim];
+                if let (Some(q_norm), Some(k_norm)) = (&layer.q_norm, &layer.k_norm) {
+                    rms_norm_heads(
+                        query,
+                        config.head_count,
+                        config.head_dim,
+                        q_norm,
+                        config.norm_eps,
+                    );
+                    rms_norm_heads(
+                        key,
+                        config.kv_head_count,
+                        config.head_dim,
+                        k_norm,
+                        config.norm_eps,
+                    );
+                }
+                let table = &scratch.rope[offset * half..(offset + 1) * half];
+                apply_rope_table(
+                    query,
                     config.head_count,
                     config.head_dim,
-                    q_norm,
-                    config.norm_eps,
+                    table,
+                    config.rope_mode,
                 );
-                rms_norm_heads(
-                    &mut key,
+                apply_rope_table(
+                    key,
                     config.kv_head_count,
                     config.head_dim,
-                    k_norm,
-                    config.norm_eps,
+                    table,
+                    config.rope_mode,
                 );
+                cache.write(layer_index, start + offset, key, value, *max_context)?;
             }
-            apply_rope(
-                &mut query,
-                config.head_count,
-                config.head_dim,
-                position,
-                config.rope_theta,
-                config.rope_mode,
-            );
-            apply_rope(
-                &mut key,
-                config.kv_head_count,
-                config.head_dim,
-                position,
-                config.rope_theta,
-                config.rope_mode,
-            );
-            self.cache
-                .append(layer_index, &key, &value, self.max_context)?;
             #[cfg(test)]
-            if self.fail_at_position == Some(position) && layer_index + 1 == self.model.layers.len()
+            if layer_index + 1 == model.layers.len()
+                && fail_at_position
+                    .is_some_and(|position| (start..start + count).contains(&position))
             {
                 return Err(Error::Allocation);
             }
-            let attended = attention(
-                &query,
-                &self.cache,
-                layer_index,
-                config.head_count,
-                config.kv_head_count,
-                config.head_dim,
-                position,
-            );
-            let projected = linear(&layer.o_proj, hidden, config.q_dim(), &attended, None);
-            for (state, projected) in state.iter_mut().zip(projected) {
-                *state += projected;
+            let (keys, values) = cache.layer(layer_index);
+            for offset in 0..count {
+                attention(
+                    &scratch.query[offset * q_dim..(offset + 1) * q_dim],
+                    keys,
+                    values,
+                    shape(start + offset),
+                    &mut scratch.scores,
+                    &mut scratch.attended[offset * q_dim..(offset + 1) * q_dim],
+                );
             }
-            let normalized = rms_norm(&state, &layer.ffn_norm, config.norm_eps);
-            let gate = linear(
-                &layer.gate_proj,
-                config.intermediate_size,
-                hidden,
-                &normalized,
-                None,
+            linear_many(
+                &scratch.attended[..count * q_dim],
+                &mut scratch.activations[..count],
+                &mut [Linear {
+                    weight: &layer.o_proj,
+                    bias: None,
+                    output: &mut scratch.projected[..count * hidden],
+                }],
             );
-            let up = linear(
-                &layer.up_proj,
-                config.intermediate_size,
-                hidden,
-                &normalized,
-                None,
+            add_assign(
+                &mut scratch.state[..count * hidden],
+                &scratch.projected[..count * hidden],
             );
-            let activated: Vec<f32> = gate
-                .iter()
-                .zip(up)
-                .map(|(gate, up)| silu(*gate) * up)
-                .collect();
-            let projected = linear(
-                &layer.down_proj,
+            normalize(
+                &scratch.state,
+                &layer.ffn_norm,
+                config.norm_eps,
+                &mut scratch.normalized,
                 hidden,
-                config.intermediate_size,
-                &activated,
-                None,
             );
-            for (state, projected) in state.iter_mut().zip(projected) {
-                *state += projected;
-            }
+            let inner = count * config.intermediate_size;
+            linear_many(
+                &scratch.normalized[..count * hidden],
+                &mut scratch.activations[..count],
+                &mut [
+                    Linear {
+                        weight: &layer.gate_proj,
+                        bias: None,
+                        output: &mut scratch.gate[..inner],
+                    },
+                    Linear {
+                        weight: &layer.up_proj,
+                        bias: None,
+                        output: &mut scratch.up[..inner],
+                    },
+                ],
+            );
+            swiglu(&mut scratch.gate[..inner], &scratch.up[..inner]);
+            linear_many(
+                &scratch.gate[..inner],
+                &mut scratch.activations[..count],
+                &mut [Linear {
+                    weight: &layer.down_proj,
+                    bias: None,
+                    output: &mut scratch.projected[..count * hidden],
+                }],
+            );
+            add_assign(
+                &mut scratch.state[..count * hidden],
+                &scratch.projected[..count * hidden],
+            );
         }
-        self.cache.finish_token();
-        let normalized = rms_norm(&state, &self.model.final_norm, config.norm_eps);
-        let lm_head = self
-            .model
-            .lm_head
-            .as_deref()
-            .unwrap_or(&self.model.token_embedding);
-        Ok(linear(
-            lm_head,
-            config.vocab_size,
-            hidden,
-            &normalized,
-            None,
-        ))
+        cache.finish_tokens(count);
+        let last = &scratch.state[(count - 1) * hidden..count * hidden];
+        rms_norm_into(
+            last,
+            &model.final_norm,
+            config.norm_eps,
+            &mut scratch.hidden,
+        );
+        Ok(())
     }
 }
 
-fn attention(
-    query: &[f32],
-    cache: &KvCache,
-    layer: usize,
-    head_count: usize,
-    kv_head_count: usize,
-    head_dim: usize,
-    position: usize,
-) -> Vec<f32> {
-    let group_size = head_count / kv_head_count;
-    let scale = (head_dim as f32).sqrt().recip();
-    let mut output = Vec::with_capacity(head_count * head_dim);
-    for head in 0..head_count {
-        let kv_head = head / group_size;
-        let query = &query[head * head_dim..(head + 1) * head_dim];
-        let mut scores = Vec::with_capacity(position + 1);
-        for index in 0..=position {
-            let key = cache.key(layer, index, kv_head, head_dim);
-            let score = query
-                .iter()
-                .zip(key)
-                .map(|(query, key)| query * key)
-                .sum::<f32>()
-                * scale;
-            scores.push(score);
-        }
-        let probabilities = softmax(&scores);
-        let mut context = vec![0.0; head_dim];
-        for (index, probability) in probabilities.iter().enumerate() {
-            let value = cache.value(layer, index, kv_head, head_dim);
-            for (context, value) in context.iter_mut().zip(value) {
-                *context += probability * value;
-            }
-        }
-        output.extend_from_slice(&context);
+fn normalize(input: &[f32], weight: &[f32], epsilon: f32, output: &mut [f32], width: usize) {
+    for (input, output) in input
+        .chunks_exact(width)
+        .zip(output.chunks_exact_mut(width))
+    {
+        rms_norm_into(input, weight, epsilon, output);
     }
-    output
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::RopeMode;
+    use crate::ops::{apply_rope, rms_norm, silu, softmax};
+    use crate::q4::linear;
     use crate::test_utils::{TinySpec, tiny_model};
 
     fn assert_close(actual: &[f32], expected: &[f32]) {
@@ -400,6 +495,90 @@ mod tests {
         }
     }
 
+    const LONG: TinySpec = TinySpec {
+        vocab: 23,
+        hidden: 64,
+        intermediate: 96,
+        heads: 4,
+        kv_heads: 2,
+        head_dim: 16,
+        max_context: 80,
+        ..TinySpec::WIDE
+    };
+
+    fn bits(values: &[f32]) -> Vec<u32> {
+        values.iter().map(|value| value.to_bits()).collect()
+    }
+
+    #[test]
+    fn batched_prefill_matches_token_by_token_decode_bit_for_bit() {
+        let tokens: Vec<u32> = (0..70).map(|index| (index * 7 + 3) % 23).collect();
+        for model in [LONG.model(), LONG.quantized_model()] {
+            let model = Arc::new(model);
+            let mut batched = Session::new(model.clone(), 0).unwrap();
+            batched.prefill(&tokens).unwrap();
+            let mut stepped = Session::new(model.clone(), 0).unwrap();
+            stepped.prefill(&tokens[..1]).unwrap();
+            for token in &tokens[1..] {
+                stepped.decode(*token).unwrap();
+            }
+            assert_eq!(batched.position(), tokens.len());
+            assert_eq!(
+                bits(batched.last_logits().unwrap()),
+                bits(stepped.last_logits().unwrap())
+            );
+            let mut split = Session::new(model, 0).unwrap();
+            split.prefill(&tokens[..5]).unwrap();
+            split.prefill(&tokens[5..]).unwrap();
+            assert_eq!(
+                bits(split.last_logits().unwrap()),
+                bits(stepped.last_logits().unwrap())
+            );
+        }
+    }
+
+    #[test]
+    fn quantized_model_tracks_f32_reference() {
+        let tokens: Vec<u32> = (0..12).map(|index| (index * 5 + 1) % 23).collect();
+        let expected = reference_logits(&LONG.model(), &tokens);
+        let mut session = Session::new(Arc::new(LONG.quantized_model()), 0).unwrap();
+        session.prefill(&tokens).unwrap();
+        let actual = session.last_logits().unwrap();
+        let spread = expected
+            .iter()
+            .fold(0.0_f32, |peak, value| peak.max(value.abs()));
+        for (actual, expected) in actual.iter().zip(&expected) {
+            assert!(
+                (actual - expected).abs() < 0.1 * spread,
+                "{actual} != {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn failure_in_a_later_prefill_block_rolls_back_the_whole_call() {
+        let model = Arc::new(LONG.model());
+        let tokens: Vec<u32> = (0..50).map(|index| index % 23).collect();
+        let mut session = Session::new(model.clone(), 0).unwrap();
+        session.prefill(&[1, 2]).unwrap();
+        let before = session.last_logits().unwrap().to_vec();
+        session.fail_at_position = Some(2 + PREFILL_BLOCK + 3);
+        assert_eq!(session.prefill(&tokens), Err(Error::Allocation));
+        assert_eq!(session.position(), 2);
+        assert_eq!(session.last_logits().unwrap(), &before[..]);
+        session.fail_at_position = None;
+        session.prefill(&tokens).unwrap();
+        let mut expected = Session::new(model, 0).unwrap();
+        expected.prefill(&[1, 2]).unwrap();
+        for token in &tokens {
+            expected.decode(*token).unwrap();
+        }
+        assert_eq!(
+            bits(session.last_logits().unwrap()),
+            bits(expected.last_logits().unwrap())
+        );
+    }
+
     #[test]
     fn rope_layout_and_theta_change_multi_token_logits() {
         let logits = |spec: TinySpec| {
@@ -429,7 +608,16 @@ mod tests {
             .append(0, &[0.1, 0.2, 0.3, 0.4], &[1.0, 2.0, 3.0, 4.0], 4)
             .unwrap();
         let query = [0.5, -0.5, 1.0, 0.25, -1.0, 2.0, 0.0, 1.0];
-        let output = attention(&query, &cache, 0, 4, 2, 2, 0);
+        let (keys, values) = cache.layer(0);
+        let shape = AttentionShape {
+            head_count: 4,
+            kv_head_count: 2,
+            head_dim: 2,
+            count: 1,
+        };
+        let mut scores = vec![0.0; 4];
+        let mut output = vec![0.0; 8];
+        attention(&query, keys, values, shape, &mut scores, &mut output);
         assert_close(&output, &[1.0, 2.0, 1.0, 2.0, 3.0, 4.0, 3.0, 4.0]);
     }
 
@@ -474,10 +662,7 @@ mod tests {
         let hidden = config.hidden_size;
         let mut states: Vec<Vec<f32>> = tokens
             .iter()
-            .map(|token| {
-                let start = *token as usize * hidden;
-                model.token_embedding[start..start + hidden].to_vec()
-            })
+            .map(|token| model.token_embedding.row(*token as usize, hidden))
             .collect();
         for layer in &model.layers {
             let mut queries = Vec::new();
@@ -594,7 +779,7 @@ mod tests {
             states = next_states;
         }
         let normalized = rms_norm(states.last().unwrap(), &model.final_norm, config.norm_eps);
-        let weights = model.lm_head.as_deref().unwrap_or(&model.token_embedding);
+        let weights = model.lm_head.as_ref().unwrap_or(&model.token_embedding);
         linear(weights, config.vocab_size, hidden, &normalized, None)
     }
 

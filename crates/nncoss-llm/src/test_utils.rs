@@ -115,6 +115,7 @@ impl TinySpec {
 
     pub fn quantized_model(&self) -> Model {
         let mut model = self.model();
+        model.config.quantized = true;
         let config = model.config.clone();
         let (hidden, q_dim, kv_dim) = (config.hidden_size, config.q_dim(), config.kv_dim());
         let inner = config.intermediate_size;

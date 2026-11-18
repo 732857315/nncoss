@@ -444,7 +444,7 @@ python3 tools/check_q4_llm.py
 cargo run -p nncoss-llm --release --example bench -- --model model/Qwen3-0.6B/qwen3-0.6b-q4.nncossllm --prompt 24 --decode 64
 ```
 
-本地 Qwen3-0.6B Q4 文件为 318,862,912 字节，约 304.1 MiB；导出约需 6 分钟。以下数据在一台 Intel Core i7-9750H（6 核 12 线程、16 GiB、macOS、接通电源）上测得，均为本地结果，不纳入 CI，也不构成性能承诺：
+本地 Qwen3-0.6B Q4 文件为 318,862,912 字节，约 304.1 MiB；不经校准导出约需 6 分钟，校准与蒸馏见下文。以下数据在一台 Intel Core i7-9750H（6 核 12 线程、16 GiB、macOS、接通电源）上测得，均为本地结果，不纳入 CI，也不构成性能承诺：
 
 | 场景 | 优化前 | 当前 |
 |------|--------|------|
@@ -460,7 +460,34 @@ cargo run -p nncoss-llm --release --example bench -- --model model/Qwen3-0.6B/qw
 
 `Session::generate` 默认启用推测解码：在会话已有的 token 中查找与当前末尾相同的 2–3 个 token 片段，取其后一个 token 作为草稿，与新采样的 token 组成 2 个 token 的批次一起前向，再按草稿验证规则接受或拒绝。贪心时只在草稿等于 argmax 时接受；采样时以目标分布中草稿的概率接受，拒绝时从去掉草稿后重新归一化的分布中采样，因此生成分布与逐 token 采样完全相同。贪心输出与关闭推测解码时逐 token 一致；采样输出的分布不变，但同一种子下随机数的使用顺序不同，具体序列可能不同。`Session::set_speculation(false)` 可关闭该功能；C ABI 的 `decode`／`sample` 逐 token 接口不受影响。2 个 token 的前向约为单步的 1.2 倍，在 7 组真实多轮对话上实测：代码类约快 10–20%，摘要类约 5–10%，开放式对话约 0–10%，整体约 5–8%（测量噪声约 ±6%）。
 
-`tools/check_q4_llm.py` 在内置的中文问答、英文问答和 Rust 代码三段文本上按 teacher forcing 比较 Q4 与 f32 模型的下一 token 分布。当前导出结果（含 f16 KV Cache）在 337 个位置上 top-1 一致率为 0.813，平均 KL(f32‖Q4) 为 0.227，困惑度从 8.689 升至 9.638（比值 1.109）。脚本默认阈值按这组结果留出余量，只用于发现回归，不表示 Q4 与 f32 质量相当。该脚本需要 numpy、tokenizers 与本地 LFS 模型，不纳入 CI。
+`tools/check_q4_llm.py` 在内置的 7 段文本（中英文问答、故事、邮件、数学推导、JSON 与 Rust 代码）上按 teacher forcing 比较 Q4 与 f32 模型的下一 token 分布，共 908 个位置。仓库当前的 Q4 模型按下文的校准量化与蒸馏生成，top-1 一致率为 0.859，平均 KL(f32‖Q4) 为 0.111，困惑度从 9.489 升至 9.676（比值 1.020）。脚本默认阈值按这组结果留出余量，只用于发现回归；不经校准导出的 Q4 达不到默认阈值。该脚本需要 numpy、tokenizers 与本地 LFS 模型，不纳入 CI。
+
+#### 校准量化与蒸馏
+
+两步都只改变权重数值，不改变 Q4 文件格式、文件大小与推理速度，运行时代码不需要任何改动：
+
+- **GPTQ 量化**：`tools/export_llm.py --outtype q4 --calibration FILE...` 先用 transformers 以 f32 运行原模型，统计每个线性层输入的二阶矩 E[xxᵀ]，再逐列量化：每列量化后把舍入误差按输入协方差分摊到尚未量化的列，使每层输出的误差最小。组步长仍按最小二乘候选搜索。校准 token 按文件平均分配，默认最多 65,536 个。不传 `--calibration` 时保持原来的最小二乘量化。
+- **蒸馏**：`tools/distill_q4_llm.py` 以 f32 原模型为教师，在校准文本上最小化 KL(f32‖Q4)，只训练 Q4 文件中本来就以 f32 保存的参数，即每行 scale、RMSNorm 权重与 QKV bias；4-bit 值与组倍率保持不变。
+
+`tools/calibration/qwen3_chat.txt` 是 Qwen3-0.6B 按 96 条中英文提示（科普、生活、写作、编程、数学、翻译等）生成的对话，与 `check_q4_llm.py` 的评估文本不重叠。只用对话文本校准的效果不如混合文本，因此当前模型同时使用了 README 与几份 Rust、Python 源码。仓库中的 Q4 模型由以下命令生成，在测试机上导出约 25 分钟、蒸馏约 37 分钟，需要 torch 与 transformers：
+
+```bash
+python3 tools/export_llm.py --model model/Qwen3-0.6B --output /tmp/qwen3-0.6b-q4-gptq.nncossllm --outtype q4 \
+  --calibration tools/calibration/qwen3_chat.txt README.md crates/nncoss-llm/src/session.rs \
+  crates/nncoss-llm/src/model.rs tools/export_llm.py crates/nncoss-web/src/lib.rs
+python3 tools/distill_q4_llm.py --model model/Qwen3-0.6B --input /tmp/qwen3-0.6b-q4-gptq.nncossllm \
+  --output model/Qwen3-0.6B/qwen3-0.6b-q4.nncossllm --steps 300 \
+  --calibration tools/calibration/qwen3_chat.txt README.md crates/nncoss-llm/src/session.rs \
+  crates/nncoss-llm/src/model.rs tools/export_llm.py crates/nncoss-web/src/lib.rs
+```
+
+校准结果取决于具体文本，README 与源码改动后重新生成的模型会有细微差别。同一组 908 个位置上三种导出方式的对比：
+
+| 导出方式 | top-1 一致率 | 平均 KL(f32‖Q4) | 困惑度比值 |
+|----------|--------------|-----------------|------------|
+| 最小二乘，无校准 | 0.801 | 0.215 | 1.091 |
+| GPTQ | 0.849 | 0.137 | 1.066 |
+| GPTQ + 蒸馏（当前） | 0.859 | 0.111 | 1.020 |
 
 ### 本地 Web 对话界面
 
@@ -505,7 +532,7 @@ python3 tools/bench_wasm_llm.py --preset small
 python3 tools/export_llm.py --model /path/to/local-model --output model.nncossllm
 ```
 
-导出器不加载 `.pt/.pth`，仅接受 `model_type` 为 `llama`、`qwen2` 或 `qwen3` 的已知 HalfSplit RoPE 配置，并按名称和形状写入 f32 权重（`--outtype q4` 时二维矩阵改写为 Q4，见 [Q4 量化与原生加速](#q4-量化与原生加速)）；导出日志会记录该 RoPE 约定。当前拒绝 RoPE scaling、partial rotary 和 sliding window attention；Tokenizer、聊天模板与文本解码由调用方处理。`.nncossllm` 是版本为 1 的原型格式，尚未承诺跨版本兼容。
+导出 Q4 时可用 `--calibration` 做 GPTQ 量化，再用 `tools/distill_q4_llm.py` 蒸馏，见[校准量化与蒸馏](#校准量化与蒸馏)。导出器不加载 `.pt/.pth`，仅接受 `model_type` 为 `llama`、`qwen2` 或 `qwen3` 的已知 HalfSplit RoPE 配置，并按名称和形状写入 f32 权重（`--outtype q4` 时二维矩阵改写为 Q4，见 [Q4 量化与原生加速](#q4-量化与原生加速)）；导出日志会记录该 RoPE 约定。当前拒绝 RoPE scaling、partial rotary 和 sliding window attention；Tokenizer、聊天模板与文本解码由调用方处理。`.nncossllm` 是版本为 1 的原型格式，尚未承诺跨版本兼容。
 
 ### Rust 调用
 

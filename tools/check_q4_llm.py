@@ -29,6 +29,37 @@ SAMPLES = (
             "common data, for example with mutexes or atomic operations."
         ),
     ),
+    CHAT.format(
+        question="给我讲一个关于老渔夫和海鸥的小故事。",
+        answer=(
+            "清晨的海面还笼着一层薄雾，老渔夫王伯像往常一样推着小船下了海。一只受伤的海鸥落在船头，翅膀上缠着一截渔线。"
+            "王伯放下桨，小心地解开渔线，又从饭盒里掰了半个馒头喂它。海鸥在船上待了三天，伤好后绕着小船飞了两圈才离开。"
+            "从那以后，每当王伯出海，总有一只海鸥远远跟着，帮他找到鱼群最多的地方。"
+        ),
+    ),
+    CHAT.format(
+        question="Write a short email asking my manager for a day off next Friday.",
+        answer=(
+            "Subject: Request for a Day Off on Friday\n\nHi Sarah,\n\nI hope you are doing well. I would like to request a day "
+            "off next Friday, March 14, to take care of a family matter. I will make sure my current tasks are completed before "
+            "then, and Tom has agreed to cover any urgent requests while I am away. Please let me know if this works for you.\n\n"
+            "Thank you,\nAlex"
+        ),
+    ),
+    CHAT.format(
+        question="请推导一元二次方程的求根公式。",
+        answer=(
+            "对于方程 ax^2 + bx + c = 0（a ≠ 0），先两边同时除以 a，得到 x^2 + (b/a)x + c/a = 0。"
+            "配方：x^2 + (b/a)x + (b/2a)^2 = (b/2a)^2 - c/a，即 (x + b/2a)^2 = (b^2 - 4ac) / 4a^2。"
+            "两边开平方得 x + b/2a = ±√(b^2 - 4ac) / 2a，所以 x = (-b ± √(b^2 - 4ac)) / 2a。"
+            "其中 b^2 - 4ac 称为判别式，它决定了方程实数根的个数。"
+        ),
+    ),
+    (
+        '{\n  "name": "nncoss",\n  "version": "0.1.0",\n  "targets": ["wasm32-unknown-unknown", "x86_64-apple-darwin"],\n'
+        '  "features": {\n    "quantization": "q4",\n    "threads": 6,\n    "speculative": true\n  },\n'
+        '  "models": [\n    {"id": "qwen3-0.6b", "context": 40960, "format": "nncossllm"}\n  ]\n}\n'
+    ),
     (
         "fn fibonacci(n: u64) -> u64 {\n"
         "    let (mut a, mut b) = (0, 1);\n"
@@ -55,9 +86,9 @@ def parse_args():
     parser.add_argument("--tokenizer", type=Path, default=DEFAULT_DIR / "tokenizer.json")
     parser.add_argument("--native", type=Path, default=ROOT / "target" / "release" / native_library_name())
     parser.add_argument("--chunk-bytes", type=int, default=16 * 1024 * 1024)
-    parser.add_argument("--min-top1", type=float, default=0.78, help="top-1 一致率下限")
-    parser.add_argument("--max-mean-kl", type=float, default=0.26, help="平均 KL 上限")
-    parser.add_argument("--max-ppl-ratio", type=float, default=1.12, help="Q4/f32 困惑度比值上限")
+    parser.add_argument("--min-top1", type=float, default=0.83, help="top-1 一致率下限")
+    parser.add_argument("--max-mean-kl", type=float, default=0.14, help="平均 KL 上限")
+    parser.add_argument("--max-ppl-ratio", type=float, default=1.06, help="Q4/f32 困惑度比值上限")
     return parser.parse_args()
 
 

@@ -1,9 +1,10 @@
 import importlib.util
 import unittest
 
-from export_llm import quantize_q4, validate_layer_features
+from export_llm import quantize_q4, quantize_q4_gptq, validate_layer_features
 
 HAS_NUMPY = importlib.util.find_spec("numpy") is not None
+HAS_TORCH = HAS_NUMPY and importlib.util.find_spec("torch") is not None
 
 
 class LayerFeatureValidationTests(unittest.TestCase):
@@ -108,6 +109,42 @@ class Q4QuantizationTests(unittest.TestCase):
         step = np.abs(blocks).max(axis=2, keepdims=True) / 7
         naive = ((np.clip(np.rint(blocks / step), -8, 7) * step - blocks) ** 2).sum()
         self.assertLess(searched, naive * 0.85)
+
+
+@unittest.skipUnless(HAS_TORCH, "需要 numpy 与 torch")
+class GptqQuantizationTests(unittest.TestCase):
+    def test_gptq_reduces_output_error_on_correlated_inputs(self):
+        import numpy as np
+        import torch
+
+        generator = np.random.default_rng(3)
+        weights = generator.standard_normal((16, 96)).astype(np.float32)
+        mixing = generator.standard_normal((96, 96)) * 0.3 + np.eye(96)
+        scales = np.ones(96)
+        scales[::7] = 8.0
+        inputs = generator.standard_normal((2048, 96)) @ mixing * scales
+        hessian = torch.from_numpy(inputs.T @ inputs / len(inputs))
+        helper = Q4QuantizationTests()
+        plain = helper.dequantize(*quantize_q4(weights), 96)
+        gptq = helper.dequantize(*quantize_q4_gptq(weights, hessian, torch), 96)
+        plain_error = ((inputs @ (plain - weights).T) ** 2).mean()
+        gptq_error = ((inputs @ (gptq - weights).T) ** 2).mean()
+        self.assertLess(gptq_error, plain_error * 0.8)
+        self.assertLess(np.abs(gptq - weights).max(), np.abs(weights).max())
+
+    def test_gptq_handles_padding_and_dead_columns(self):
+        import numpy as np
+        import torch
+
+        weights = np.random.default_rng(5).standard_normal((4, 70)).astype(np.float32)
+        hessian = torch.eye(70, dtype=torch.float64)
+        hessian[3, 3] = 0.0
+        row_scale, codes, packed = quantize_q4_gptq(weights, hessian, torch)
+        self.assertEqual(codes.shape, (4, 3))
+        self.assertEqual(packed.shape, (4, 3, 16))
+        restored = Q4QuantizationTests().dequantize(row_scale, codes, packed, 70)
+        self.assertTrue((restored[:, 3] == 0).all())
+        self.assertTrue(np.isfinite(restored).all())
 
 
 if __name__ == "__main__":

@@ -12,6 +12,21 @@ def is_cjk(ch):
     return "㐀" <= ch <= "鿿"
 
 
+def readable(ch):
+    code = ord(ch)
+    return (code < 0x250 or 0x370 <= code <= 0x3FF or 0x2000 <= code <= 0x22FF or 0x2460 <= code <= 0x24FF
+            or 0x25A0 <= code <= 0x25FF or 0x3000 <= code <= 0x303F or 0x3400 <= code <= 0x4DBF
+            or 0x4E00 <= code <= 0x9FFF or 0xFF00 <= code <= 0xFFEF)
+
+
+def clean(text):
+    kept = "".join(ch if readable(ch) else " " for ch in text)
+    kept = re.sub(r"[ \t　]{2,}", " ", kept).strip()
+    original = len(re.sub(r"\s", "", text))
+    remaining = len(re.sub(r"\s", "", kept))
+    return kept if original and remaining >= original * 0.5 else ""
+
+
 def join_lines(lines):
     text = ""
     for line in lines:
@@ -67,6 +82,7 @@ def textbook_passages(pdf_root):
         for number, page in enumerate(document, 1):
             text = join_lines(page.get_text().splitlines())
             for index, chunk in enumerate(chunks(text.split("\n"))):
+                chunk = clean(chunk)
                 if len(chunk) >= 20:
                     yield {"id": f"{key}-p{number}-{index}", "source": f"{book} 第{number}页", "text": chunk}
 

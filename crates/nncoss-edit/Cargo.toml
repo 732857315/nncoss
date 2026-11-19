@@ -1,0 +1,19 @@
+[package]
+name = "nncoss-edit"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+publish = false
+
+[lib]
+name = "nncoss_edit"
+path = "src/lib.rs"
+
+[[bin]]
+name = "nncoss-edit"
+path = "src/main.rs"
+
+[dependencies]
+nncoss-llm = { path = "../nncoss-llm" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

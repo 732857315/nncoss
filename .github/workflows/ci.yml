@@ -35,9 +35,9 @@ jobs:
       - name: Check Rust formatting
         run: cargo fmt --all --check
       - name: Run Clippy
-        run: cargo clippy -p nncoss-llm -p nncoss-web -p nncoss-knowledge --all-targets -- -D warnings
+        run: cargo clippy -p nncoss-llm -p nncoss-web -p nncoss-knowledge -p nncoss-edit --all-targets -- -D warnings
       - name: Test native runtime
-        run: cargo test -p nncoss-llm && cargo test -p nncoss-llm --release && cargo test -p nncoss-web && cargo test -p nncoss-knowledge
+        run: cargo test -p nncoss-llm && cargo test -p nncoss-llm --release && cargo test -p nncoss-web && cargo test -p nncoss-knowledge && cargo test -p nncoss-edit
       - name: Test model exporter validation
         run: python3 -m unittest discover -s tools -p "test_*.py"
       - name: Build native runtime

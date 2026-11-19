@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
-use nncoss_knowledge::{Agent, AgentConfig, KnowledgeBase};
+use nncoss_knowledge::{Agent, AgentConfig, KnowledgeBase, opening_prompt};
 use nncoss_llm::{Model, ModelLoader};
 use serde::{Deserialize, Serialize};
 use tokenizers::Tokenizer;
@@ -14,6 +14,7 @@ const USAGE: &str = "用法：
   nncoss-know search --store <目录> --query <问题> [--limit N]
   nncoss-know ask    --store <目录> --model <模型> --tokenizer <分词器> --question <问题> [选项]
   nncoss-know batch  --store <目录> --model <模型> --tokenizer <分词器> --input <题目.jsonl> --output <结果.jsonl> [选项]
+  nncoss-know prompt (--question <问题> | --input <题目.jsonl> --output <提示.jsonl>) [选项]
 
 选项：
   --think                启用思考模式
@@ -149,7 +150,50 @@ fn engine(options: &Options) -> Result<(Arc<Model>, Tokenizer), String> {
     Ok((model, tokenizer))
 }
 
+#[derive(Serialize)]
+struct PromptRecord<'a> {
+    id: &'a str,
+    prompt: String,
+}
+
+fn prompts(options: &Options) -> Result<(), String> {
+    if let Some(question) = &options.query {
+        print!("{}", opening_prompt(&options.config, question));
+        return Ok(());
+    }
+    let input = required(&options.input, "--input")?;
+    let output = required(&options.output, "--output")?;
+    let reader = BufReader::new(
+        File::open(&input).map_err(|error| format!("无法打开 {}: {error}", input.display()))?,
+    );
+    let mut writer = BufWriter::new(
+        File::create(&output).map_err(|error| format!("无法写入 {}: {error}", output.display()))?,
+    );
+    for (number, line) in reader.lines().enumerate() {
+        let line = line.map_err(|error| error.to_string())?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let question: Question = serde_json::from_str(&line)
+            .map_err(|error| format!("第 {} 行格式错误: {error}", number + 1))?;
+        let record = PromptRecord {
+            id: &question.id,
+            prompt: opening_prompt(&options.config, &question.question),
+        };
+        writeln!(
+            writer,
+            "{}",
+            serde_json::to_string(&record).map_err(|error| error.to_string())?
+        )
+        .map_err(|error| error.to_string())?;
+    }
+    writer.flush().map_err(|error| error.to_string())
+}
+
 fn run(options: Options) -> Result<(), String> {
+    if options.command == "prompt" {
+        return prompts(&options);
+    }
     let store = required(&options.store, "--store")?;
     let mut base = KnowledgeBase::open(&store)?;
     match options.command.as_str() {

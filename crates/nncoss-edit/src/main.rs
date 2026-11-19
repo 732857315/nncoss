@@ -15,7 +15,10 @@ target 可选 mlp、kv_head、q_norm、k_norm、attn_norm、ffn_norm、final_nor
 index 为空表示该张量的全部行或元素。
 删除整层：
   {\"op\": \"drop_layers\", \"layers\": [20, 21]}
-删除后层号从 0 重新连续编号，计划中排在它后面的改动使用新层号。";
+删除后层号从 0 重新连续编号，计划中排在它后面的改动使用新层号。
+删除子层（输出投影置零，nncoss-llm 会整块跳过）：
+  {\"op\": \"drop_sublayer\", \"part\": \"mlp\", \"layers\": [12, 13]}
+part 可选 mlp、attention。";
 
 fn inspect(path: &PathBuf) -> Result<(), String> {
     let file = ModelFile::parse(

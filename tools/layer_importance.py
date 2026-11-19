@@ -30,6 +30,8 @@ def main():
     parser.add_argument("--questions", type=int, default=32)
     parser.add_argument("--tokens", type=int, default=96)
     parser.add_argument("--max-drop", type=int, default=8)
+    parser.add_argument("--part", choices=["layer", "attn", "mlp"], default="layer",
+                        help="删除整层，或只删注意力子层、只删 MLP 子层（子层输出置零，残差直通）")
     args = parser.parse_args()
     args.work.mkdir(parents=True, exist_ok=True)
 
@@ -55,8 +57,19 @@ def main():
         tail = tokenizer(own[q["id"]], add_special_tokens=False).input_ids[:args.tokens]
         samples.append((torch.tensor([head + tail]), len(head), torch.tensor(tail)))
 
+    def silence(module, inputs, output):
+        if isinstance(output, tuple):
+            return (torch.zeros_like(output[0]),) + tuple(output[1:])
+        return torch.zeros_like(output)
+
     def score(removed):
-        model.model.layers = torch.nn.ModuleList(layer for index, layer in enumerate(layers) if index not in removed)
+        hooks = []
+        if args.part == "layer":
+            model.model.layers = torch.nn.ModuleList(layer for index, layer in enumerate(layers) if index not in removed)
+        else:
+            for index in removed:
+                target = layers[index].self_attn if args.part == "attn" else layers[index].mlp
+                hooks.append(target.register_forward_hook(silence))
         total, agree, count = 0.0, 0, 0
         with torch.no_grad():
             for ids, start, tail in samples:
@@ -66,6 +79,8 @@ def main():
                 agree += int((logits.argmax(-1) == tail).sum())
                 count += len(tail)
         model.model.layers = torch.nn.ModuleList(layers)
+        for hook in hooks:
+            hook.remove()
         return total / count, agree / count
 
     base_nll, base_agree = score(set())
@@ -83,7 +98,7 @@ def main():
         cumulative.append({"count": count, "layers": removed, "nll": round(nll, 4),
                            "delta": round(nll - base_nll, 4), "agree": round(agree, 4)})
         print(json.dumps(cumulative[-1]), flush=True)
-    result = {"questions": [q["id"] for q in questions], "tokens": args.tokens,
+    result = {"part": args.part, "questions": [q["id"] for q in questions], "tokens": args.tokens,
               "baseline": {"nll": base_nll, "agree": base_agree}, "single": single, "order": order,
               "cumulative": cumulative}
     (args.work / "result.json").write_text(json.dumps(result, ensure_ascii=False, indent=1), encoding="utf-8")

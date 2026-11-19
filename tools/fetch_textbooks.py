@@ -115,6 +115,7 @@ def main():
     parser.add_argument("--manifest", type=Path, default=ROOT / "modelbook/knowledge/textbooks-manifest.json")
     parser.add_argument("--output", type=Path, default=ROOT / "modelbook/textbooks", help="PDF 保存在 <output>/pdf/ 下")
     parser.add_argument("--verify", action="store_true", help="对已存在的 PDF 也逐分卷核对 Git 对象哈希")
+    parser.add_argument("--prune", action="store_true", help="删除 <output>/pdf/ 下不在清单中的 PDF（清单缩小后使用）")
     parser.add_argument("--select", type=Path, metavar="TREE_JSON", help="从 GitHub 文件树重新生成清单并写入 --manifest，不下载")
     args = parser.parse_args()
     if args.select:
@@ -123,7 +124,14 @@ def main():
         counts = Counter("/".join(book["book"].split("/")[:2]) for book in manifest["books"])
         print(f"选中 {len(manifest['books'])} 册 -> {args.manifest}\n{sorted(counts.items())}")
         return
-    fetch(json.loads(args.manifest.read_text(encoding="utf-8")), args.output, args.verify)
+    manifest = json.loads(args.manifest.read_text(encoding="utf-8"))
+    if args.prune:
+        wanted = {args.output / "pdf" / book["book"] for book in manifest["books"]}
+        for path in sorted((args.output / "pdf").rglob("*.pdf")):
+            if path not in wanted:
+                print("删除清单外的文件", path.relative_to(args.output))
+                path.unlink()
+    fetch(manifest, args.output, args.verify)
 
 
 if __name__ == "__main__":

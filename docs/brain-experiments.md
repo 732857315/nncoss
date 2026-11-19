@@ -175,7 +175,7 @@
 
 按“知识直接从中国学生课本中找，不用生成的内容”的要求，第一至四章的自编题库和知识陈述全部停用，改为：
 
-- **知识库：** 160 册人教版和统编版小学、初中、高中课本，加上 OI Wiki，切成 44,913 段（课本 32,775 段，OI Wiki 12,138 段）。之后已把选书扩大到小学至高中全部学科、每科一个版本，共 323 册；本章的结果都用 160 册的知识库测得。
+- **知识库：** 160 册人教版和统编版小学、初中、高中课本，加上 OI Wiki，切成 44,913 段（课本 32,775 段，OI Wiki 12,138 段）。之后已把选书扩大到小学至高中全部学科、每科一个版本，共 318 册，并加入教育部的两份幼儿园指导文件；本章的结果都用 160 册的知识库（`modelbook/knowledge/store-160`）测得。
 - **测评：** GAOKAO-Bench 中 9 个单选题科目（数学 I、数学 II、物理、化学、生物、历史、政治、语文、英语）各抽 12 道，共 108 道作为测验题；再按另一个种子抽同样数量、与测验题不重叠的 108 道作为定位题，只用来寻找要改的部件。
 - **作答：** `nncoss-know` 驱动本地 Q4 模型，非思考模式贪心解码，每轮最多 1024 token，最多 6 轮工具调用。从回答中提取选项字母判分，不规定格式。
 - **命令：**
@@ -184,7 +184,7 @@
   python3 tools/eval_gaokao.py --model model/Qwen3-0.6B/qwen3-0.6b-q4.nncossllm --tokenizer model/Qwen3-0.6B/tokenizer.json \
     --label q06-nothink-notool --no-tools
   python3 tools/eval_gaokao.py --model model/Qwen3-0.6B/qwen3-0.6b-q4.nncossllm --tokenizer model/Qwen3-0.6B/tokenizer.json \
-    --store modelbook/knowledge/store-base --label q06-nothink-prefetch --prefetch
+    --store modelbook/knowledge/store-160 --label q06-nothink-prefetch --prefetch
   python3 tools/eval_gaokao.py --model model/Qwen3-0.6B/qwen3-0.6b-q4.nncossllm --tokenizer model/Qwen3-0.6B/tokenizer.json \
     --label q06-nothink-prefetch-empty --prefetch          # 不给 --store：知识库为空
   ```
@@ -263,7 +263,7 @@ decode 受内存带宽限制，每生成一个 token 要读一遍全部权重：
 
 1. 完成 5.5 的定位，用 `nncoss-edit` 改写，看能否让模型在检索之后照常推理：先在定位题上检验，再到测验题上确认。
 2. 完成修复后程序的“先检索一次”与“自己决定是否检索”两个条件，并补上思考模式。
-3. 用 323 册课本重建知识库，比较知识覆盖面扩大后的效果。
+3. 用 318 册课本加幼儿园文件重建知识库，比较知识覆盖面扩大后的效果。
 4. 完成逐层与累计删层的测量，在空闲的机器上测 int8 KV Cache 与删层带来的速度变化。
 5. 1.7B 模型的同样测评，以及用 CodeContests 在本地判题的编程测评。
 

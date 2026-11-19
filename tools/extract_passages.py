@@ -4,6 +4,8 @@ import re
 from pathlib import Path
 
 END = "。！？；：…」』”）)!?;:"
+# 源仓库中个别目录名不是学段名，换成出处里易读的学段与学科。
+ALIASES = {("学数学最重要的刷习题在这里", "初中练习题_带答案"): ("初中", "数学中考真题与练习")}
 TARGET = 420
 LIMIT = 700
 
@@ -70,7 +72,7 @@ def textbook_passages(pdf_root):
     import fitz
     for path in sorted(pdf_root.rglob("*.pdf")):
         relative = path.relative_to(pdf_root)
-        stage, subject = relative.parts[0], relative.parts[1]
+        stage, subject = ALIASES.get(relative.parts[:2], relative.parts[:2])
         title = path.stem.split("·")[-1]
         book = f"{stage}/{subject}/{title}"
         key = re.sub(r"[^\w]", "", f"{stage}{subject}{title}")
@@ -85,6 +87,17 @@ def textbook_passages(pdf_root):
                 chunk = clean(chunk)
                 if len(chunk) >= 20:
                     yield {"id": f"{key}-p{number}-{index}", "source": f"{book} 第{number}页", "text": chunk}
+
+
+def text_passages(root):
+    """纯文本资料（如幼儿园的指导文件）：按段落切分，出处为相对路径去掉扩展名。"""
+    for path in sorted(root.rglob("*.txt")):
+        source = path.relative_to(root).with_suffix("").as_posix()
+        key = re.sub(r"[^\w]", "", source)
+        text = path.read_text(encoding="utf-8")
+        for index, chunk in enumerate(chunks(text.split("\n"))):
+            if len(chunk) >= 20:
+                yield {"id": f"{key}-{index}", "source": source, "text": chunk}
 
 
 def oiwiki_passages(root):
@@ -104,8 +117,9 @@ def oiwiki_passages(root):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="把课本 PDF 与 OI Wiki 切成带出处的段落 JSONL")
-    parser.add_argument("--textbooks", type=Path)
+    parser = argparse.ArgumentParser(description="把课本 PDF、纯文本资料与 OI Wiki 切成带出处的段落 JSONL")
+    parser.add_argument("--textbooks", type=Path, help="课本 PDF 目录，按 学段/学科/版本/… 组织")
+    parser.add_argument("--texts", type=Path, help="纯文本资料目录，出处为相对路径")
     parser.add_argument("--oiwiki", type=Path)
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args()
@@ -115,6 +129,8 @@ def main():
         sources = []
         if args.textbooks:
             sources.append(textbook_passages(args.textbooks))
+        if args.texts:
+            sources.append(text_passages(args.texts))
         if args.oiwiki:
             sources.append(oiwiki_passages(args.oiwiki))
         for source in sources:

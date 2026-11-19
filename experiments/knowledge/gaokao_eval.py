@@ -69,6 +69,7 @@ def main():
     parser.add_argument("--label", required=True)
     parser.add_argument("--think", action="store_true")
     parser.add_argument("--no-tools", action="store_true")
+    parser.add_argument("--prefetch", action="store_true", help="作答前先用题目自动检索一次知识库")
     parser.add_argument("--per-subject", type=int, default=12)
     parser.add_argument("--seed", default="gaokao")
     parser.add_argument("--turn-tokens", type=int, default=0)
@@ -91,13 +92,15 @@ def main():
         command.append("--think")
     if args.no_tools:
         command.append("--no-tools")
+    if args.prefetch:
+        command.append("--prefetch")
     turn_tokens = args.turn_tokens or (3072 if args.think else 1024)
     command += ["--turn-tokens", str(turn_tokens)]
     started = time.time()
     subprocess.run(command, check=True)
     answers = [json.loads(line) for line in (work / "answers.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
     table, details = judge(questions, answers)
-    report = {"label": args.label, "model": str(args.model), "think": args.think, "tools": not args.no_tools,
+    report = {"label": args.label, "model": str(args.model), "think": args.think, "tools": not args.no_tools, "prefetch": args.prefetch,
               "seconds": round(time.time() - started), "notes_written": sum(d["notes"] for d in details),
               "searches": sum(d["searches"] for d in details), "table": table, "details": details}
     (work / "report.json").write_text(json.dumps(report, ensure_ascii=False, indent=1), encoding="utf-8")

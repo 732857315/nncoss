@@ -12,6 +12,8 @@ pub const EOS_TOKENS: [u32; 2] = [151643, 151645];
 const NO_THINK: &str = "<think>\n\n</think>\n\n";
 const PASSAGE_CHARS: usize = 360;
 const PAGE_CHARS: usize = 4000;
+const PREFETCH_CHARS: usize = 300;
+const MIN_SUPPORT: f32 = 0.6;
 const INSTRUCTION: &str = "你的知识保存在外部知识库里，知识库中有幼儿园到高中的课本、计算机与算法资料，以及你以前记下的笔记。回答需要事实、概念、公式、方法或课文内容的问题时，先用 search_knowledge 查找，再依据查到的内容作答；学到以后用得上的知识时，用 write_note 记下来。";
 const BROWSE_INSTRUCTION: &str = "需要网页上的内容时，用 browse 打开网址阅读。";
 const LEARN_PROMPT: &str = "请把刚才从资料中学到、以后解决同类问题时用得上的知识归纳成一条简洁的笔记。只写知识本身（概念、规律、公式、方法或事实），不要写本题的答案，也不要写推理过程。";
@@ -25,6 +27,7 @@ pub struct AgentConfig {
     pub tools: bool,
     pub browse: bool,
     pub learn: bool,
+    pub prefetch: bool,
     pub turn_tokens: usize,
     pub tool_rounds: usize,
     pub search_limit: usize,
@@ -39,6 +42,7 @@ impl Default for AgentConfig {
             tools: true,
             browse: false,
             learn: true,
+            prefetch: false,
             turn_tokens: 1024,
             tool_rounds: 6,
             search_limit: 4,
@@ -55,6 +59,7 @@ pub struct Answer {
     pub searches: Vec<String>,
     pub pages: Vec<String>,
     pub notes: Vec<u64>,
+    pub rejected: usize,
     pub generated: usize,
 }
 
@@ -122,6 +127,14 @@ pub fn parse_tool_calls(text: &str) -> Vec<Result<ToolCall, String>> {
         rest = next;
     }
     calls
+}
+
+pub fn prefetch_turn(query: &str, output: &str, thinking: bool) -> String {
+    let arguments = serde_json::json!({ "query": query }).to_string();
+    format!(
+        "<|im_start|>assistant\n{NO_THINK}<tool_call>\n{{\"name\": \"search_knowledge\", \"arguments\": {arguments}}}\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n{output}\n</tool_response><|im_end|>\n{}",
+        assistant_open(thinking)
+    )
 }
 
 fn truncate(text: &str, limit: usize) -> String {
@@ -322,6 +335,38 @@ impl<'a> Agent<'a> {
             .map_err(|error| error.to_string())
     }
 
+    fn record_note(
+        &mut self,
+        text: &str,
+        sources: &[String],
+        question: &str,
+        answer: &mut Answer,
+    ) -> String {
+        if sources.is_empty() {
+            answer.rejected += 1;
+            return "还没有查到任何资料，笔记必须以查到的资料为依据，没有记录".to_string();
+        }
+        let support = self.base.support(text, sources);
+        if support < MIN_SUPPORT {
+            answer.rejected += 1;
+            return format!(
+                "笔记中只有 {:.0}% 的内容能在查到的资料中找到依据，没有记录",
+                support * 100.0
+            );
+        }
+        match self
+            .base
+            .add_note(text, sources.to_vec(), Some(question.to_string()))
+        {
+            Ok(Some(id)) => {
+                answer.notes.push(id);
+                format!("已记下笔记 note-{id}")
+            }
+            Ok(None) => "笔记为空或已经存在，没有重复记录".to_string(),
+            Err(error) => format!("记笔记失败：{error}"),
+        }
+    }
+
     fn run_tool(
         &mut self,
         call: &ToolCall,
@@ -363,17 +408,7 @@ impl<'a> Agent<'a> {
             }
             "write_note" => {
                 let content = argument("content");
-                match self
-                    .base
-                    .add_note(&content, sources.clone(), Some(question.to_string()))
-                {
-                    Ok(Some(id)) => {
-                        answer.notes.push(id);
-                        format!("已记下笔记 note-{id}")
-                    }
-                    Ok(None) => "笔记为空或已经存在，没有重复记录".to_string(),
-                    Err(error) => format!("记笔记失败：{error}"),
-                }
+                self.record_note(&content, sources, question, answer)
             }
             "browse" if self.config.browse => {
                 let url = argument("url");
@@ -396,10 +431,20 @@ impl<'a> Agent<'a> {
         let mut answer = Answer::default();
         let mut sources = Vec::new();
         let mut prompt = format!(
-            "{}<|im_start|>user\n{question}<|im_end|>\n{}",
-            system_prompt(&self.config),
-            assistant_open(self.config.thinking)
+            "{}<|im_start|>user\n{question}<|im_end|>\n",
+            system_prompt(&self.config)
         );
+        if self.config.prefetch && self.config.tools {
+            let query: String = question.chars().take(PREFETCH_CHARS).collect();
+            let call = ToolCall {
+                name: "search_knowledge".to_string(),
+                arguments: serde_json::json!({ "query": query }),
+            };
+            let output = self.run_tool(&call, question, &mut sources, &mut answer);
+            prompt.push_str(&prefetch_turn(&query, &output, self.config.thinking));
+        } else {
+            prompt.push_str(assistant_open(self.config.thinking));
+        }
         answer.transcript.push_str(&prompt);
         let mut rounds = 0;
         loop {
@@ -444,14 +489,9 @@ impl<'a> Agent<'a> {
             )?;
             answer.transcript.push_str(&body);
             answer.transcript.push_str(&text);
-            let note = visible(&text);
-            if parse_tool_calls(note).is_empty() {
-                if let Some(id) =
-                    self.base
-                        .add_note(note, sources.clone(), Some(question.to_string()))?
-                {
-                    answer.notes.push(id);
-                }
+            let note = visible(&text).to_string();
+            if parse_tool_calls(&note).is_empty() {
+                self.record_note(&note, &sources, question, &mut answer);
             }
         }
         Ok(answer)
@@ -500,6 +540,23 @@ mod tests {
             "<|im_start|>assistant\n<think>\n\n</think>\n\n"
         );
         assert_eq!(assistant_open(true), "<|im_start|>assistant\n");
+    }
+
+    #[test]
+    fn prefetched_search_looks_like_a_model_tool_call() {
+        let turn = prefetch_turn("钠离子", "[课本] 钠原子失去电子形成钠离子", false);
+        assert!(turn.starts_with("<|im_start|>assistant\n<think>\n\n</think>\n\n<tool_call>\n"));
+        let calls = parse_tool_calls(&turn);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].as_ref().unwrap().arguments["query"], "钠离子");
+        assert!(
+            turn.contains("<tool_response>\n[课本] 钠原子失去电子形成钠离子\n</tool_response>")
+        );
+        assert!(turn.ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n"));
+        assert!(
+            prefetch_turn("x", "y", true)
+                .ends_with("</tool_response><|im_end|>\n<|im_start|>assistant\n")
+        );
     }
 
     #[test]

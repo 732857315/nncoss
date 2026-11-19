@@ -1,5 +1,10 @@
+use std::collections::BTreeSet;
+
 use nncoss_llm::{Config, TensorLayout, tensor_layout};
 use serde::{Deserialize, Serialize};
+
+/// 头部中层数字段的偏移，见 nncoss-llm 的模型格式说明。
+const LAYER_COUNT_OFFSET: usize = 28;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -25,6 +30,9 @@ pub enum Edit {
         index: Vec<usize>,
         factor: f32,
     },
+    /// 删除整层（注意力与 MLP 一起删除），其余张量逐字节保留。
+    /// 删除后层号重新从 0 连续编号，之后的改动使用新的层号。
+    DropLayers { layers: Vec<usize> },
 }
 
 pub struct ModelFile {
@@ -153,14 +161,50 @@ impl ModelFile {
         Ok(indices.len())
     }
 
+    /// 删除指定的层，返回被删除的数值个数。
+    fn drop_layers(&mut self, layers: &[usize]) -> Result<usize, String> {
+        let count = self.config.layer_count;
+        if layers.is_empty() {
+            return Err("没有指定要删除的层".to_string());
+        }
+        if let Some(layer) = layers.iter().find(|&&layer| layer >= count) {
+            return Err(format!("模型只有 {count} 层，第 {layer} 层越界"));
+        }
+        let removed: BTreeSet<usize> = layers.iter().copied().collect();
+        if removed.len() >= count {
+            return Err("至少要保留一层".to_string());
+        }
+        let header = self
+            .tensors
+            .first()
+            .map_or(self.bytes.len(), |tensor| tensor.offset);
+        let mut bytes = self.bytes[..header].to_vec();
+        let kept = u32::try_from(count - removed.len()).map_err(|error| error.to_string())?;
+        bytes[LAYER_COUNT_OFFSET..LAYER_COUNT_OFFSET + 4].copy_from_slice(&kept.to_le_bytes());
+        let mut values = 0;
+        for tensor in &self.tensors {
+            if tensor.layer.is_some_and(|layer| removed.contains(&layer)) {
+                values += tensor.rows * tensor.columns;
+            } else {
+                bytes.extend_from_slice(
+                    &self.bytes[tensor.offset..tensor.offset + tensor.byte_count],
+                );
+            }
+        }
+        *self = Self::parse(bytes)?;
+        Ok(values)
+    }
+
     pub fn apply(&mut self, edit: &Edit) -> Result<usize, String> {
-        let Edit::Scale {
-            target,
-            layer,
-            index,
-            factor,
-        } = edit;
-        let factor = *factor;
+        let (target, layer, index, factor) = match edit {
+            Edit::DropLayers { layers } => return self.drop_layers(layers),
+            Edit::Scale {
+                target,
+                layer,
+                index,
+                factor,
+            } => (target, layer, index, *factor),
+        };
         if !factor.is_finite() {
             return Err("缩放因子必须是有限数".to_string());
         }
@@ -351,6 +395,94 @@ mod tests {
         }
         assert_eq!(file.bytes(), original.as_slice());
         assert!(ModelFile::parse(FIXTURE[..FIXTURE.len() - 4].to_vec()).is_err());
+    }
+
+    /// 把单层的测试模型复制成多层，并给每层的 Norm 乘上不同系数，使各层内容互不相同。
+    fn layered(file: &ModelFile, count: usize) -> ModelFile {
+        let tensors = file.tensors();
+        let first = tensors
+            .iter()
+            .position(|tensor| tensor.layer.is_some())
+            .unwrap();
+        let last = tensors
+            .iter()
+            .rposition(|tensor| tensor.layer.is_some())
+            .unwrap();
+        let copy = |bytes: &mut Vec<u8>, tensor: &TensorLayout| {
+            bytes.extend_from_slice(&file.bytes()[tensor.offset..tensor.offset + tensor.byte_count])
+        };
+        let mut bytes = file.bytes()[..tensors[0].offset].to_vec();
+        bytes[LAYER_COUNT_OFFSET..LAYER_COUNT_OFFSET + 4]
+            .copy_from_slice(&u32::try_from(count).unwrap().to_le_bytes());
+        tensors[..first]
+            .iter()
+            .for_each(|tensor| copy(&mut bytes, tensor));
+        for _ in 0..count {
+            tensors[first..=last]
+                .iter()
+                .for_each(|tensor| copy(&mut bytes, tensor));
+        }
+        tensors[last + 1..]
+            .iter()
+            .for_each(|tensor| copy(&mut bytes, tensor));
+        let mut result = ModelFile::parse(bytes).unwrap();
+        for layer in 0..count {
+            for target in [Target::AttnNorm, Target::FfnNorm] {
+                let edit = Edit::Scale {
+                    target,
+                    layer: Some(layer),
+                    index: Vec::new(),
+                    factor: (layer + 2) as f32,
+                };
+                result.apply(&edit).unwrap();
+            }
+        }
+        result
+    }
+
+    #[test]
+    fn dropping_layers_keeps_the_other_tensors_byte_for_byte() {
+        let base = [ModelFile::parse(FIXTURE.to_vec()).unwrap(), quantized()];
+        for mut file in base.iter().map(|file| layered(file, 4)) {
+            let original = ModelFile::parse(file.bytes().to_vec()).unwrap();
+            let edit: Edit =
+                serde_json::from_str(r#"{"op": "drop_layers", "layers": [2, 0]}"#).unwrap();
+            let removed = file.apply(&edit).unwrap();
+            assert_eq!(file.config().layer_count, 2);
+            Model::from_bytes(file.bytes()).unwrap();
+            let slice = |model: &ModelFile, tensor: &TensorLayout| {
+                model.bytes()[tensor.offset..tensor.offset + tensor.byte_count].to_vec()
+            };
+            let mut expected_removed = 0;
+            for tensor in original.tensors() {
+                let moved = match tensor.layer {
+                    Some(0 | 2) => {
+                        expected_removed += tensor.rows * tensor.columns;
+                        continue;
+                    }
+                    Some(1) => Some(0),
+                    Some(3) => Some(1),
+                    other => other,
+                };
+                let target = file.find(tensor.kind, moved).unwrap();
+                assert_eq!(
+                    slice(&original, tensor),
+                    slice(&file, &target),
+                    "{}",
+                    tensor.kind
+                );
+            }
+            assert_eq!(removed, expected_removed);
+            assert_ne!(
+                slice(&file, &file.find("input_layernorm", Some(0)).unwrap()),
+                slice(&file, &file.find("input_layernorm", Some(1)).unwrap())
+            );
+            for layers in [vec![], vec![1, 2], vec![0, 1]] {
+                let before = file.bytes().to_vec();
+                assert!(file.apply(&Edit::DropLayers { layers }).is_err());
+                assert_eq!(file.bytes(), before.as_slice());
+            }
+        }
     }
 
     #[test]

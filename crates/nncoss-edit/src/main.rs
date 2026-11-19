@@ -12,7 +12,10 @@ const USAGE: &str = "用法：
 改动计划是 JSON 数组，每项形如：
   {\"op\": \"scale\", \"target\": \"mlp\", \"layer\": 1, \"index\": [2997], \"factor\": 0.0}
 target 可选 mlp、kv_head、q_norm、k_norm、attn_norm、ffn_norm、final_norm、token；
-index 为空表示该张量的全部行或元素。";
+index 为空表示该张量的全部行或元素。
+删除整层：
+  {\"op\": \"drop_layers\", \"layers\": [20, 21]}
+删除后层号从 0 重新连续编号，计划中排在它后面的改动使用新层号。";
 
 fn inspect(path: &PathBuf) -> Result<(), String> {
     let file = ModelFile::parse(

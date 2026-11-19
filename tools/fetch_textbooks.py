@@ -54,6 +54,10 @@ def select(tree):
         match = re.match(r"(.*\.pdf)(?:\.(\d+))?$", entry["path"])
         if match:
             books[match.group(1)].append((int(match.group(2) or 0), entry))
+    # 源仓库有时把同一册书的分卷另放在 “<书名>.pdf_merge_folder/” 下；已有完整文件时这份分卷是重复的。
+    for book in [book for book in books if ".pdf_merge_folder/" in book]:
+        if book.split(".pdf_merge_folder/")[0] + ".pdf" in books:
+            del books[book]
     return {"source": SOURCE, "commit_tree": tree["sha"],
             "books": [{"book": book, "parts": [{"path": entry["path"], "size": entry["size"], "sha": entry["sha"]}
                                                for _, entry in sorted(parts, key=lambda item: item[0])]}

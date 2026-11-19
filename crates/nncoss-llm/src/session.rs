@@ -372,150 +372,155 @@ impl Session {
             model.token_embedding.row_into(*token as usize, state);
         }
         for (layer_index, layer) in model.layers.iter().enumerate() {
-            normalize(
-                &scratch.state,
-                &layer.attn_norm,
-                config.norm_eps,
-                &mut scratch.normalized,
-                hidden,
-            );
-            linear_many(
-                &scratch.normalized[..count * hidden],
-                &mut scratch.activations[..count],
-                &mut [
-                    Linear {
-                        weight: &layer.q_proj,
-                        bias: layer.q_bias.as_deref(),
-                        output: &mut scratch.query[..count * q_dim],
-                    },
-                    Linear {
-                        weight: &layer.k_proj,
-                        bias: layer.k_bias.as_deref(),
-                        output: &mut scratch.key[..count * kv_dim],
-                    },
-                    Linear {
-                        weight: &layer.v_proj,
-                        bias: layer.v_bias.as_deref(),
-                        output: &mut scratch.value[..count * kv_dim],
-                    },
-                ],
-            );
-            for offset in 0..count {
-                let query = &mut scratch.query[offset * q_dim..(offset + 1) * q_dim];
-                let key = &mut scratch.key[offset * kv_dim..(offset + 1) * kv_dim];
-                let value = &mut scratch.value[offset * kv_dim..(offset + 1) * kv_dim];
-                if let (Some(q_norm), Some(k_norm)) = (&layer.q_norm, &layer.k_norm) {
-                    rms_norm_heads(
+            // 输出投影全为零的子层对残差没有贡献，跳过它与结果逐位相同（见 LayerWeights::refresh_skips）。
+            if !layer.attn_skipped {
+                normalize(
+                    &scratch.state,
+                    &layer.attn_norm,
+                    config.norm_eps,
+                    &mut scratch.normalized,
+                    hidden,
+                );
+                linear_many(
+                    &scratch.normalized[..count * hidden],
+                    &mut scratch.activations[..count],
+                    &mut [
+                        Linear {
+                            weight: &layer.q_proj,
+                            bias: layer.q_bias.as_deref(),
+                            output: &mut scratch.query[..count * q_dim],
+                        },
+                        Linear {
+                            weight: &layer.k_proj,
+                            bias: layer.k_bias.as_deref(),
+                            output: &mut scratch.key[..count * kv_dim],
+                        },
+                        Linear {
+                            weight: &layer.v_proj,
+                            bias: layer.v_bias.as_deref(),
+                            output: &mut scratch.value[..count * kv_dim],
+                        },
+                    ],
+                );
+                for offset in 0..count {
+                    let query = &mut scratch.query[offset * q_dim..(offset + 1) * q_dim];
+                    let key = &mut scratch.key[offset * kv_dim..(offset + 1) * kv_dim];
+                    let value = &mut scratch.value[offset * kv_dim..(offset + 1) * kv_dim];
+                    if let (Some(q_norm), Some(k_norm)) = (&layer.q_norm, &layer.k_norm) {
+                        rms_norm_heads(
+                            query,
+                            config.head_count,
+                            config.head_dim,
+                            q_norm,
+                            config.norm_eps,
+                        );
+                        rms_norm_heads(
+                            key,
+                            config.kv_head_count,
+                            config.head_dim,
+                            k_norm,
+                            config.norm_eps,
+                        );
+                    }
+                    let table = &scratch.rope[offset * half..(offset + 1) * half];
+                    apply_rope_table(
                         query,
                         config.head_count,
                         config.head_dim,
-                        q_norm,
-                        config.norm_eps,
+                        table,
+                        config.rope_mode,
                     );
-                    rms_norm_heads(
+                    apply_rope_table(
                         key,
                         config.kv_head_count,
                         config.head_dim,
-                        k_norm,
-                        config.norm_eps,
+                        table,
+                        config.rope_mode,
                     );
+                    if rotate {
+                        hadamard_heads(query, config.head_dim);
+                        hadamard_heads(key, config.head_dim);
+                        hadamard_heads(value, config.head_dim);
+                    }
+                    cache.write(layer_index, start + offset, key, value, *max_context)?;
                 }
-                let table = &scratch.rope[offset * half..(offset + 1) * half];
-                apply_rope_table(
-                    query,
-                    config.head_count,
-                    config.head_dim,
-                    table,
-                    config.rope_mode,
-                );
-                apply_rope_table(
-                    key,
-                    config.kv_head_count,
-                    config.head_dim,
-                    table,
-                    config.rope_mode,
-                );
+                #[cfg(test)]
+                if layer_index + 1 == model.layers.len()
+                    && fail_at_position
+                        .is_some_and(|position| (start..start + count).contains(&position))
+                {
+                    return Err(Error::Allocation);
+                }
+                let queries = &scratch.query[..count * q_dim];
+                let attended = &mut scratch.attended[..count * q_dim];
+                match cache.layer(layer_index) {
+                    KvLayer::F32(view) => {
+                        attention(queries, view, shape, start, &mut scratch.scores, attended)
+                    }
+                    KvLayer::F16(view) => {
+                        attention(queries, view, shape, start, &mut scratch.scores, attended)
+                    }
+                    KvLayer::I8(view) => {
+                        attention(queries, view, shape, start, &mut scratch.scores, attended)
+                    }
+                }
                 if rotate {
-                    hadamard_heads(query, config.head_dim);
-                    hadamard_heads(key, config.head_dim);
-                    hadamard_heads(value, config.head_dim);
+                    hadamard_heads(attended, config.head_dim);
                 }
-                cache.write(layer_index, start + offset, key, value, *max_context)?;
-            }
-            #[cfg(test)]
-            if layer_index + 1 == model.layers.len()
-                && fail_at_position
-                    .is_some_and(|position| (start..start + count).contains(&position))
-            {
-                return Err(Error::Allocation);
-            }
-            let queries = &scratch.query[..count * q_dim];
-            let attended = &mut scratch.attended[..count * q_dim];
-            match cache.layer(layer_index) {
-                KvLayer::F32(view) => {
-                    attention(queries, view, shape, start, &mut scratch.scores, attended)
-                }
-                KvLayer::F16(view) => {
-                    attention(queries, view, shape, start, &mut scratch.scores, attended)
-                }
-                KvLayer::I8(view) => {
-                    attention(queries, view, shape, start, &mut scratch.scores, attended)
-                }
-            }
-            if rotate {
-                hadamard_heads(attended, config.head_dim);
-            }
-            linear_many(
-                &scratch.attended[..count * q_dim],
-                &mut scratch.activations[..count],
-                &mut [Linear {
-                    weight: &layer.o_proj,
-                    bias: None,
-                    output: &mut scratch.projected[..count * hidden],
-                }],
-            );
-            add_assign(
-                &mut scratch.state[..count * hidden],
-                &scratch.projected[..count * hidden],
-            );
-            normalize(
-                &scratch.state,
-                &layer.ffn_norm,
-                config.norm_eps,
-                &mut scratch.normalized,
-                hidden,
-            );
-            let inner = count * config.intermediate_size;
-            linear_many(
-                &scratch.normalized[..count * hidden],
-                &mut scratch.activations[..count],
-                &mut [
-                    Linear {
-                        weight: &layer.gate_proj,
+                linear_many(
+                    &scratch.attended[..count * q_dim],
+                    &mut scratch.activations[..count],
+                    &mut [Linear {
+                        weight: &layer.o_proj,
                         bias: None,
-                        output: &mut scratch.gate[..inner],
-                    },
-                    Linear {
-                        weight: &layer.up_proj,
+                        output: &mut scratch.projected[..count * hidden],
+                    }],
+                );
+                add_assign(
+                    &mut scratch.state[..count * hidden],
+                    &scratch.projected[..count * hidden],
+                );
+            }
+            if !layer.mlp_skipped {
+                normalize(
+                    &scratch.state,
+                    &layer.ffn_norm,
+                    config.norm_eps,
+                    &mut scratch.normalized,
+                    hidden,
+                );
+                let inner = count * config.intermediate_size;
+                linear_many(
+                    &scratch.normalized[..count * hidden],
+                    &mut scratch.activations[..count],
+                    &mut [
+                        Linear {
+                            weight: &layer.gate_proj,
+                            bias: None,
+                            output: &mut scratch.gate[..inner],
+                        },
+                        Linear {
+                            weight: &layer.up_proj,
+                            bias: None,
+                            output: &mut scratch.up[..inner],
+                        },
+                    ],
+                );
+                swiglu(&mut scratch.gate[..inner], &scratch.up[..inner]);
+                linear_many(
+                    &scratch.gate[..inner],
+                    &mut scratch.activations[..count],
+                    &mut [Linear {
+                        weight: &layer.down_proj,
                         bias: None,
-                        output: &mut scratch.up[..inner],
-                    },
-                ],
-            );
-            swiglu(&mut scratch.gate[..inner], &scratch.up[..inner]);
-            linear_many(
-                &scratch.gate[..inner],
-                &mut scratch.activations[..count],
-                &mut [Linear {
-                    weight: &layer.down_proj,
-                    bias: None,
-                    output: &mut scratch.projected[..count * hidden],
-                }],
-            );
-            add_assign(
-                &mut scratch.state[..count * hidden],
-                &scratch.projected[..count * hidden],
-            );
+                        output: &mut scratch.projected[..count * hidden],
+                    }],
+                );
+                add_assign(
+                    &mut scratch.state[..count * hidden],
+                    &scratch.projected[..count * hidden],
+                );
+            }
         }
         cache.finish_tokens(count);
         history.extend_from_slice(tokens);
@@ -590,6 +595,67 @@ mod tests {
         incremental.decode(tokens[3]).unwrap();
         assert_close(incremental.last_logits().unwrap(), &expected);
         assert_eq!(incremental.position(), tokens.len());
+    }
+
+    #[test]
+    fn zeroed_sublayers_are_skipped_bit_for_bit() {
+        use crate::model::LayerWeights;
+        use crate::q4::test_support::encode;
+        use crate::q4::{Q4Matrix, Weight};
+
+        fn zero(weight: &mut Weight, rows: usize, columns: usize) {
+            *weight = match weight {
+                Weight::F32(values) => Weight::F32(vec![0.0; values.len()]),
+                Weight::Q4(_) => Weight::Q4(
+                    Q4Matrix::new(
+                        rows,
+                        columns,
+                        encode(&vec![0.0; rows * columns], rows, columns),
+                    )
+                    .unwrap(),
+                ),
+            };
+        }
+        let tokens = [1, 2, 3, 0, 4, 2];
+        for quantized in [false, true] {
+            let build = |skip: bool| {
+                let mut model = if quantized {
+                    TinySpec::WIDE.quantized_model()
+                } else {
+                    TinySpec::WIDE.model()
+                };
+                let config = model.config.clone();
+                let (hidden, inner) = (config.hidden_size, config.intermediate_size);
+                zero(&mut model.layers[0].o_proj, hidden, config.q_dim());
+                zero(&mut model.layers[1].down_proj, hidden, inner);
+                if skip {
+                    model
+                        .layers
+                        .iter_mut()
+                        .for_each(LayerWeights::refresh_skips);
+                }
+                Arc::new(model)
+            };
+            let skipped = build(true);
+            assert!(skipped.layers[0].attn_skipped && !skipped.layers[0].mlp_skipped);
+            assert!(skipped.layers[1].mlp_skipped && !skipped.layers[1].attn_skipped);
+            let computed = build(false);
+            assert!(!computed.layers[0].attn_skipped && !computed.layers[1].mlp_skipped);
+            let run = |model: Arc<Model>| {
+                let mut session = Session::new(model, 0).unwrap();
+                session.prefill(&tokens[..3]).unwrap();
+                for token in &tokens[3..] {
+                    session.decode(*token).unwrap();
+                }
+                session.last_logits().unwrap().to_vec()
+            };
+            let (fast, full) = (run(skipped), run(computed));
+            assert_eq!(
+                fast.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+                full.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+                "quantized={quantized}"
+            );
+        }
     }
 
     #[test]

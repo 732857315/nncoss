@@ -19,6 +19,13 @@ pub enum Target {
     Token,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Sublayer {
+    Attention,
+    Mlp,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 pub enum Edit {
@@ -33,6 +40,9 @@ pub enum Edit {
     /// 删除整层（注意力与 MLP 一起删除），其余张量逐字节保留。
     /// 删除后层号重新从 0 连续编号，之后的改动使用新的层号。
     DropLayers { layers: Vec<usize> },
+    /// 删去指定层的注意力或 MLP 子层：把输出投影（o_proj 或 down_proj）置零，残差直通。
+    /// nncoss-llm 加载时发现输出投影全为零，会整块跳过该子层，因此能真正省下计算与读取。
+    DropSublayer { part: Sublayer, layers: Vec<usize> },
 }
 
 pub struct ModelFile {
@@ -195,9 +205,31 @@ impl ModelFile {
         Ok(values)
     }
 
+    /// 把指定层子层的输出投影整体置零，返回被置零的行数（Q4）或数值个数（f32）。
+    fn drop_sublayers(&mut self, part: Sublayer, layers: &[usize]) -> Result<usize, String> {
+        if layers.is_empty() {
+            return Err("没有指定层".to_string());
+        }
+        let kind = match part {
+            Sublayer::Attention => "o_proj",
+            Sublayer::Mlp => "down_proj",
+        };
+        let tensors = layers
+            .iter()
+            .map(|&layer| self.find(kind, Some(layer)))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut changed = 0;
+        for tensor in &tensors {
+            let rows: Vec<usize> = (0..tensor.rows).collect();
+            changed += self.scale_rows(tensor, &rows, 0.0)?;
+        }
+        Ok(changed)
+    }
+
     pub fn apply(&mut self, edit: &Edit) -> Result<usize, String> {
         let (target, layer, index, factor) = match edit {
             Edit::DropLayers { layers } => return self.drop_layers(layers),
+            Edit::DropSublayer { part, layers } => return self.drop_sublayers(*part, layers),
             Edit::Scale {
                 target,
                 layer,
@@ -482,6 +514,51 @@ mod tests {
                 assert!(file.apply(&Edit::DropLayers { layers }).is_err());
                 assert_eq!(file.bytes(), before.as_slice());
             }
+        }
+    }
+
+    #[test]
+    fn dropping_sublayers_zeroes_their_output_projection() {
+        for mut file in [ModelFile::parse(FIXTURE.to_vec()).unwrap(), quantized()] {
+            let original = ModelFile::parse(file.bytes().to_vec()).unwrap();
+            let edit: Edit =
+                serde_json::from_str(r#"{"op": "drop_sublayer", "part": "mlp", "layers": [0]}"#)
+                    .unwrap();
+            file.apply(&edit).unwrap();
+            let down = file.find("down_proj", Some(0)).unwrap();
+            let zeroed = if down.quantized {
+                down.rows
+            } else {
+                down.rows * down.columns
+            };
+            for index in 0..zeroed {
+                assert_eq!(read_f32(file.bytes(), down.offset + index * 4), 0.0);
+            }
+            let attention = Edit::DropSublayer {
+                part: Sublayer::Attention,
+                layers: vec![0],
+            };
+            file.apply(&attention).unwrap();
+            let o_proj = file.find("o_proj", Some(0)).unwrap();
+            assert_eq!(read_f32(file.bytes(), o_proj.offset), 0.0);
+            for tensor in original.tensors() {
+                if tensor.kind != "down_proj" && tensor.kind != "o_proj" {
+                    let range = tensor.offset..tensor.offset + tensor.byte_count;
+                    assert_eq!(&file.bytes()[range.clone()], &original.bytes()[range]);
+                }
+            }
+            Model::from_bytes(file.bytes()).unwrap();
+            let before = file.bytes().to_vec();
+            for layers in [vec![], vec![5]] {
+                assert!(
+                    file.apply(&Edit::DropSublayer {
+                        part: Sublayer::Mlp,
+                        layers
+                    })
+                    .is_err()
+                );
+            }
+            assert_eq!(file.bytes(), before.as_slice());
         }
     }
 

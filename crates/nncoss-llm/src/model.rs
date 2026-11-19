@@ -110,6 +110,18 @@ pub(crate) struct LayerWeights {
     pub gate_proj: Weight,
     pub up_proj: Weight,
     pub down_proj: Weight,
+    /// o_proj 全为零：注意力子层的输出恒为零，前向时整块跳过，也不写入这一层的 KV Cache。
+    pub attn_skipped: bool,
+    /// down_proj 全为零：MLP 子层的输出恒为零，前向时整块跳过。
+    pub mlp_skipped: bool,
+}
+
+impl LayerWeights {
+    /// 根据输出投影是否全为零，标记可以整块跳过的子层。删去子层可用 nncoss-edit 把输出投影置零。
+    pub(crate) fn refresh_skips(&mut self) {
+        self.attn_skipped = self.o_proj.is_zero();
+        self.mlp_skipped = self.down_proj.is_zero();
+    }
 }
 
 #[derive(Debug)]
@@ -496,10 +508,12 @@ impl Assembly {
         if self.tensor.is_some() {
             return Err(Error::InvalidModel("模型数据被截断"));
         }
+        let mut layers = self.layers;
+        layers.iter_mut().for_each(LayerWeights::refresh_skips);
         Ok(Model {
             config: self.config,
             token_embedding: self.token_embedding,
-            layers: self.layers,
+            layers,
             final_norm: self.final_norm,
             lm_head: self.lm_head,
         })

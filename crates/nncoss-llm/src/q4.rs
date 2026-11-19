@@ -27,6 +27,14 @@ impl Default for Weight {
 }
 
 impl Weight {
+    /// 全部权重为零。Q4 只需检查每行的 scale：scale 为零时整行还原值都是零。
+    pub(crate) fn is_zero(&self) -> bool {
+        match self {
+            Self::F32(values) => values.iter().all(|value| *value == 0.0),
+            Self::Q4(matrix) => (0..matrix.rows).all(|row| matrix.row_scale(row) == 0.0),
+        }
+    }
+
     pub fn into_f32(self) -> Vec<f32> {
         match self {
             Self::F32(values) => values,

@@ -13,6 +13,7 @@ mod session;
 #[cfg(test)]
 mod test_utils;
 
+pub use cache::KvPrecision;
 pub use error::Error;
 pub use model::{Config, Model, ModelLoader, RopeMode, TensorLayout, tensor_layout};
 pub use sampler::SamplingConfig;

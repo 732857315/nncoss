@@ -3,8 +3,8 @@ use std::sync::Arc;
 use crate::cache::{KvCache, KvLayer, KvPrecision};
 use crate::model::Model;
 use crate::ops::{
-    AttentionShape, add_assign, apply_rope_table, attention, rms_norm_heads, rms_norm_into,
-    rope_frequencies, rope_table, swiglu,
+    AttentionShape, add_assign, apply_rope_table, attention, hadamard_heads, rms_norm_heads,
+    rms_norm_into, rope_frequencies, rope_table, swiglu,
 };
 use crate::q4::{Activation, Linear, linear_into, linear_many};
 use crate::sampler::Sampler;
@@ -132,6 +132,22 @@ impl Session {
         self.cache.reset();
         self.history.clear();
         self.has_logits = false;
+    }
+
+    /// 更换 KV Cache 的存储精度并清空会话。Q4 模型默认 f16，f32 模型默认 f32。
+    pub fn set_kv_precision(&mut self, precision: KvPrecision) {
+        let config = &self.model.config;
+        self.cache = KvCache::new(
+            config.layer_count,
+            config.kv_head_count,
+            config.head_dim,
+            precision,
+        );
+        self.reset();
+    }
+
+    pub fn kv_precision(&self) -> KvPrecision {
+        self.cache.precision()
     }
 
     pub fn set_speculation(&mut self, enabled: bool) {
@@ -337,6 +353,9 @@ impl Session {
         let start = cache.len();
         let (hidden, q_dim, kv_dim) = (config.hidden_size, config.q_dim(), config.kv_dim());
         let half = config.head_dim / 2;
+        // int8 缓存按行缩放，键里少数离群维度会吃掉其余维度的精度。对 Q、K、V 做同一个
+        // 正交 Hadamard 旋转把离群值摊开：Q·K 不变，注意力输出再旋转回来即可。
+        let rotate = cache.precision() == KvPrecision::I8 && config.head_dim.is_power_of_two();
         let shape = AttentionShape {
             head_count: config.head_count,
             kv_head_count: config.kv_head_count,
@@ -384,7 +403,7 @@ impl Session {
             for offset in 0..count {
                 let query = &mut scratch.query[offset * q_dim..(offset + 1) * q_dim];
                 let key = &mut scratch.key[offset * kv_dim..(offset + 1) * kv_dim];
-                let value = &scratch.value[offset * kv_dim..(offset + 1) * kv_dim];
+                let value = &mut scratch.value[offset * kv_dim..(offset + 1) * kv_dim];
                 if let (Some(q_norm), Some(k_norm)) = (&layer.q_norm, &layer.k_norm) {
                     rms_norm_heads(
                         query,
@@ -416,6 +435,11 @@ impl Session {
                     table,
                     config.rope_mode,
                 );
+                if rotate {
+                    hadamard_heads(query, config.head_dim);
+                    hadamard_heads(key, config.head_dim);
+                    hadamard_heads(value, config.head_dim);
+                }
                 cache.write(layer_index, start + offset, key, value, *max_context)?;
             }
             #[cfg(test)]
@@ -434,6 +458,12 @@ impl Session {
                 KvLayer::F16(view) => {
                     attention(queries, view, shape, start, &mut scratch.scores, attended)
                 }
+                KvLayer::I8(view) => {
+                    attention(queries, view, shape, start, &mut scratch.scores, attended)
+                }
+            }
+            if rotate {
+                hadamard_heads(attended, config.head_dim);
             }
             linear_many(
                 &scratch.attended[..count * q_dim],
@@ -560,6 +590,37 @@ mod tests {
         incremental.decode(tokens[3]).unwrap();
         assert_close(incremental.last_logits().unwrap(), &expected);
         assert_eq!(incremental.position(), tokens.len());
+    }
+
+    #[test]
+    fn int8_kv_cache_tracks_full_precision_logits() {
+        let model = Arc::new(tiny_model());
+        let tokens = [1, 2, 3, 0, 4, 2, 1];
+        let expected = reference_logits(&model, &tokens);
+        let mut session = Session::new(model, 0).unwrap();
+        session.set_kv_precision(KvPrecision::I8);
+        assert_eq!(session.kv_precision(), KvPrecision::I8);
+        session.prefill(&tokens[..3]).unwrap();
+        for token in &tokens[3..] {
+            session.decode(*token).unwrap();
+        }
+        let actual = session.last_logits().unwrap();
+        let spread = expected
+            .iter()
+            .fold(0.0_f32, |peak, value| peak.max(value.abs()));
+        for (actual, expected) in actual.iter().zip(&expected) {
+            assert!(
+                (actual - expected).abs() < 0.02 * spread,
+                "{actual} != {expected}"
+            );
+        }
+        assert_ne!(
+            actual,
+            expected.as_slice(),
+            "int8 缓存应当有量化误差，否则没有生效"
+        );
+        session.set_kv_precision(KvPrecision::F16);
+        assert_eq!(session.position(), 0);
     }
 
     #[test]

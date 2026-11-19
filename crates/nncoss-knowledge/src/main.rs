@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
-use nncoss_knowledge::{Agent, AgentConfig, KnowledgeBase, opening_prompt};
+use nncoss_knowledge::{Agent, AgentConfig, KnowledgeBase, opening_prompt, prefetch_prompt};
 use nncoss_llm::{Model, ModelLoader};
 use serde::{Deserialize, Serialize};
 use tokenizers::Tokenizer;
@@ -14,7 +14,7 @@ const USAGE: &str = "用法：
   nncoss-know search --store <目录> --query <问题> [--limit N]
   nncoss-know ask    --store <目录> --model <模型> --tokenizer <分词器> --question <问题> [选项]
   nncoss-know batch  --store <目录> --model <模型> --tokenizer <分词器> --input <题目.jsonl> --output <结果.jsonl> [选项]
-  nncoss-know prompt (--question <问题> | --input <题目.jsonl> --output <提示.jsonl>) [选项]
+  nncoss-know prompt (--question <问题> | --input <题目.jsonl> --output <提示.jsonl>) [--prefetch --store <目录>] [选项]
 
 选项：
   --think                启用思考模式
@@ -157,8 +157,17 @@ struct PromptRecord<'a> {
 }
 
 fn prompts(options: &Options) -> Result<(), String> {
+    let base = if options.config.prefetch && options.config.tools {
+        Some(KnowledgeBase::open(&required(&options.store, "--store")?)?)
+    } else {
+        None
+    };
+    let render = |question: &str| match &base {
+        Some(base) => prefetch_prompt(base, &options.config, question, &mut Vec::new()).0,
+        None => opening_prompt(&options.config, question),
+    };
     if let Some(question) = &options.query {
-        print!("{}", opening_prompt(&options.config, question));
+        print!("{}", render(question));
         return Ok(());
     }
     let input = required(&options.input, "--input")?;
@@ -178,7 +187,7 @@ fn prompts(options: &Options) -> Result<(), String> {
             .map_err(|error| format!("第 {} 行格式错误: {error}", number + 1))?;
         let record = PromptRecord {
             id: &question.id,
-            prompt: opening_prompt(&options.config, &question.question),
+            prompt: render(&question.question),
         };
         writeln!(
             writer,

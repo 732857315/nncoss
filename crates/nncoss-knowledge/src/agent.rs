@@ -14,6 +14,7 @@ const PASSAGE_CHARS: usize = 360;
 const PAGE_CHARS: usize = 4000;
 const PREFETCH_CHARS: usize = 300;
 const MIN_SUPPORT: f32 = 0.6;
+const ROUNDS_USED_UP: &str = "工具调用次数已用完，请根据已有信息直接作答。";
 const INSTRUCTION: &str = "你的知识保存在外部知识库里，知识库中有幼儿园到高中的课本、计算机与算法资料，以及你以前记下的笔记。回答需要事实、概念、公式、方法或课文内容的问题时，先用 search_knowledge 查找，再依据查到的内容作答；学到以后用得上的知识时，用 write_note 记下来。";
 const BROWSE_INSTRUCTION: &str = "需要网页上的内容时，用 browse 打开网址阅读。";
 const LEARN_PROMPT: &str = "请把刚才从资料中学到、以后解决同类问题时用得上的知识归纳成一条简洁的笔记。只写知识本身（概念、规律、公式、方法或事实），不要写本题的答案，也不要写推理过程。";
@@ -103,6 +104,42 @@ pub fn visible(text: &str) -> &str {
     text.trim()
 }
 
+/// 模型常把题目里的 LaTeX（如 `\quad`、`\left`）原样抄进 JSON 字符串，
+/// 这些反斜杠不构成合法转义。把它们改成字面反斜杠后再解析一次。
+fn repair_escapes(body: &str) -> String {
+    let chars: Vec<char> = body.chars().collect();
+    let mut repaired = String::with_capacity(body.len() + 8);
+    let mut index = 0;
+    while index < chars.len() {
+        let current = chars[index];
+        if current != '\\' {
+            repaired.push(current);
+            index += 1;
+            continue;
+        }
+        let next = chars.get(index + 1).copied();
+        let unicode = next == Some('u')
+            && chars.len() >= index + 6
+            && chars[index + 2..index + 6].iter().all(char::is_ascii_hexdigit);
+        match next {
+            Some('"' | '\\' | '/' | 'b' | 'f' | 'n' | 'r' | 't') => {
+                repaired.push('\\');
+                repaired.push(chars[index + 1]);
+                index += 2;
+            }
+            Some('u') if unicode => {
+                repaired.push('\\');
+                index += 1;
+            }
+            _ => {
+                repaired.push_str("\\\\");
+                index += 1;
+            }
+        }
+    }
+    repaired
+}
+
 pub fn parse_tool_calls(text: &str) -> Vec<Result<ToolCall, String>> {
     let mut calls = Vec::new();
     let mut rest = text;
@@ -113,6 +150,9 @@ pub fn parse_tool_calls(text: &str) -> Vec<Result<ToolCall, String>> {
             None => (after, ""),
         };
         let parsed = serde_json::from_str::<Value>(body.trim())
+            .or_else(|error| {
+                serde_json::from_str::<Value>(&repair_escapes(body.trim())).map_err(|_| error)
+            })
             .map_err(|error| format!("工具调用不是合法的 JSON：{error}"))
             .and_then(|value| {
                 let name = value
@@ -456,7 +496,7 @@ impl<'a> Agent<'a> {
             prompt.push_str(&prefetch_turn(&query, &output, self.config.thinking));
         }
         answer.transcript.push_str(&prompt);
-        let mut rounds = 0;
+        let (mut rounds, mut last_turn) = (0, false);
         loop {
             let text = self.turn(&mut session, &prompt, self.config.turn_tokens, &mut answer)?;
             answer.transcript.push_str(&text);
@@ -466,17 +506,25 @@ impl<'a> Agent<'a> {
             } else {
                 Vec::new()
             };
-            if calls.is_empty() || rounds >= self.config.tool_rounds {
+            if calls.is_empty() || last_turn {
                 answer.reply = visible(&text).to_string();
                 break;
             }
-            rounds += 1;
-            let responses: Vec<String> = calls
-                .iter()
-                .map(|call| match call {
-                    Ok(call) => self.run_tool(call, question, &mut sources, &mut answer),
-                    Err(error) => error.clone(),
-                })
+            let outputs: Vec<String> = if rounds >= self.config.tool_rounds {
+                last_turn = true;
+                vec![ROUNDS_USED_UP.to_string(); calls.len()]
+            } else {
+                rounds += 1;
+                calls
+                    .iter()
+                    .map(|call| match call {
+                        Ok(call) => self.run_tool(call, question, &mut sources, &mut answer),
+                        Err(error) => error.clone(),
+                    })
+                    .collect()
+            };
+            let responses: Vec<String> = outputs
+                .into_iter()
                 .map(|output| format!("<tool_response>\n{output}\n</tool_response>"))
                 .collect();
             let body = format!(
@@ -521,6 +569,9 @@ mod tests {
         assert_eq!(call.name, "search_knowledge");
         assert_eq!(call.arguments["query"], "光合作用");
         assert!(parse_tool_calls("<tool_call>{bad json}</tool_call>")[0].is_err());
+        let latex = r#"<tool_call>{"name": "search_knowledge", "arguments": {"query": "$(\quad)$ \frac{1}{2}\n一 \underline{x}"}}</tool_call>"#;
+        let call = parse_tool_calls(latex).remove(0).unwrap();
+        assert_eq!(call.arguments["query"], "$(\\quad)$ \u{c}rac{1}{2}\n一 \\underline{x}");
         assert!(parse_tool_calls("<tool_call>{\"arguments\": {}}</tool_call>")[0].is_err());
         assert!(parse_tool_calls("没有工具调用").is_empty());
     }

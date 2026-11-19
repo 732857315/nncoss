@@ -11,6 +11,7 @@
 | 路径 | 内容 | 入库 | 来源与许可 |
 |---|---|---|---|
 | `eval/gaokao/` | 2010–2022 年高考客观题 14 类共 1781 道，含标准答案与解析 | 是 | [GAOKAO-Bench](https://github.com/OpenLMLab/GAOKAO-Bench) 的 `Data/Objective_Questions/`，原样复制；Apache License 2.0，许可证原文见 `eval/gaokao/LICENSE` |
+| `eval/gaokao/subjective/` | 2010–2022 年高考主观题 18 类共 1030 道（解答题、填空题、阅读、默写、写作技能、改错等），含参考答案与分值 | 是 | GAOKAO-Bench 的 `Data/Subjective_Questions/`，原样复制；许可同上 |
 | `eval/code_contests/test.parquet` | 165 道 Codeforces 竞赛题（难度 800–3500），含公开、隐藏与生成的测试数据 | 否 | DeepMind [CodeContests](https://github.com/google-deepmind/code_contests) 测试集，CC BY 4.0，托管在 [Hugging Face](https://huggingface.co/datasets/deepmind/code_contests) |
 | `knowledge/oiwiki.jsonl` | OI Wiki 的算法与计算机知识，按标题切成 12138 段，每段带出处 | 是（LFS） | [OI Wiki](https://github.com/OI-wiki/OI-wiki)，CC BY-SA 4.0 与 The Star And Thank Author License；本文件作为改编作品同样按 CC BY-SA 4.0 提供 |
 | `knowledge/textbooks-manifest.json` | 选用的 318 册小学、初中、高中课本清单：全部学科，每科一个版本（优先人教版、统编版），另加 19 套初中数学中考真题与练习；记录源仓库路径、分卷大小与 Git 对象哈希 | 是 | 课本来自 [ChinaTextbook](https://github.com/TapXWorld/ChinaTextbook)，版权归各出版社所有 |

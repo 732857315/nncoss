@@ -1,6 +1,6 @@
 import json, sys, time
 from pathlib import Path
-ROOT = Path("/Users/admin/Desktop/prj2026/nncoss")
+ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "tools"))
 sys.path.insert(0, str(Path(__file__).parent))
 from check_real_llm import checked, file_chunks

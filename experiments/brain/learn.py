@@ -19,7 +19,7 @@ HERE = Path(__file__).parent
 sys.path.insert(0, str(HERE))
 import school
 
-ROOT = Path("/Users/admin/Desktop/prj2026/nncoss")
+ROOT = Path(__file__).resolve().parents[2]
 END = "<|im_end|>"
 TURN = "<|im_start|>assistant\n<think>\n\n</think>\n\n"
 ASK = {

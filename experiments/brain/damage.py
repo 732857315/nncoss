@@ -6,7 +6,7 @@ import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 sys.path.insert(0, str(Path(__file__).parent))
 import data
-ROOT = Path("/Users/admin/Desktop/prj2026/nncoss")
+ROOT = Path(__file__).resolve().parents[2]
 torch.set_grad_enabled(False)
 tokenizer = AutoTokenizer.from_pretrained(ROOT / "model/Qwen3-0.6B")
 model = AutoModelForCausalLM.from_pretrained(ROOT / "model/Qwen3-0.6B", dtype=torch.float32).eval()

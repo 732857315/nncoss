@@ -291,6 +291,77 @@ impl Slot {
     }
 }
 
+impl Slot {
+    fn name(self) -> &'static str {
+        match self {
+            Self::TokenEmbedding => "embed_tokens",
+            Self::AttnNorm => "input_layernorm",
+            Self::QProj => "q_proj",
+            Self::KProj => "k_proj",
+            Self::VProj => "v_proj",
+            Self::QBias => "q_bias",
+            Self::KBias => "k_bias",
+            Self::VBias => "v_bias",
+            Self::QNorm => "q_norm",
+            Self::KNorm => "k_norm",
+            Self::OProj => "o_proj",
+            Self::FfnNorm => "post_attention_layernorm",
+            Self::GateProj => "gate_proj",
+            Self::UpProj => "up_proj",
+            Self::DownProj => "down_proj",
+            Self::FinalNorm => "norm",
+            Self::LmHead => "lm_head",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TensorLayout {
+    pub kind: &'static str,
+    pub layer: Option<usize>,
+    pub offset: usize,
+    pub byte_count: usize,
+    pub rows: usize,
+    pub columns: usize,
+    pub quantized: bool,
+}
+
+pub fn tensor_layout(bytes: &[u8]) -> Result<(Config, Vec<TensorLayout>)> {
+    let header = bytes
+        .get(..HEADER_LENGTH)
+        .ok_or(Error::InvalidModel("模型数据被截断"))?;
+    let config = parse_header(header)?;
+    let mut tensors = Vec::new();
+    let mut offset = HEADER_LENGTH;
+    let mut finished = 0;
+    let mut slot = Some(Slot::TokenEmbedding);
+    while let Some(current) = slot {
+        let (rows, columns) = current.shape(&config);
+        let byte_count = current.byte_count(&config)?;
+        let global = matches!(
+            current,
+            Slot::TokenEmbedding | Slot::FinalNorm | Slot::LmHead
+        );
+        tensors.push(TensorLayout {
+            kind: current.name(),
+            layer: (!global).then_some(finished),
+            offset,
+            byte_count,
+            rows,
+            columns,
+            quantized: config.quantized && current.is_matrix(),
+        });
+        offset = offset
+            .checked_add(byte_count)
+            .ok_or(Error::InvalidModel("模型长度溢出"))?;
+        if current == Slot::DownProj {
+            finished += 1;
+        }
+        slot = current.next(&config, finished);
+    }
+    Ok((config, tensors))
+}
+
 #[derive(Debug)]
 struct Tensor {
     slot: Slot,
@@ -617,6 +688,32 @@ mod tests {
         let mut trailing = bytes;
         trailing.push(0);
         assert!(Model::from_bytes(&trailing).is_err());
+    }
+
+    #[test]
+    fn tensor_layout_covers_every_byte_in_loader_order() {
+        use crate::test_utils::TinySpec;
+        for spec in TinySpec::wide_variants() {
+            let bytes = spec.bytes();
+            let (config, tensors) = tensor_layout(&bytes).unwrap();
+            assert_eq!(config, *spec.model().config());
+            assert_eq!(tensors[0].kind, "embed_tokens");
+            assert_eq!(tensors[0].offset, HEADER_LENGTH);
+            for pair in tensors.windows(2) {
+                assert_eq!(pair[0].offset + pair[0].byte_count, pair[1].offset);
+            }
+            let last = tensors.last().unwrap();
+            assert_eq!(last.offset + last.byte_count, bytes.len());
+            assert_eq!(last.kind, if spec.tied { "norm" } else { "lm_head" });
+            let downs: Vec<_> = tensors
+                .iter()
+                .filter(|t| t.kind == "down_proj")
+                .map(|t| t.layer)
+                .collect();
+            assert_eq!(downs, (0..spec.layers).map(Some).collect::<Vec<_>>());
+            assert!(tensors.iter().all(|t| !t.quantized));
+        }
+        assert!(tensor_layout(&tiny_model_bytes()[..10]).is_err());
     }
 
     #[test]

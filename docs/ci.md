@@ -20,10 +20,11 @@
 `llm-acceptance` 执行以下检查：
 
 - `cargo fmt --all --check`。
-- `cargo clippy -p nncoss-llm -p nncoss-web -p nncoss-knowledge --all-targets -- -D warnings`。
+- `cargo clippy -p nncoss-llm -p nncoss-web -p nncoss-knowledge -p nncoss-edit --all-targets -- -D warnings`。
 - 在 debug 与 release 下执行 `cargo test -p nncoss-llm`，覆盖模型解析与非法头字段、分块加载在各特性组合、每个二分切点、每个截断长度与各错误路径上同整块加载的一致性、手算 RoPE 与 GQA 头映射、采样、KV Cache 扩容失败与回退、prefill／decode 失败后的状态保持，以及多层 GQA 模型各特性组合上的增量解码与无缓存参考前向对拍，并验证 release 的原生 ABI panic 映射、分配错误回归和测试模型与已提交夹具逐字节一致。
 - 执行 `cargo test -p nncoss-web`，覆盖表单解码、HTML 转义、Cookie、mock 对话历史和重置。
 - 执行 `cargo test -p nncoss-knowledge`，覆盖中英文检索分词与 BM25 排序、段落导入与笔记持久化、笔记去重、工具调用解析、Qwen 工具模板和网页正文提取，不加载模型、不访问网络。
+- 执行 `cargo test -p nncoss-edit`，覆盖 f32 与 Q4 模型上按神经元、KV 头和 Norm 元素的缩放、越界与非法改动的拒绝，以及改动后模型仍能被加载器正确加载。
 - 使用 `python3 -m unittest discover -s tools -p "test_*.py"` 验证导出器拒绝不支持的 bias，并检查 QKV bias 与 QK norm 的跨层一致性。
 - 分别构建原生与 `wasm32-unknown-unknown` 发布产物，并构建 `nncoss-web` 原生发布产物。
 - 执行 `tools/check_web_ui.py`，以 `--mock` 启动本地 HTTP 服务，验证健康检查、POST 表单、多轮历史、UTF-8、HTML 转义、空消息、重置和独立 Cookie 会话，不加载模型。

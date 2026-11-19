@@ -3,3 +3,6 @@ __pycache__/
 *.pyc
 /model/**/.cache/
 .DS_Store
+/model/Qwen3-1.7B/*
+!/model/Qwen3-1.7B/*.nncossllm
+/data/eval/code_contests/

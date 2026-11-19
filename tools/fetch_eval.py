@@ -15,8 +15,11 @@ def download(url, target):
     raise SystemExit(f"下载失败：{url}")
 
 
+ROOT = Path(__file__).resolve().parents[1]
+
+
 def main():
-    root = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("data/eval")
+    root = Path(sys.argv[1]) if len(sys.argv) > 1 else ROOT / "modelbook/eval"
     target = root / "code_contests" / "test.parquet"
     download(CODE_CONTESTS, target)
     print(f"已下载 {target}（{target.stat().st_size} 字节）")

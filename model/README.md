@@ -2,7 +2,7 @@
 
 模型文件不随仓库分发，只记录来源和生成方法。按下面的步骤可以在本地复现 `model/` 下的全部文件，每步给出了测试机上得到的文件大小和 SHA-256，便于核对。`model/` 目录中除本说明外的内容都不纳入版本库。
 
-测试机为 Intel Core i7-9750H（6 核 12 线程、16 GiB 内存、macOS）。Python 3.11 依赖见 [experiments/requirements.txt](../experiments/requirements.txt)。所有命令都从仓库根目录执行。
+测试机为 Intel Core i7-9750H（6 核 12 线程、16 GiB 内存、macOS）。Python 3.11 依赖见 [tools/knowledge_requirements.txt](../tools/knowledge_requirements.txt)。所有命令都从仓库根目录执行。
 
 ## 基础模型
 
@@ -49,30 +49,11 @@ python3 tools/distill_q4_llm.py --model model/Qwen3-0.6B --input /tmp/qwen3-0.6b
 
 ## 自我学习模型（对照组）
 
-`Qwen3-0.6B-school-r1/` 是在 Qwen3-0.6B 上做一轮拒绝采样自我学习得到的模型，继承 Apache License 2.0。实验过程与测评结果见[实验记录](../docs/brain-experiments.md)。复现步骤：
+`Qwen3-0.6B-school-r1/` 是在 Qwen3-0.6B 上做一轮拒绝采样自我学习得到的模型，继承 Apache License 2.0。实验过程与测评结果见[实验记录](../docs/brain-experiments.md)。
 
-```bash
-cargo build --release -p nncoss-llm
-bash experiments/brain/round1.sh
-```
-
-脚本依次执行四步，生成的文件都写入 `experiments/brain/runs/`：
-
-1. 用 Q4 模型在中小学训练题上收集成功经验；
-2. 用 LoRA 训练并合并权重；
-3. 按上面的 Q4 流程导出；
-4. 在四种条件下测评。
-
-在测试机上共约 12 小时。
+生成它的是 Python 训练流程。按项目约定，功能代码须用 Rust 实现，所以这套流程已经删除，不再提供复现命令。当时的脚本和经验数据可以在提交 `aa625fd` 中查看。测试机上生成的文件如下：
 
 | 文件 | 字节数 | SHA-256 |
 |---|---|---|
 | `Qwen3-0.6B-school-r1/model.safetensors`（f32 合并权重） | 3,006,565,056 | `9a2414a22822a1b830dd3325517906aad404ae1662b5b91c6c5920d5a037dc66` |
 | `Qwen3-0.6B-school-r1/qwen3-0.6b-school-r1-q4.nncossllm` | 318,862,912 | `f473d21bab9abb58b0337eef72b8152e4b448eb08c51c6de1308976e64411d85` |
-
-经验收集使用固定随机种子，但原生引擎在多线程下的采样结果与 PyTorch 训练都不保证跨机器逐位一致，复现得到的模型与上表的文件可能不同。可以对比的是第一轮的测评结果。实验当时收集到的经验数据保存在 `experiments/brain/experience_r1.json`；直接用这份数据训练，可以跳过耗时最长的收集步骤：
-
-```bash
-python3 experiments/brain/improve.py train --source model/Qwen3-0.6B --examples experiments/brain/experience_r1.json \
-  --output experiments/brain/runs/models/school-r1 --max-run 0
-```

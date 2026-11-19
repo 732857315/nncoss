@@ -8,7 +8,7 @@ import time
 from collections import defaultdict
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(__file__).resolve().parents[1]
 SUBJECTS = {
     "数学I": "2010-2022_Math_I_MCQs.json",
     "数学II": "2010-2022_Math_II_MCQs.json",
@@ -73,7 +73,7 @@ def main():
     parser.add_argument("--per-subject", type=int, default=12)
     parser.add_argument("--seed", default="gaokao")
     parser.add_argument("--turn-tokens", type=int, default=0)
-    parser.add_argument("--work", type=Path, default=ROOT / "experiments/knowledge/runs")
+    parser.add_argument("--work", type=Path, default=ROOT / "runs")
     args = parser.parse_args()
     work = args.work / args.label
     work.mkdir(parents=True, exist_ok=True)

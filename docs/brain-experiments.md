@@ -178,42 +178,17 @@
 
 ## 复现
 
-实验用到的模型都不随仓库分发。Qwen3-0.6B 从 Hugging Face 下载，第一轮模型由脚本重新生成；来源、生成命令和测试机上各文件的 SHA-256 见[模型说明](../model/README.md)。第一轮模型是后续直接改写权重实验的**对照组**，每个改法都要同时与原模型和它比较。
+探索阶段的脚本和中间数据已从仓库删除，包括：
+- 打分、裁剪和拆除分析的脚本；
+- 中小学题库；
+- Python 版的测评与自我学习流程；
+- 两轮的经验数据和逐题测评记录。
 
-环境要求：Python 3.11，依赖固定在 [experiments/requirements.txt](../experiments/requirements.txt)；另外先执行 `cargo build --release -p nncoss-llm`，生成原生引擎动态库。以下命令在仓库根目录执行：
+其中作答、检索、训练和改写权重属于功能代码，按项目约定应当用 Rust 实现。现在的替代：
+- 检索与作答由 `nncoss-knowledge` 承担；
+- 直接改写权重由 `nncoss-edit` 承担；
+- 自我学习训练不再继续。
 
-| 步骤 | 命令 | 测试机耗时 |
-|---|---|---|
-| 1.1 节打分与裁剪 | `python3 experiments/brain/generate.py experiments/brain/chats.json`，再执行 `score.py`；之后对每种方案运行 `prune.py <输出目录> <宽度> <方法> <λ>` 和 `evaluate.py <输出目录>` | 每种方案约 6 分钟 |
-| 1.2 节拆除实验 | `python3 experiments/brain/massive.py`、`damage.py neurons`、`sink.py` | 共约 15 分钟 |
-| 三、基准测评 | `python3 experiments/brain/agent.py --label base` | 约 2.5 小时 |
-| 四、第一轮自我学习 | `bash experiments/brain/round1.sh` | 约 12 小时 |
-| 四、第二轮自我学习 | `bash experiments/brain/round2.sh` | 约 12 小时 |
+本文已经记录了全部结论和关键数据。需要查看原始脚本和数据时，可以检出提交 `aa625fd` 中的 `experiments/brain/` 目录。
 
-题库由 `school.py` 按固定随机种子生成，测验子集也是固定的。
-
-实验当时的数据随仓库保存，可以直接用来对比或跳过耗时的步骤：
-
-| 位置 | 内容 |
-|---|---|
-| `experiments/brain/experience_r1.json`、`experience_r2.json` | 两轮收集到的成功经验（训练数据）；用 `improve.py train --examples` 可以直接训练，跳过收集步骤 |
-| `experiments/brain/agent_reports/` | 原模型与第一轮模型在四种条件下的逐题测评记录，包括完整对话、工具调用和反馈 |
-| `experiments/brain/reports/` | 1.1 节裁剪实验的问答评测结果 |
-| `experiments/brain/chats.json`、`scores.npz` | 1.1 节使用的"大脑"对话与神经元重要性分数 |
-
-经验收集和训练都使用了固定随机种子。但多线程采样和 PyTorch 训练不保证跨机器逐位一致，复现得到的模型文件可能与测试机上的不同。可以比较的是测评结果。
-
-实验脚本放在 `experiments/brain/`：
-
-| 文件 | 作用 |
-|---|---|
-| `data.py`、`generate.py`、`score.py`、`prune.py`、`evaluate.py`、`analyze.py` | 生成数据、打分、裁剪与问答评测（1.1 节） |
-| `massive.py`、`damage.py`、`sink.py` | 巨量激活、拆除实验、注意力汇点（1.2 节） |
-| `tune.py` | 强度系数优化（1.3 节，已中止；需要下载的 WikiText-2 与 CMRC2018） |
-| `school.py`、`kb.py` | 中小学题库与知识库检索 |
-| `agent.py` | 原生引擎测评：四种条件、工具调用、反馈重答 |
-| `improve.py`、`learn.py` | 收集经验、LoRA 训练与 Q4 导出 |
-| `round1.sh`、`round2.sh` | 两轮自我学习的完整流程，输出写入 `experiments/brain/runs/` |
-| `filekb.py`、`filerun.py` | 早期"文件现学"测试草稿；用的是生成的虚构资料，后来按要求改用真实课本，没有正式运行 |
-
-这些脚本是实验用的辅助脚本，依赖 PyTorch 和 transformers，不在 CI 检查范围内。
+实验用到的模型不随仓库分发，来源和生成方法见[模型说明](../model/README.md)。

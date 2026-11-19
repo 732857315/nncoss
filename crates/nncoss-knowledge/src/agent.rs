@@ -120,7 +120,9 @@ fn repair_escapes(body: &str) -> String {
         let next = chars.get(index + 1).copied();
         let unicode = next == Some('u')
             && chars.len() >= index + 6
-            && chars[index + 2..index + 6].iter().all(char::is_ascii_hexdigit);
+            && chars[index + 2..index + 6]
+                .iter()
+                .all(char::is_ascii_hexdigit);
         match next {
             Some('"' | '\\' | '/' | 'b' | 'f' | 'n' | 'r' | 't') => {
                 repaired.push('\\');
@@ -183,6 +185,49 @@ pub fn prefetch_turn(query: &str, output: &str, thinking: bool) -> String {
         "<|im_start|>assistant\n{NO_THINK}<tool_call>\n{{\"name\": \"search_knowledge\", \"arguments\": {arguments}}}\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n{output}\n</tool_response><|im_end|>\n{}",
         assistant_open(thinking)
     )
+}
+
+/// 检索知识库并格式化成工具回复；引用到的课本段落记入 `sources`，供笔记依据检查使用。
+fn search_output(
+    base: &KnowledgeBase,
+    query: &str,
+    limit: usize,
+    sources: &mut Vec<String>,
+) -> String {
+    let hits = base.search(query, limit);
+    if hits.is_empty() {
+        return "知识库中没有找到相关内容".to_string();
+    }
+    hits.iter()
+        .map(|hit| match hit.kind {
+            Kind::Note => format!("[笔记 {}] {}", hit.id, hit.text),
+            Kind::Passage => {
+                if !sources.contains(&hit.id) {
+                    sources.push(hit.id.clone());
+                }
+                format!("[{}] {}", hit.source, truncate(&hit.text, PASSAGE_CHARS))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// 预取检索条件下模型开口前看到的完整提示：先用题目检索一次，把这次调用和结果写进对话。
+/// 返回提示和所用的检索词。
+pub fn prefetch_prompt(
+    base: &KnowledgeBase,
+    config: &AgentConfig,
+    question: &str,
+    sources: &mut Vec<String>,
+) -> (String, String) {
+    let query: String = question.chars().take(PREFETCH_CHARS).collect();
+    let output = search_output(base, &query, config.search_limit, sources);
+    let prompt = format!(
+        "{}<|im_start|>user\n{question}<|im_end|>\n{}",
+        system_prompt(config),
+        prefetch_turn(&query, &output, config.thinking)
+    );
+    (prompt, query)
 }
 
 fn truncate(text: &str, limit: usize) -> String {
@@ -437,22 +482,7 @@ impl<'a> Agent<'a> {
                     return "缺少 query 参数".to_string();
                 }
                 answer.searches.push(query.clone());
-                let hits = self.base.search(&query, self.config.search_limit);
-                if hits.is_empty() {
-                    return "知识库中没有找到相关内容".to_string();
-                }
-                hits.iter()
-                    .map(|hit| match hit.kind {
-                        Kind::Note => format!("[笔记 {}] {}", hit.id, hit.text),
-                        Kind::Passage => {
-                            if !sources.contains(&hit.id) {
-                                sources.push(hit.id.clone());
-                            }
-                            format!("[{}] {}", hit.source, truncate(&hit.text, PASSAGE_CHARS))
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n")
+                search_output(self.base, &query, self.config.search_limit, sources)
             }
             "write_note" => {
                 let content = argument("content");
@@ -479,22 +509,12 @@ impl<'a> Agent<'a> {
         let mut answer = Answer::default();
         let mut sources = Vec::new();
         let mut prompt = if self.config.prefetch && self.config.tools {
-            format!(
-                "{}<|im_start|>user\n{question}<|im_end|>\n",
-                system_prompt(&self.config)
-            )
+            let (prompt, query) = prefetch_prompt(self.base, &self.config, question, &mut sources);
+            answer.searches.push(query);
+            prompt
         } else {
             opening_prompt(&self.config, question)
         };
-        if self.config.prefetch && self.config.tools {
-            let query: String = question.chars().take(PREFETCH_CHARS).collect();
-            let call = ToolCall {
-                name: "search_knowledge".to_string(),
-                arguments: serde_json::json!({ "query": query }),
-            };
-            let output = self.run_tool(&call, question, &mut sources, &mut answer);
-            prompt.push_str(&prefetch_turn(&query, &output, self.config.thinking));
-        }
         answer.transcript.push_str(&prompt);
         let (mut rounds, mut last_turn) = (0, false);
         loop {
@@ -571,7 +591,10 @@ mod tests {
         assert!(parse_tool_calls("<tool_call>{bad json}</tool_call>")[0].is_err());
         let latex = r#"<tool_call>{"name": "search_knowledge", "arguments": {"query": "$(\quad)$ \frac{1}{2}\n一 \underline{x}"}}</tool_call>"#;
         let call = parse_tool_calls(latex).remove(0).unwrap();
-        assert_eq!(call.arguments["query"], "$(\\quad)$ \u{c}rac{1}{2}\n一 \\underline{x}");
+        assert_eq!(
+            call.arguments["query"],
+            "$(\\quad)$ \u{c}rac{1}{2}\n一 \\underline{x}"
+        );
         assert!(parse_tool_calls("<tool_call>{\"arguments\": {}}</tool_call>")[0].is_err());
         assert!(parse_tool_calls("没有工具调用").is_empty());
     }

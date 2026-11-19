@@ -609,7 +609,7 @@ fn load(path: &str) -> Result<Model, Box<dyn std::error::Error>> {
 
 ## 知识库与权重改写实验
 
-这部分是“大脑与知识分离”的探索性实验：模型只负责理解和推理，知识放在外部文件里现查现学；同时尝试不经训练、直接改写权重或网络结构来改进模型。实验过程与结果见[实验记录](docs/brain-experiments.md)，用到的资料见[外部资料](docs/modelbook.md)，模型见[模型说明](docs/models.md)。以下工具都是实验原型，不属于框架的公开接口。
+这部分是“大脑与知识分离”的探索性实验：模型只负责理解和推理，知识放在外部文件里现查现学；同时尝试不经训练、直接改写权重或网络结构来改进模型。方向、判断标准与每项改动的原因见[决策记录](docs/decisions.md)，实验过程与结果见[实验记录](docs/brain-experiments.md)，用到的资料见[外部资料](docs/modelbook.md)，模型见[模型说明](docs/models.md)。以下工具都是实验原型，不属于框架的公开接口。
 
 ### 外部知识库：nncoss-knowledge
 

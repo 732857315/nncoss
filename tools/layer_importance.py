@@ -25,7 +25,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--model-dir", type=Path, required=True)
     parser.add_argument("--own", type=Path, required=True, help="定位题上不用工具时的作答结果 answers.jsonl")
-    parser.add_argument("--work", type=Path, default=ROOT / "runs/layer_importance")
+    parser.add_argument("--work", type=Path, default=ROOT / "tmp/layer_importance")
     parser.add_argument("--know", type=Path, default=ROOT / "target/release/nncoss-know")
     parser.add_argument("--questions", type=int, default=32)
     parser.add_argument("--tokens", type=int, default=96)

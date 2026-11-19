@@ -70,7 +70,7 @@ def plan(mlp_effect, value_effect, neurons, heads, factor):
 def main():
     parser = argparse.ArgumentParser(description="测量模型在开口时选择调用检索工具的概率，并估计每个 MLP 神经元与 KV 头对这一选择的影响；只做测量，不改参数")
     parser.add_argument("--model-dir", type=Path, required=True, help="Hugging Face 格式的原始模型目录")
-    parser.add_argument("--work", type=Path, default=ROOT / "runs/tool_decision")
+    parser.add_argument("--work", type=Path, default=ROOT / "tmp/tool_decision")
     parser.add_argument("--per-subject", type=int, default=12)
     parser.add_argument("--neurons", type=int, default=64)
     parser.add_argument("--heads", type=int, default=4)

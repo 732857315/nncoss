@@ -1,6 +1,6 @@
 # 模型
 
-模型文件不随仓库分发，只记录来源和生成方法。按下面的步骤可以在本地复现 `model/` 下的全部文件，每步给出了测试机上得到的文件大小和 SHA-256，便于核对。`model/` 目录中除本说明外的内容都不纳入版本库。
+模型文件不随仓库分发，只在本文记录来源和生成方法。按下面的步骤可以在本地复现 `model/` 下的全部文件，每步给出了测试机上得到的文件大小和 SHA-256，便于核对。整个 `model/` 目录都不纳入版本库，中间文件写到同样不入库的 `tmp/`。
 
 测试机为 Intel Core i7-9750H（6 核 12 线程、16 GiB 内存、macOS）。Python 3.11 依赖见 [tools/knowledge_requirements.txt](../tools/knowledge_requirements.txt)。所有命令都从仓库根目录执行。
 
@@ -30,12 +30,12 @@ python3 tools/export_llm.py --model model/Qwen3-0.6B --output model/Qwen3-0.6B/q
 |---|---|---|
 | `Qwen3-0.6B/qwen3-0.6b-f32.nncossllm` | 2,384,199,744 | `1738cc3266f38cd84bee2ba9d9638fa0bca1902bbb46693e0871e8b76c97b632` |
 
-Q4 模型先做 GPTQ 校准量化，再蒸馏行 scale、Norm 与 bias。命令与效果见 [README 的校准量化与蒸馏一节](../README.md)，在测试机上约需 1 小时：
+Q4 模型先做 GPTQ 校准量化，再蒸馏行 scale、Norm 与 bias。命令与效果见 [README 的校准量化与蒸馏一节](../README.md#校准量化与蒸馏)，在测试机上约需 1 小时：
 
 ```bash
 CAL="tools/calibration/qwen3_chat.txt README.md crates/nncoss-llm/src/session.rs crates/nncoss-llm/src/model.rs tools/export_llm.py crates/nncoss-web/src/lib.rs"
-python3 tools/export_llm.py --model model/Qwen3-0.6B --output /tmp/qwen3-0.6b-q4-gptq.nncossllm --outtype q4 --calibration $CAL
-python3 tools/distill_q4_llm.py --model model/Qwen3-0.6B --input /tmp/qwen3-0.6b-q4-gptq.nncossllm \
+python3 tools/export_llm.py --model model/Qwen3-0.6B --output tmp/qwen3-0.6b-q4-gptq.nncossllm --outtype q4 --calibration $CAL
+python3 tools/distill_q4_llm.py --model model/Qwen3-0.6B --input tmp/qwen3-0.6b-q4-gptq.nncossllm \
   --output model/Qwen3-0.6B/qwen3-0.6b-q4.nncossllm --steps 300 --calibration $CAL
 ```
 
@@ -47,9 +47,39 @@ python3 tools/distill_q4_llm.py --model model/Qwen3-0.6B --input /tmp/qwen3-0.6b
 
 蒸馏使用 PyTorch 在 CPU 上训练，不同机器、线程数或库版本得到的 scale 会有微小差异，因此 Q4 文件不保证逐字节一致；可用 `tools/check_q4_llm.py` 检查质量是否达到 README 给出的水平。
 
+### Qwen3-1.7B
+
+1.7B 只做了不经校准的最小二乘 Q4 导出，用时几分钟，结果是确定的：
+
+```bash
+python3 tools/export_llm.py --model model/Qwen3-1.7B --output model/Qwen3-1.7B/qwen3-1.7b-q4-ls.nncossllm --outtype q4
+```
+
+| 文件 | 字节数 | SHA-256 |
+|---|---|---|
+| `Qwen3-1.7B/qwen3-1.7b-q4-ls.nncossllm` | 917,386,816 | `7307b7eb14782bd1e422a84cb77ead6dc502063d263e0254ca84bcc92caa0ab8` |
+
+GPTQ 校准导出在 16 GiB 内存的测试机上没有完成：第一次进程无报错退出，第二次运行 3 小时 40 分钟后占用约 3.6 GB 交换空间，已手动停止。因此 1.7B 目前没有校准版。在 0.6B 上，不经校准的 Q4 与 f32 的平均 KL 约为校准加蒸馏版本的两倍（0.215 对 0.111）；1.7B 的对应数值没有测过。
+
+## 直接改写权重得到的模型
+
+`nncoss-edit` 按改动计划改写 Q4 文件中的行 scale 或删除整层，几秒内完成，结果是确定的。用法见 [README](../README.md#知识库与权重改写实验)。目前保留的改写模型：
+
+```bash
+target/release/nncoss-edit apply --input model/Qwen3-0.6B/qwen3-0.6b-q4.nncossllm \
+  --output model/edits/qwen3-0.6b-q4-l1n2997-off.nncossllm \
+  --edit '{"op": "scale", "target": "mlp", "layer": 1, "index": [2997], "factor": 0.0}'
+```
+
+| 文件 | 字节数 | SHA-256 |
+|---|---|---|
+| `edits/qwen3-0.6b-q4-l1n2997-off.nncossllm`（第 1 层 2997 号神经元置零） | 318,862,912 | `51c5a98653a6acb5a5d89aa310aff1d4d7e2fca128b52590021a2ff827f8cd8c` |
+
+以上哈希以本文给出的 Q4 基础模型为输入；基础模型的 scale 若因重新蒸馏而不同，改写结果也会不同。
+
 ## 自我学习模型（对照组）
 
-`Qwen3-0.6B-school-r1/` 是在 Qwen3-0.6B 上做一轮拒绝采样自我学习得到的模型，继承 Apache License 2.0。实验过程与测评结果见[实验记录](../docs/brain-experiments.md)。
+`Qwen3-0.6B-school-r1/` 是在 Qwen3-0.6B 上做一轮拒绝采样自我学习得到的模型，继承 Apache License 2.0。实验过程与测评结果见[实验记录](brain-experiments.md)。
 
 生成它的是 Python 训练流程。按项目约定，功能代码须用 Rust 实现，所以这套流程已经删除，不再提供复现命令。当时的脚本和经验数据可以在提交 `aa625fd` 中查看。测试机上生成的文件如下：
 

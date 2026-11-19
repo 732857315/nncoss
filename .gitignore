@@ -1,9 +1,15 @@
 /target/
 __pycache__/
 *.pyc
-/model/**/.cache/
 .DS_Store
-/data/eval/code_contests/
-/model/*
-!/model/README.md
-/runs/
+# 模型文件不入库，来源与生成方法见 docs/models.md
+/model/
+# 外部资料的本地部分：课本 PDF 与全文受版权保护，其余可按 docs/modelbook.md 重新获取或生成
+/modelbook/textbooks/
+/modelbook/sources/
+/modelbook/eval/code_contests/
+/modelbook/knowledge/textbooks.jsonl
+/modelbook/knowledge/store-*/
+# 临时数据：实验输出、日志与中间文件
+/tmp/
+/runs

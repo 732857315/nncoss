@@ -20,6 +20,7 @@ const USAGE: &str = "用法：
   --no-tools             不提供任何工具（不使用知识库）
   --browse               提供 browse 工具，允许模型打开网页
   --no-learn             答题后不自动归纳笔记
+  --prefetch             作答前先用题目自动检索一次知识库（对照实验用）
   --turn-tokens N        每轮最多生成的 token 数，默认 1024
   --temperature T        采样温度，默认思考模式 0.6、非思考模式 0
   --top-k K / --top-p P  采样参数
@@ -52,6 +53,7 @@ struct Record<'a> {
     searches: &'a [String],
     pages: &'a [String],
     notes: &'a [u64],
+    rejected: usize,
     generated: usize,
     seconds: f64,
     transcript: &'a str,
@@ -85,6 +87,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Options, String> {
             "--no-tools" => options.config.tools = false,
             "--browse" => options.config.browse = true,
             "--no-learn" => options.config.learn = false,
+            "--prefetch" => options.config.prefetch = true,
             "--turn-tokens" => options.config.turn_tokens = number(value(&mut args, &arg)?, &arg)?,
             "--temperature" => options.temperature = Some(number(value(&mut args, &arg)?, &arg)?),
             "--top-k" => options.config.sampling.top_k = number(value(&mut args, &arg)?, &arg)?,
@@ -209,6 +212,7 @@ fn run(options: Options) -> Result<(), String> {
                     searches: &answer.searches,
                     pages: &answer.pages,
                     notes: &answer.notes,
+                    rejected: answer.rejected,
                     generated: answer.generated,
                     seconds: started.elapsed().as_secs_f64(),
                     transcript: &answer.transcript,

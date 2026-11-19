@@ -4,7 +4,9 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::index::Index;
+use std::collections::HashSet;
+
+use crate::index::{Index, terms};
 
 const PASSAGES: &str = "passages.jsonl";
 const NOTES: &str = "notes.jsonl";
@@ -175,6 +177,26 @@ impl KnowledgeBase {
         hits
     }
 
+    pub fn support(&self, text: &str, sources: &[String]) -> f32 {
+        let wanted: HashSet<String> = terms(text).into_iter().collect();
+        if wanted.is_empty() {
+            return 0.0;
+        }
+        let mut available = HashSet::new();
+        for passage in self
+            .passages
+            .iter()
+            .filter(|passage| sources.contains(&passage.id))
+        {
+            available.extend(terms(&passage.text));
+        }
+        wanted
+            .iter()
+            .filter(|term| available.contains(*term))
+            .count() as f32
+            / wanted.len() as f32
+    }
+
     pub fn add_note(
         &mut self,
         text: &str,
@@ -250,6 +272,26 @@ mod tests {
         let hits = reopened.search("合力 加速度", 2);
         assert_eq!(hits[0].kind, Kind::Note);
         assert_eq!(reopened.search("化学式", 1)[0].id, "p2");
+        fs::remove_dir_all(&directory).unwrap();
+        fs::remove_file(&input).unwrap();
+    }
+
+    #[test]
+    fn support_measures_how_much_of_a_note_comes_from_its_sources() {
+        let directory = scratch();
+        let input = directory.with_extension("jsonl");
+        fs::write(
+            &input,
+            "{\"id\":\"p1\",\"source\":\"初中/化学\",\"text\":\"不能用手接触药品，不要把鼻孔凑到容器口去闻药品的气味，不得尝任何药品的味道。\"}\n",
+        )
+        .unwrap();
+        let mut base = KnowledgeBase::open(&directory).unwrap();
+        base.import(&input).unwrap();
+        let sources = vec!["p1".to_string()];
+        assert!(base.support("取用药品时不能用手接触药品，不得尝药品的味道", &sources) > 0.65);
+        assert!(base.support("三不原则是不碰眼睛、不留下残留", &sources) < 0.6);
+        assert_eq!(base.support("不能用手接触药品", &[]), 0.0);
+        assert_eq!(base.support("，。", &sources), 0.0);
         fs::remove_dir_all(&directory).unwrap();
         fs::remove_file(&input).unwrap();
     }

@@ -1,7 +1,7 @@
 use std::ops::Range;
 
 use crate::RopeMode;
-use crate::cache::{F16, KvValue, KvView};
+use crate::cache::{F16, I8, KvValue, KvView, RowScales};
 use crate::pool::{SharedPtr, parallel_for};
 
 macro_rules! simd_fn {
@@ -289,6 +289,28 @@ simd_fn! {
     }
 }
 
+/// 归一化的 Walsh–Hadamard 变换，逐头原地进行。它是正交且自逆的，长度须为 2 的幂。
+pub(crate) fn hadamard_heads(values: &mut [f32], head_dim: usize) {
+    debug_assert!(head_dim.is_power_of_two());
+    let norm = (head_dim as f32).sqrt().recip();
+    for head in values.chunks_exact_mut(head_dim) {
+        let mut width = 1;
+        while width < head_dim {
+            for start in (0..head_dim).step_by(width * 2) {
+                for index in start..start + width {
+                    let (left, right) = (head[index], head[index + width]);
+                    head[index] = left + right;
+                    head[index + width] = left - right;
+                }
+            }
+            width *= 2;
+        }
+        for value in head.iter_mut() {
+            *value *= norm;
+        }
+    }
+}
+
 pub(crate) fn rope_frequencies(head_dim: usize, theta: f32) -> Vec<f32> {
     (0..head_dim / 2)
         .map(|index| {
@@ -381,10 +403,12 @@ pub(crate) const ATTENTION_CHUNK: usize = if cfg!(test) { 8 } else { 256 };
 const PARTIAL_LIMIT: usize = if cfg!(test) { 4096 } else { 1 << 22 };
 
 pub(crate) trait AttendValue: KvValue {
+    #[allow(clippy::too_many_arguments)]
     fn chunk(
         queries: &[f32],
         keys: &[Self],
         values: &[Self],
+        scales: RowScales<'_>,
         head_dim: usize,
         count: usize,
         scores: &mut [f32],
@@ -397,25 +421,31 @@ impl AttendValue for f32 {
         queries: &[f32],
         keys: &[f32],
         values: &[f32],
+        scales: RowScales<'_>,
         head_dim: usize,
         count: usize,
         scores: &mut [f32],
         partials: &mut [f32],
     ) {
+        let rows = Rows {
+            keys,
+            values,
+            scales,
+            head_dim,
+            count,
+        };
         #[cfg(target_arch = "x86_64")]
         if std::arch::is_x86_feature_detected!("avx2") {
             unsafe {
                 if head_dim % (LANES * 2) == 0 {
-                    chunk_blocked_f32(queries, keys, values, head_dim, count, scores, partials);
+                    chunk_blocked_f32(queries, rows, scores, partials);
                 } else {
-                    chunk_f32_avx2(queries, keys, values, head_dim, count, scores, partials);
+                    chunk_f32_avx2(queries, rows, scores, partials);
                 }
             }
             return;
         }
-        chunk_with(
-            queries, keys, values, head_dim, count, scores, partials, dot, axpy,
-        );
+        chunk_with(queries, rows, scores, partials, dot, axpy);
     }
 }
 
@@ -424,27 +454,90 @@ impl AttendValue for F16 {
         queries: &[f32],
         keys: &[F16],
         values: &[F16],
+        scales: RowScales<'_>,
         head_dim: usize,
         count: usize,
         scores: &mut [f32],
         partials: &mut [f32],
     ) {
+        let rows = Rows {
+            keys,
+            values,
+            scales,
+            head_dim,
+            count,
+        };
         #[cfg(target_arch = "x86_64")]
         if std::arch::is_x86_feature_detected!("avx2")
             && std::arch::is_x86_feature_detected!("f16c")
         {
             unsafe {
                 if head_dim % (LANES * 2) == 0 {
-                    chunk_blocked_f16(queries, keys, values, head_dim, count, scores, partials);
+                    chunk_blocked_f16(queries, rows, scores, partials);
                 } else {
-                    chunk_f16_avx2(queries, keys, values, head_dim, count, scores, partials);
+                    chunk_f16_avx2(queries, rows, scores, partials);
                 }
             }
             return;
         }
-        chunk_with(
-            queries, keys, values, head_dim, count, scores, partials, dot, axpy,
-        );
+        chunk_with(queries, rows, scores, partials, dot, axpy);
+    }
+}
+
+impl AttendValue for I8 {
+    fn chunk(
+        queries: &[f32],
+        keys: &[I8],
+        values: &[I8],
+        scales: RowScales<'_>,
+        head_dim: usize,
+        count: usize,
+        scores: &mut [f32],
+        partials: &mut [f32],
+    ) {
+        let rows = Rows {
+            keys,
+            values,
+            scales,
+            head_dim,
+            count,
+        };
+        #[cfg(target_arch = "x86_64")]
+        if std::arch::is_x86_feature_detected!("avx2") && head_dim % (LANES * 2) == 0 {
+            unsafe { chunk_blocked_i8(queries, rows, scores, partials) };
+            return;
+        }
+        chunk_with(queries, rows, scores, partials, dot, axpy);
+    }
+}
+
+/// 一段连续位置的 K/V 行及其缩放系数。
+#[derive(Clone, Copy)]
+struct Rows<'a, K> {
+    keys: &'a [K],
+    values: &'a [K],
+    scales: RowScales<'a>,
+    head_dim: usize,
+    count: usize,
+}
+
+/// 键的缩放系数乘到注意力分数上。顺序与各实现保持一致，保证逐位相同。
+#[inline(always)]
+fn scale_scores(scores: &mut [f32], scales: RowScales<'_>) {
+    if let Some((keys, _)) = scales {
+        for (score, factor) in scores.iter_mut().zip(keys) {
+            *score *= factor;
+        }
+    }
+}
+
+/// 值的缩放系数乘到注意力权重上；权重之和须在此之前算好。
+#[inline(always)]
+fn scale_weights(weights: &mut [f32], scales: RowScales<'_>) {
+    if let Some((_, values)) = scales {
+        for (weight, factor) in weights.iter_mut().zip(values) {
+            *weight *= factor;
+        }
     }
 }
 
@@ -586,18 +679,21 @@ unsafe fn axpy_f16_avx2(output: &mut [f32], scale: f32, values: &[F16]) {
 }
 
 #[inline(always)]
-#[allow(clippy::too_many_arguments)]
 fn chunk_with<K: KvValue>(
     queries: &[f32],
-    keys: &[K],
-    values: &[K],
-    head_dim: usize,
-    count: usize,
+    rows: Rows<'_, K>,
     scores: &mut [f32],
     partials: &mut [f32],
     dot: impl Fn(&[f32], &[K]) -> f32,
     axpy: impl Fn(&mut [f32], f32, &[K]),
 ) {
+    let Rows {
+        keys,
+        values,
+        scales,
+        head_dim,
+        count,
+    } = rows;
     let scale = (head_dim as f32).sqrt().recip();
     let width = head_dim + 2;
     for index in 0..count {
@@ -613,7 +709,9 @@ fn chunk_with<K: KvValue>(
         .chunks_exact_mut(count)
         .zip(partials.chunks_exact_mut(width))
     {
+        scale_scores(scores, scales);
         let (maximum, total) = exponentiate(scores);
+        scale_weights(scores, scales);
         partial[0] = maximum;
         partial[1] = total;
         partial[2..].fill(0.0);
@@ -633,19 +731,13 @@ fn chunk_with<K: KvValue>(
 #[target_feature(enable = "avx2")]
 unsafe fn chunk_f32_avx2(
     queries: &[f32],
-    keys: &[f32],
-    values: &[f32],
-    head_dim: usize,
-    count: usize,
+    rows: Rows<'_, f32>,
     scores: &mut [f32],
     partials: &mut [f32],
 ) {
     chunk_with(
         queries,
-        keys,
-        values,
-        head_dim,
-        count,
+        rows,
         scores,
         partials,
         |left, right| unsafe { dot_avx2(left, right) },
@@ -657,19 +749,13 @@ unsafe fn chunk_f32_avx2(
 #[target_feature(enable = "avx2,f16c")]
 unsafe fn chunk_f16_avx2(
     queries: &[f32],
-    keys: &[F16],
-    values: &[F16],
-    head_dim: usize,
-    count: usize,
+    rows: Rows<'_, F16>,
     scores: &mut [f32],
     partials: &mut [f32],
 ) {
     chunk_with(
         queries,
-        keys,
-        values,
-        head_dim,
-        count,
+        rows,
         scores,
         partials,
         |left, right| unsafe { dot_f16_avx2(left, right) },
@@ -747,17 +833,20 @@ unsafe fn accumulate_values<K, const VECTORS: usize>(
 
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
-#[allow(clippy::too_many_arguments)]
 unsafe fn chunk_blocked<K: KvValue>(
     queries: &[f32],
-    keys: &[K],
-    values: &[K],
-    head_dim: usize,
-    count: usize,
+    rows: Rows<'_, K>,
     scores: &mut [f32],
     partials: &mut [f32],
     load: impl Fn(*const K) -> std::arch::x86_64::__m256,
 ) {
+    let Rows {
+        keys,
+        values,
+        scales,
+        head_dim,
+        count,
+    } = rows;
     const ROWS: usize = 4;
     const WIDE: usize = 8;
     let heads = queries.len() / head_dim;
@@ -783,7 +872,9 @@ unsafe fn chunk_blocked<K: KvValue>(
             scores[index] = unsafe { dot_rows::<K, 1>(query, rows, head_dim, &load) }[0] * scale;
             index += 1;
         }
+        scale_scores(scores, scales);
         let (maximum, total) = exponentiate(scores);
+        scale_weights(scores, scales);
         partials[head * width] = maximum;
         partials[head * width + 1] = total;
     }
@@ -822,26 +913,16 @@ unsafe fn chunk_blocked<K: KvValue>(
 #[target_feature(enable = "avx2")]
 unsafe fn chunk_blocked_f32(
     queries: &[f32],
-    keys: &[f32],
-    values: &[f32],
-    head_dim: usize,
-    count: usize,
+    rows: Rows<'_, f32>,
     scores: &mut [f32],
     partials: &mut [f32],
 ) {
     use std::arch::x86_64::*;
 
     unsafe {
-        chunk_blocked(
-            queries,
-            keys,
-            values,
-            head_dim,
-            count,
-            scores,
-            partials,
-            |pointer: *const f32| _mm256_loadu_ps(pointer),
-        )
+        chunk_blocked(queries, rows, scores, partials, |pointer: *const f32| {
+            _mm256_loadu_ps(pointer)
+        })
     }
 }
 
@@ -849,26 +930,33 @@ unsafe fn chunk_blocked_f32(
 #[target_feature(enable = "avx2,f16c")]
 unsafe fn chunk_blocked_f16(
     queries: &[f32],
-    keys: &[F16],
-    values: &[F16],
-    head_dim: usize,
-    count: usize,
+    rows: Rows<'_, F16>,
     scores: &mut [f32],
     partials: &mut [f32],
 ) {
     use std::arch::x86_64::*;
 
     unsafe {
-        chunk_blocked(
-            queries,
-            keys,
-            values,
-            head_dim,
-            count,
-            scores,
-            partials,
-            |pointer: *const F16| _mm256_cvtph_ps(_mm_loadu_si128(pointer.cast())),
-        )
+        chunk_blocked(queries, rows, scores, partials, |pointer: *const F16| {
+            _mm256_cvtph_ps(_mm_loadu_si128(pointer.cast()))
+        })
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn chunk_blocked_i8(
+    queries: &[f32],
+    rows: Rows<'_, I8>,
+    scores: &mut [f32],
+    partials: &mut [f32],
+) {
+    use std::arch::x86_64::*;
+
+    unsafe {
+        chunk_blocked(queries, rows, scores, partials, |pointer: *const I8| {
+            _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64(pointer.cast())))
+        })
     }
 }
 
@@ -907,6 +995,7 @@ pub(crate) fn attention<K: AttendValue>(
             let (kv_head, chunk) = (task / chunks, task % chunks);
             let begin = chunk * ATTENTION_CHUNK;
             let (keys, values) = kv.head(kv_head, longest, head_dim);
+            let row_scales = kv.scales(kv_head, longest);
             let scores = unsafe {
                 std::slice::from_raw_parts_mut(
                     score_pointer.get().add(task * task_scores),
@@ -929,6 +1018,7 @@ pub(crate) fn attention<K: AttendValue>(
                     &queries[query..query + group * head_dim],
                     &keys[begin * head_dim..end * head_dim],
                     &values[begin * head_dim..end * head_dim],
+                    row_scales.map(|(keys, values)| (&keys[begin..end], &values[begin..end])),
                     head_dim,
                     length,
                     &mut scores[..group * length],
@@ -988,6 +1078,7 @@ pub(crate) fn attention<K: AttendValue>(
             let (state, partial) = rest.split_at_mut(group * width);
             let count = first + token + 1;
             let (keys, values) = kv.head(kv_head, count, head_dim);
+            let row_scales = kv.scales(kv_head, count);
             let query = token * q_dim + kv_head * group * head_dim;
             let queries = &queries[query..query + group * head_dim];
             for chunk in 0..count.div_ceil(ATTENTION_CHUNK) {
@@ -1003,6 +1094,7 @@ pub(crate) fn attention<K: AttendValue>(
                     queries,
                     &keys[begin * head_dim..end * head_dim],
                     &values[begin * head_dim..end * head_dim],
+                    row_scales.map(|(keys, values)| (&keys[begin..end], &values[begin..end])),
                     head_dim,
                     length,
                     &mut scores[..group * length],
@@ -1157,6 +1249,7 @@ mod tests {
             let count = first + token + 1;
             for head in 0..shape.head_count {
                 let (keys, values) = view.head(head / group, count, head_dim);
+                let row_scales = view.scales(head / group, count);
                 let query = &queries[token * q_dim + head * head_dim..][..head_dim];
                 let mut state = vec![0.0; width];
                 for chunk in 0..count.div_ceil(ATTENTION_CHUNK) {
@@ -1164,17 +1257,15 @@ mod tests {
                     let end = (begin + ATTENTION_CHUNK).min(count);
                     let mut scores = vec![0.0; end - begin];
                     let mut partial = vec![0.0; width];
-                    chunk_with(
-                        query,
-                        &keys[begin * head_dim..end * head_dim],
-                        &values[begin * head_dim..end * head_dim],
+                    let rows = Rows {
+                        keys: &keys[begin * head_dim..end * head_dim],
+                        values: &values[begin * head_dim..end * head_dim],
+                        scales: row_scales
+                            .map(|(keys, values)| (&keys[begin..end], &values[begin..end])),
                         head_dim,
-                        end - begin,
-                        &mut scores,
-                        &mut partial,
-                        dot,
-                        axpy,
-                    );
+                        count: end - begin,
+                    };
+                    chunk_with(query, rows, &mut scores, &mut partial, dot, axpy);
                     if chunk == 0 {
                         state = partial;
                     } else {
@@ -1205,13 +1296,17 @@ mod tests {
             let count = first + token + 1;
             for head in 0..shape.head_count {
                 let (keys, values) = view.head(head / group, count, head_dim);
+                let (key_scale, value_scale) = match view.scales(head / group, count) {
+                    Some((keys, values)) => (keys.to_vec(), values.to_vec()),
+                    None => (vec![1.0; count], vec![1.0; count]),
+                };
                 let query = &queries[token * q_dim + head * head_dim..][..head_dim];
                 let scores: Vec<f64> = (0..count)
                     .map(|index| {
                         query
                             .iter()
                             .zip(&keys[index * head_dim..(index + 1) * head_dim])
-                            .map(|(q, k)| f64::from(*q) * f64::from(k.to_f32()))
+                            .map(|(q, k)| f64::from(*q) * f64::from(key_scale[index] * k.to_f32()))
                             .sum::<f64>()
                             / (head_dim as f64).sqrt()
                     })
@@ -1224,7 +1319,11 @@ mod tests {
                         .iter()
                         .enumerate()
                         .map(|(index, weight)| {
-                            weight * f64::from(values[index * head_dim + dimension].to_f32())
+                            weight
+                                * f64::from(
+                                    value_scale[index]
+                                        * values[index * head_dim + dimension].to_f32(),
+                                )
                         })
                         .sum();
                     output[token * q_dim + head * head_dim + dimension] = (value / total) as f32;
@@ -1243,17 +1342,30 @@ mod tests {
         let q_dim = shape.head_count * head_dim;
         let longest = first + tokens;
         let capacity = longest + 3;
-        let keys: Vec<K> = wave(capacity * 2 * head_dim, 0.37)
-            .into_iter()
-            .map(K::from_f32)
-            .collect();
-        let values: Vec<K> = wave(capacity * 2 * head_dim, 0.11)
-            .into_iter()
-            .map(K::from_f32)
-            .collect();
+        let encode = |values: Vec<f32>| {
+            let mut stored = vec![K::default(); values.len()];
+            let mut scales = Vec::new();
+            for (row, output) in values.chunks(head_dim).zip(stored.chunks_mut(head_dim)) {
+                scales.push(K::store_row(row, output));
+            }
+            if !K::SCALED {
+                scales.clear();
+            }
+            (stored, scales)
+        };
+        let (keys, key_scales) = encode(
+            wave(capacity * 2 * head_dim, 0.37)
+                .into_iter()
+                .enumerate()
+                .map(|(index, value)| value * (1.0 + (index / head_dim % 5) as f32))
+                .collect(),
+        );
+        let (values, value_scales) = encode(wave(capacity * 2 * head_dim, 0.11));
         let view = KvView {
             keys: &keys,
             values: &values,
+            key_scales: &key_scales,
+            value_scales: &value_scales,
             capacity,
         };
         let queries = wave(tokens * q_dim, 0.23);
@@ -1298,6 +1410,27 @@ mod tests {
         ] {
             attention_case::<f32>(head_dim, group, first, tokens);
             attention_case::<F16>(head_dim, group, first, tokens);
+            attention_case::<I8>(head_dim, group, first, tokens);
+        }
+    }
+
+    #[test]
+    fn hadamard_is_orthogonal_and_self_inverse() {
+        let original = wave(3 * 16, 0.7);
+        let mut rotated = original.clone();
+        hadamard_heads(&mut rotated, 16);
+        for (before, after) in original.chunks(16).zip(rotated.chunks(16)) {
+            let norm = |values: &[f32]| values.iter().map(|v| v * v).sum::<f32>();
+            assert!((norm(before) - norm(after)).abs() < 1e-4);
+        }
+        let mut other = wave(3 * 16, 0.3);
+        let dot = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>();
+        let expected = dot(&original[..16], &other[..16]);
+        hadamard_heads(&mut other, 16);
+        assert!((dot(&rotated[..16], &other[..16]) - expected).abs() < 1e-4);
+        hadamard_heads(&mut rotated, 16);
+        for (back, value) in rotated.iter().zip(&original) {
+            assert!((back - value).abs() < 1e-5);
         }
     }
 

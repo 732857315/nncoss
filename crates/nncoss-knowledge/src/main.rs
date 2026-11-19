@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use nncoss_knowledge::{Agent, AgentConfig, KnowledgeBase, opening_prompt, prefetch_prompt};
-use nncoss_llm::{Model, ModelLoader};
+use nncoss_llm::{KvPrecision, Model, ModelLoader};
 use serde::{Deserialize, Serialize};
 use tokenizers::Tokenizer;
 
@@ -25,7 +25,8 @@ const USAGE: &str = "用法：
   --turn-tokens N        每轮最多生成的 token 数，默认 1024
   --temperature T        采样温度，默认思考模式 0.6、非思考模式 0
   --top-k K / --top-p P  采样参数
-  --seed S               随机种子";
+  --seed S               随机种子
+  --kv f32|f16|i8        KV Cache 精度，默认 Q4 模型用 f16；i8 在长上下文时读得更少";
 
 #[derive(Default)]
 struct Options {
@@ -94,6 +95,14 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Options, String> {
             "--top-k" => options.config.sampling.top_k = number(value(&mut args, &arg)?, &arg)?,
             "--top-p" => options.config.sampling.top_p = number(value(&mut args, &arg)?, &arg)?,
             "--seed" => options.config.seed = number(value(&mut args, &arg)?, &arg)?,
+            "--kv" => {
+                options.config.kv = Some(match value(&mut args, &arg)?.as_str() {
+                    "f32" => KvPrecision::F32,
+                    "f16" => KvPrecision::F16,
+                    "i8" => KvPrecision::I8,
+                    other => return Err(format!("--kv 只能是 f32、f16 或 i8，收到 {other}")),
+                })
+            }
             "--help" | "-h" => return Err(USAGE.to_string()),
             other => return Err(format!("未知参数 {other}\n\n{USAGE}")),
         }

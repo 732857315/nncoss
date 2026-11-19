@@ -2,6 +2,9 @@ use crate::math::{f16_to_f32, f32_to_f16};
 use crate::{Error, Result};
 
 pub(crate) trait KvValue: Copy + Default + Send + Sync + 'static {
+    /// 为 true 时每个位置、每个 KV 头另存一个缩放系数，真实值 = 系数 × to_f32()。
+    const SCALED: bool = false;
+
     fn from_f32(value: f32) -> Self;
     fn to_f32(self) -> f32;
 
@@ -9,6 +12,12 @@ pub(crate) trait KvValue: Copy + Default + Send + Sync + 'static {
         for (slot, value) in output.iter_mut().zip(values) {
             *slot = Self::from_f32(*value);
         }
+    }
+
+    /// 存入一行（一个位置的一个 KV 头），返回这一行的缩放系数。
+    fn store_row(values: &[f32], output: &mut [Self]) -> f32 {
+        Self::store(values, output);
+        1.0
     }
 }
 
@@ -48,6 +57,38 @@ impl KvValue for F16 {
     }
 }
 
+/// 对称 int8：每行按绝对值最大值缩放到 ±127，系数单独存放。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[repr(transparent)]
+pub(crate) struct I8(pub i8);
+
+impl KvValue for I8 {
+    const SCALED: bool = true;
+
+    fn from_f32(value: f32) -> Self {
+        Self(value.round().clamp(-127.0, 127.0) as i8)
+    }
+
+    fn to_f32(self) -> f32 {
+        f32::from(self.0)
+    }
+
+    fn store_row(values: &[f32], output: &mut [Self]) -> f32 {
+        let peak = values
+            .iter()
+            .fold(0.0_f32, |peak, value| peak.max(value.abs()));
+        if !peak.is_finite() || peak == 0.0 {
+            output[..values.len()].fill(Self(0));
+            return if peak.is_finite() { 0.0 } else { peak };
+        }
+        let inverse = 127.0 / peak;
+        for (slot, value) in output.iter_mut().zip(values) {
+            *slot = Self::from_f32(value * inverse);
+        }
+        peak / 127.0
+    }
+}
+
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx,f16c")]
 unsafe fn store_f16c(values: &[f32], output: &mut [F16]) -> usize {
@@ -66,15 +107,19 @@ unsafe fn store_f16c(values: &[f32], output: &mut [F16]) -> usize {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum KvPrecision {
+pub enum KvPrecision {
     F32,
     F16,
+    /// 每个位置、每个 KV 头一个 f32 系数加 int8 数值，比 f16 少读约一半。
+    I8,
 }
 
 #[derive(Debug)]
 struct LayerCache<T> {
     keys: Vec<T>,
     values: Vec<T>,
+    key_scales: Vec<f32>,
+    value_scales: Vec<f32>,
     capacity: usize,
 }
 
@@ -83,6 +128,8 @@ impl<T: KvValue> LayerCache<T> {
         Self {
             keys: Vec::new(),
             values: Vec::new(),
+            key_scales: Vec::new(),
+            value_scales: Vec::new(),
             capacity: 0,
         }
     }
@@ -110,8 +157,17 @@ impl<T: KvValue> LayerCache<T> {
         values
             .try_reserve_exact(length)
             .map_err(|_| Error::Allocation)?;
+        let scale_length = if T::SCALED { capacity * heads } else { 0 };
+        let mut key_scales = Vec::new();
+        let mut value_scales = Vec::new();
+        key_scales
+            .try_reserve_exact(scale_length)
+            .and_then(|()| value_scales.try_reserve_exact(scale_length))
+            .map_err(|_| Error::Allocation)?;
         keys.resize(length, T::default());
         values.resize(length, T::default());
+        key_scales.resize(scale_length, 0.0);
+        value_scales.resize(scale_length, 0.0);
         let old = self.capacity * head_dim;
         let new = capacity * head_dim;
         for head in 0..heads.min(self.keys.len().checked_div(old).unwrap_or(0)) {
@@ -119,9 +175,18 @@ impl<T: KvValue> LayerCache<T> {
                 .copy_from_slice(&self.keys[head * old..(head + 1) * old]);
             values[head * new..head * new + old]
                 .copy_from_slice(&self.values[head * old..(head + 1) * old]);
+            if T::SCALED {
+                let (old, new) = (self.capacity, capacity);
+                key_scales[head * new..head * new + old]
+                    .copy_from_slice(&self.key_scales[head * old..(head + 1) * old]);
+                value_scales[head * new..head * new + old]
+                    .copy_from_slice(&self.value_scales[head * old..(head + 1) * old]);
+            }
         }
         self.keys = keys;
         self.values = values;
+        self.key_scales = key_scales;
+        self.value_scales = value_scales;
         self.capacity = capacity;
         Ok(())
     }
@@ -132,9 +197,14 @@ impl<T: KvValue> LayerCache<T> {
             .zip(values.chunks_exact(head_dim))
             .enumerate()
         {
-            let start = (head * self.capacity + position) * head_dim;
-            T::store(keys, &mut self.keys[start..start + head_dim]);
-            T::store(values, &mut self.values[start..start + head_dim]);
+            let row = head * self.capacity + position;
+            let start = row * head_dim;
+            let key_scale = T::store_row(keys, &mut self.keys[start..start + head_dim]);
+            let value_scale = T::store_row(values, &mut self.values[start..start + head_dim]);
+            if T::SCALED {
+                self.key_scales[row] = key_scale;
+                self.value_scales[row] = value_scale;
+            }
         }
     }
 
@@ -142,6 +212,8 @@ impl<T: KvValue> LayerCache<T> {
         KvView {
             keys: &self.keys,
             values: &self.values,
+            key_scales: &self.key_scales,
+            value_scales: &self.value_scales,
             capacity: self.capacity,
         }
     }
@@ -151,8 +223,14 @@ impl<T: KvValue> LayerCache<T> {
 pub(crate) struct KvView<'a, T> {
     pub keys: &'a [T],
     pub values: &'a [T],
+    /// 仅 int8 缓存使用，布局为 [头 × 容量 + 位置]；其他精度为空。
+    pub key_scales: &'a [f32],
+    pub value_scales: &'a [f32],
     pub capacity: usize,
 }
+
+/// 一段 K/V 行各自的缩放系数，键的系数乘到注意力分数上，值的系数乘到注意力权重上。
+pub(crate) type RowScales<'a> = Option<(&'a [f32], &'a [f32])>;
 
 impl<'a, T> KvView<'a, T> {
     pub fn head(&self, head: usize, count: usize, head_dim: usize) -> (&'a [T], &'a [T]) {
@@ -160,18 +238,31 @@ impl<'a, T> KvView<'a, T> {
         let end = start + count * head_dim;
         (&self.keys[start..end], &self.values[start..end])
     }
+
+    pub fn scales(&self, head: usize, count: usize) -> RowScales<'a> {
+        if self.key_scales.is_empty() {
+            return None;
+        }
+        let start = head * self.capacity;
+        Some((
+            &self.key_scales[start..start + count],
+            &self.value_scales[start..start + count],
+        ))
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum KvLayer<'a> {
     F32(KvView<'a, f32>),
     F16(KvView<'a, F16>),
+    I8(KvView<'a, I8>),
 }
 
 #[derive(Debug)]
 enum Layers {
     F32(Vec<LayerCache<f32>>),
     F16(Vec<LayerCache<F16>>),
+    I8(Vec<LayerCache<I8>>),
 }
 
 #[derive(Debug)]
@@ -187,6 +278,7 @@ impl KvCache {
         let layers = match precision {
             KvPrecision::F32 => Layers::F32((0..layer_count).map(|_| LayerCache::new()).collect()),
             KvPrecision::F16 => Layers::F16((0..layer_count).map(|_| LayerCache::new()).collect()),
+            KvPrecision::I8 => Layers::I8((0..layer_count).map(|_| LayerCache::new()).collect()),
         };
         Self {
             layers,
@@ -225,6 +317,10 @@ impl KvCache {
                 layers[layer].reserve(position + 1, heads, head_dim, maximum)?;
                 layers[layer].write(position, keys, values, head_dim);
             }
+            Layers::I8(layers) => {
+                layers[layer].reserve(position + 1, heads, head_dim, maximum)?;
+                layers[layer].write(position, keys, values, head_dim);
+            }
         }
         Ok(())
     }
@@ -233,6 +329,15 @@ impl KvCache {
         match &self.layers {
             Layers::F32(layers) => KvLayer::F32(layers[layer].view()),
             Layers::F16(layers) => KvLayer::F16(layers[layer].view()),
+            Layers::I8(layers) => KvLayer::I8(layers[layer].view()),
+        }
+    }
+
+    pub fn precision(&self) -> KvPrecision {
+        match self.layers {
+            Layers::F32(_) => KvPrecision::F32,
+            Layers::F16(_) => KvPrecision::F16,
+            Layers::I8(_) => KvPrecision::I8,
         }
     }
 
@@ -275,14 +380,21 @@ impl KvCache {
         ) -> Vec<f32> {
             let (keys, value_rows) = view.head(head, position + 1, head_dim);
             let rows = if values { value_rows } else { keys };
+            let scale = view
+                .scales(head, position + 1)
+                .map_or(1.0, |(keys, value_rows)| {
+                    let scales = if values { value_rows } else { keys };
+                    scales[position]
+                });
             rows[position * head_dim..(position + 1) * head_dim]
                 .iter()
-                .map(|value| value.to_f32())
+                .map(|value| scale * value.to_f32())
                 .collect()
         }
         match self.layer(layer) {
             KvLayer::F32(view) => read(view, position, head, self.head_dim, values),
             KvLayer::F16(view) => read(view, position, head, self.head_dim, values),
+            KvLayer::I8(view) => read(view, position, head, self.head_dim, values),
         }
     }
 
@@ -291,6 +403,7 @@ impl KvCache {
         match self.layer(layer) {
             KvLayer::F32(view) => view.capacity,
             KvLayer::F16(view) => view.capacity,
+            KvLayer::I8(view) => view.capacity,
         }
     }
 }
@@ -330,6 +443,45 @@ mod tests {
             assert_eq!(cache.entry(0, 0, 0, false), vec![9.0, 1.0]);
             assert_eq!(cache.entry(0, 0, 1, true), vec![5.0, 5.0]);
         }
+    }
+
+    #[test]
+    fn i8_cache_keeps_per_row_scales_through_growth() {
+        let mut cache = KvCache::new(1, 2, 4, KvPrecision::I8);
+        let rows: Vec<[f32; 8]> = (0..40)
+            .map(|token| {
+                let value = token as f32 + 1.0;
+                [value, -0.5, 0.25, 0.0, -value * 3.0, 1.0, 2.0, 0.1]
+            })
+            .collect();
+        for row in &rows {
+            cache
+                .append(0, row, &row.map(|value| value * 0.5), 64)
+                .unwrap();
+            cache.finish_token();
+        }
+        for (position, row) in rows.iter().enumerate() {
+            for head in 0..2 {
+                let expected = &row[head * 4..(head + 1) * 4];
+                let peak = expected
+                    .iter()
+                    .fold(0.0_f32, |peak, value| peak.max(value.abs()));
+                for (stored, original) in cache.entry(0, position, head, false).iter().zip(expected)
+                {
+                    assert!(
+                        (stored - original).abs() <= peak / 254.0 + 1e-6,
+                        "{stored} {original}"
+                    );
+                }
+                for (stored, original) in cache.entry(0, position, head, true).iter().zip(expected)
+                {
+                    assert!((stored - original * 0.5).abs() <= peak / 508.0 + 1e-6);
+                }
+            }
+        }
+        let mut zero = KvCache::new(1, 1, 2, KvPrecision::I8);
+        zero.append(0, &[0.0, 0.0], &[0.0, -0.0], 4).unwrap();
+        assert_eq!(zero.entry(0, 0, 0, false), vec![0.0, 0.0]);
     }
 
     #[test]

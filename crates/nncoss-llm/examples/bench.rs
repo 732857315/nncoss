@@ -2,7 +2,7 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Instant;
 
-use nncoss_llm::{MODEL_FORMAT_VERSION, Model, SamplingConfig, Session};
+use nncoss_llm::{KvPrecision, MODEL_FORMAT_VERSION, Model, SamplingConfig, Session};
 
 #[derive(Clone, Copy)]
 struct Preset {
@@ -139,6 +139,8 @@ struct Options {
     tokens: Option<String>,
     generate: bool,
     eos: Vec<u32>,
+    kv: Option<KvPrecision>,
+    kv_compare: bool,
 }
 
 fn parse_options() -> Result<Options, String> {
@@ -152,6 +154,8 @@ fn parse_options() -> Result<Options, String> {
     let mut tokens = None;
     let mut generate = false;
     let mut eos = Vec::new();
+    let mut kv = None;
+    let mut kv_compare = false;
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         let mut value = || args.next().ok_or(format!("{arg} 需要参数"));
@@ -188,8 +192,17 @@ fn parse_options() -> Result<Options, String> {
                     .ok_or("--decode 需要正整数")?;
             }
             "--greedy" => greedy = true,
+            "--kv" => {
+                kv = Some(match value()?.as_str() {
+                    "f32" => KvPrecision::F32,
+                    "f16" => KvPrecision::F16,
+                    "i8" => KvPrecision::I8,
+                    other => return Err(format!("--kv 只能是 f32、f16 或 i8，收到 {other}")),
+                });
+            }
             "--tokens" => tokens = Some(value()?),
             "--generate" => generate = true,
+            "--kv-compare" => kv_compare = true,
             "--eos" => {
                 eos = value()?
                     .split(',')
@@ -199,7 +212,7 @@ fn parse_options() -> Result<Options, String> {
             }
             "--help" | "-h" => {
                 return Err(
-                    "用法：bench [--preset tiny|small] [--iterations N] [--write-model PATH]\n      bench --model PATH [--prompt N | --tokens FILE] [--decode N] [--greedy] [--generate [--eos IDS]] [--iterations N]"
+                    "用法：bench [--preset tiny|small] [--iterations N] [--write-model PATH]\n      bench --model PATH [--prompt N | --tokens FILE] [--decode N] [--greedy] [--kv f32|f16|i8] [--generate [--eos IDS]] [--iterations N]\n      bench --model PATH --tokens FILE --kv-compare"
                         .into(),
                 );
             }
@@ -217,6 +230,8 @@ fn parse_options() -> Result<Options, String> {
         tokens,
         generate,
         eos,
+        kv,
+        kv_compare,
     })
 }
 
@@ -263,11 +278,17 @@ fn run_model(path: &str, options: &Options) -> Result<(), String> {
     if options.generate {
         return compare_generation(&model, &prompt, context, sampling, options);
     }
+    if options.kv_compare {
+        return compare_kv(&model, &prompt);
+    }
     let mut prefill_ms = Vec::new();
     let mut decode_ms = Vec::new();
     let mut generated = Vec::new();
     for iteration in 0..=options.iterations {
         let mut session = Session::new(model.clone(), context).map_err(|e| e.to_string())?;
+        if let Some(precision) = options.kv {
+            session.set_kv_precision(precision);
+        }
         session
             .set_sampler(sampling, 42)
             .map_err(|e| e.to_string())?;
@@ -321,6 +342,79 @@ fn run_model(path: &str, options: &Options) -> Result<(), String> {
         options.decode as f64 / fastest * 1e3
     );
     println!("token_checksum: {checksum}");
+    Ok(())
+}
+
+fn log_softmax(logits: &[f32]) -> Vec<f64> {
+    let maximum = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let total: f64 = logits
+        .iter()
+        .map(|value| f64::from(value - maximum).exp())
+        .sum();
+    let offset = f64::from(maximum) + total.ln();
+    logits
+        .iter()
+        .map(|value| f64::from(*value) - offset)
+        .collect()
+}
+
+/// 以 f32 缓存为参照：前一半 token 作为 prompt，后一半逐个强制输入，
+/// 比较每个位置上 f16 与 int8 缓存给出的下一个 token 分布（KL 与首选一致率）。
+fn compare_kv(model: &Arc<Model>, tokens: &[u32]) -> Result<(), String> {
+    if tokens.len() < 4 {
+        return Err("--kv-compare 至少需要 4 个 token".into());
+    }
+    let split = tokens.len() / 2;
+    let precisions = [KvPrecision::F32, KvPrecision::F16, KvPrecision::I8];
+    let mut sessions = Vec::new();
+    for precision in precisions {
+        let mut session = Session::new(model.clone(), tokens.len()).map_err(|e| e.to_string())?;
+        session.set_kv_precision(precision);
+        session
+            .prefill(&tokens[..split])
+            .map_err(|e| e.to_string())?;
+        sessions.push(session);
+    }
+    let argmax = |values: &[f32]| {
+        values
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .map(|(index, _)| index)
+    };
+    let mut totals = [(0.0_f64, 0.0_f64, 0_usize); 2];
+    let mut count = 0;
+    for (index, token) in tokens[split..].iter().enumerate() {
+        let reference = sessions[0].last_logits().map_err(|e| e.to_string())?;
+        let reference_log = log_softmax(reference);
+        for (slot, session) in sessions[1..].iter().enumerate() {
+            let candidate = session.last_logits().map_err(|e| e.to_string())?;
+            let divergence: f64 = reference_log
+                .iter()
+                .zip(log_softmax(candidate))
+                .map(|(p, q)| p.exp() * (p - q))
+                .sum();
+            let (total, worst, agree) = &mut totals[slot];
+            *total += divergence;
+            *worst = worst.max(divergence);
+            *agree += usize::from(argmax(reference) == argmax(candidate));
+        }
+        count += 1;
+        if index + 1 < tokens.len() - split {
+            for session in &mut sessions {
+                session.decode(*token).map_err(|e| e.to_string())?;
+            }
+        }
+    }
+    for (name, (total, worst, agree)) in ["f16", "i8"].iter().zip(totals) {
+        println!(
+            "kv_compare {name} vs f32: positions={count} context={split}..{} mean_kl={:.6} max_kl={:.6} top1_agree={:.4}",
+            tokens.len(),
+            total / count as f64,
+            worst,
+            agree as f64 / count as f64
+        );
+    }
     Ok(())
 }
 

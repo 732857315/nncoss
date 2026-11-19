@@ -1,7 +1,7 @@
 use std::process::Command;
 use std::sync::Arc;
 
-use nncoss_llm::{Model, SamplingConfig, Session};
+use nncoss_llm::{KvPrecision, Model, SamplingConfig, Session};
 use serde::Serialize;
 use serde_json::Value;
 use tokenizers::Tokenizer;
@@ -34,6 +34,8 @@ pub struct AgentConfig {
     pub search_limit: usize,
     pub sampling: SamplingConfig,
     pub seed: u64,
+    /// KV Cache 精度；None 时用引擎默认（Q4 模型为 f16）。
+    pub kv: Option<KvPrecision>,
 }
 
 impl Default for AgentConfig {
@@ -49,6 +51,7 @@ impl Default for AgentConfig {
             search_limit: 4,
             sampling: SamplingConfig::default(),
             seed: 0,
+            kv: None,
         }
     }
 }
@@ -503,6 +506,9 @@ impl<'a> Agent<'a> {
 
     pub fn ask(&mut self, question: &str) -> Result<Answer, String> {
         let mut session = Session::new(self.model.clone(), 0).map_err(|error| error.to_string())?;
+        if let Some(precision) = self.config.kv {
+            session.set_kv_precision(precision);
+        }
         session
             .set_sampler(self.config.sampling, self.config.seed)
             .map_err(|error| error.to_string())?;

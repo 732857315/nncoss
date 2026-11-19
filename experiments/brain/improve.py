@@ -10,9 +10,9 @@ from collections import Counter
 from pathlib import Path
 
 HERE = Path(__file__).parent
-ROOT = Path("/Users/admin/Desktop/prj2026/nncoss")
+ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(HERE))
-PYTHON = "/tmp/nncoss-golden/env/bin/python"
+PYTHON = sys.executable
 CALIBRATION = ["tools/calibration/qwen3_chat.txt", "README.md", "crates/nncoss-llm/src/session.rs",
                "crates/nncoss-llm/src/model.rs", "tools/export_llm.py", "crates/nncoss-web/src/lib.rs"]
 PLANS = {
@@ -67,7 +67,7 @@ def collect(model_path, output, seed, plan):
     print("collected", len(examples), flush=True)
 
 
-def train(source, examples_path, output, lr, rank, epochs, max_len, anchor=None, beta=0.0, repeat_corrected=1):
+def train(source, examples_path, output, lr, rank, epochs, max_len, anchor=None, beta=0.0, repeat_corrected=1, max_run=1600):
     import torch
     import torch.nn.functional as F
     from safetensors.torch import save_file
@@ -102,7 +102,7 @@ def train(source, examples_path, output, lr, rank, epochs, max_len, anchor=None,
         return best
 
     before = len(examples)
-    examples = [example for example in examples if len(example["ids"]) <= max_len and any(example["mask"]) and longest_run(example["mask"]) <= 1600]
+    examples = [example for example in examples if len(example["ids"]) <= max_len and any(example["mask"]) and (max_run <= 0 or longest_run(example["mask"]) <= max_run)]
     print("长度筛选", before, "->", len(examples), flush=True)
     print("训练样本", len(examples), Counter(e["condition"] for e in examples), Counter(e["kind"] for e in examples), flush=True)
     model = AutoModelForCausalLM.from_pretrained(source, dtype=torch.float32)
@@ -184,6 +184,7 @@ def main():
     parser.add_argument("--anchor", type=Path)
     parser.add_argument("--beta", type=float, default=0.0)
     parser.add_argument("--repeat-corrected", type=int, default=1)
+    parser.add_argument("--max-run", type=int, default=1600, help="单轮输出超过该长度的经验不参与训练，0 表示不筛选")
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--rank", type=int, default=16)
     parser.add_argument("--epochs", type=int, default=1)
@@ -193,7 +194,7 @@ def main():
     if args.command == "collect":
         collect(args.model, args.output, args.seed, args.plan)
     elif args.command == "train":
-        train(args.source, args.examples, args.output, args.lr, args.rank, args.epochs, args.max_len, args.anchor, args.beta, args.repeat_corrected)
+        train(args.source, args.examples, args.output, args.lr, args.rank, args.epochs, args.max_len, args.anchor, args.beta, args.repeat_corrected, args.max_run)
     else:
         export(args.source, args.output, args.distill_steps)
 

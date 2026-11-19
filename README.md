@@ -411,7 +411,7 @@ python3 tools/make_golden_llm.py
 
 整块加载要求输入缓冲区与解析后的权重同时驻留内存，且 wasm32 的单次分配不能超过 `isize::MAX`（2 GiB − 1 字节）。分块加载不需要整文件输入缓冲区，最大的单次分配是最大的单个权重张量。
 
-仓库通过 Git LFS 提供 `model/Qwen3-0.6B/qwen3-0.6b-f32.nncossllm`（2,384,199,744 字节）。下列命令以 1 MiB 分块把它分别加载到原生动态库与 `wasm32-unknown-unknown` 产物，执行 5 个 token 的 prefill 与 4 步贪心 decode 并比较 logits；`--hf-model` 为可选项，需要 `tools/golden_requirements.txt` 的依赖，用 Hugging Face f32 eager 前向作为参考：
+模型文件不随仓库分发，按[模型说明](model/README.md)下载 Qwen3-0.6B 并导出 `model/Qwen3-0.6B/qwen3-0.6b-f32.nncossllm`（2,384,199,744 字节）。下列命令以 1 MiB 分块把它分别加载到原生动态库与 `wasm32-unknown-unknown` 产物，执行 5 个 token 的 prefill 与 4 步贪心 decode 并比较 logits；`--hf-model` 为可选项，需要 `tools/golden_requirements.txt` 的依赖，用 Hugging Face f32 eager 前向作为参考：
 
 ```bash
 python3 tools/check_real_llm.py
@@ -429,7 +429,7 @@ python3 tools/check_real_llm.py --hf-model model/Qwen3-0.6B
 | 原生／Hugging Face | 4 个贪心 token 一致，5 组 logits 最大误差 8.965e-05 |
 | WASM／Hugging Face | 4 个贪心 token 一致，5 组 logits 最大误差 1.001e-04 |
 
-该对拍使用固定 token id，不经过 Tokenizer；只覆盖 9 个位置的短序列，不包含长上下文、采样分布或性能验收。KV Cache 随上下文增长，该模型每个 token 占 229,376 字节，更长上下文在 wasm32 的可用余量尚未实测。该脚本依赖本地 LFS 模型，不纳入 CI。
+该对拍使用固定 token id，不经过 Tokenizer；只覆盖 9 个位置的短序列，不包含长上下文、采样分布或性能验收。KV Cache 随上下文增长，该模型每个 token 占 229,376 字节，更长上下文在 wasm32 的可用余量尚未实测。该脚本依赖本地导出的模型，不纳入 CI。
 
 ### Q4 量化与原生加速
 
@@ -460,7 +460,7 @@ cargo run -p nncoss-llm --release --example bench -- --model model/Qwen3-0.6B/qw
 
 `Session::generate` 默认启用推测解码：在会话已有的 token 中查找与当前末尾相同的 2–3 个 token 片段，取其后一个 token 作为草稿，与新采样的 token 组成 2 个 token 的批次一起前向，再按草稿验证规则接受或拒绝。贪心时只在草稿等于 argmax 时接受；采样时以目标分布中草稿的概率接受，拒绝时从去掉草稿后重新归一化的分布中采样，因此生成分布与逐 token 采样完全相同。贪心输出与关闭推测解码时逐 token 一致；采样输出的分布不变，但同一种子下随机数的使用顺序不同，具体序列可能不同。`Session::set_speculation(false)` 可关闭该功能；C ABI 的 `decode`／`sample` 逐 token 接口不受影响。2 个 token 的前向约为单步的 1.2 倍，在 7 组真实多轮对话上实测：代码类约快 10–20%，摘要类约 5–10%，开放式对话约 0–10%，整体约 5–8%（测量噪声约 ±6%）。
 
-`tools/check_q4_llm.py` 在内置的 7 段文本（中英文问答、故事、邮件、数学推导、JSON 与 Rust 代码）上按 teacher forcing 比较 Q4 与 f32 模型的下一 token 分布，共 908 个位置。仓库当前的 Q4 模型按下文的校准量化与蒸馏生成，top-1 一致率为 0.859，平均 KL(f32‖Q4) 为 0.111，困惑度从 9.489 升至 9.676（比值 1.020）。脚本默认阈值按这组结果留出余量，只用于发现回归；不经校准导出的 Q4 达不到默认阈值。该脚本需要 numpy、tokenizers 与本地 LFS 模型，不纳入 CI。
+`tools/check_q4_llm.py` 在内置的 7 段文本（中英文问答、故事、邮件、数学推导、JSON 与 Rust 代码）上按 teacher forcing 比较 Q4 与 f32 模型的下一 token 分布，共 908 个位置。仓库当前的 Q4 模型按下文的校准量化与蒸馏生成，top-1 一致率为 0.859，平均 KL(f32‖Q4) 为 0.111，困惑度从 9.489 升至 9.676（比值 1.020）。脚本默认阈值按这组结果留出余量，只用于发现回归；不经校准导出的 Q4 达不到默认阈值。该脚本需要 numpy、tokenizers 与本地导出的模型，不纳入 CI。
 
 #### 校准量化与蒸馏
 
@@ -498,7 +498,7 @@ cargo build -p nncoss-web --release
 target/release/nncoss-web
 ```
 
-随后在浏览器打开 `http://127.0.0.1:8765/`。未指定 `--model` 时，若本地已导出 `model/Qwen3-0.6B/qwen3-0.6b-q4.nncossllm` 则优先加载该 Q4 模型（约 304 MiB），否则加载仓库中约 2.4 GiB 的 f32 模型；启动日志会打印实际加载的路径。f32 模型在上述测试机上 decode 约 11.8 tokens/s、prefill 约 115 tokens/s，受每个 token 读取约 2.4 GB 权重的内存带宽限制。常用参数：
+随后在浏览器打开 `http://127.0.0.1:8765/`。未指定 `--model` 时，若本地已导出 `model/Qwen3-0.6B/qwen3-0.6b-q4.nncossllm` 则优先加载该 Q4 模型（约 304 MiB），否则加载本地导出的约 2.4 GiB f32 模型；启动日志会打印实际加载的路径。f32 模型在上述测试机上 decode 约 11.8 tokens/s、prefill 约 115 tokens/s，受每个 token 读取约 2.4 GB 权重的内存带宽限制。常用参数：
 
 ```bash
 target/release/nncoss-web --decode 32 --temperature 0.6 --top-k 20 --top-p 0.95

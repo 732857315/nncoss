@@ -12,7 +12,7 @@ import torch
 import torch.nn.functional as F
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
-ROOT = Path("/Users/admin/Desktop/prj2026/nncoss")
+ROOT = Path(__file__).resolve().parents[2]
 HERE = Path(__file__).parent
 DATA = HERE / "datasets"
 CHAT = "<|im_start|>user\n{question}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"

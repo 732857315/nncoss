@@ -5,7 +5,7 @@ import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
 
-ROOT = Path("/Users/admin/Desktop/prj2026/nncoss")
+ROOT = Path(__file__).resolve().parents[2]
 HERE = Path(__file__).parent
 
 

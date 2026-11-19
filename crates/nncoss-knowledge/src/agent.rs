@@ -129,6 +129,14 @@ pub fn parse_tool_calls(text: &str) -> Vec<Result<ToolCall, String>> {
     calls
 }
 
+pub fn opening_prompt(config: &AgentConfig, question: &str) -> String {
+    format!(
+        "{}<|im_start|>user\n{question}<|im_end|>\n{}",
+        system_prompt(config),
+        assistant_open(config.thinking)
+    )
+}
+
 pub fn prefetch_turn(query: &str, output: &str, thinking: bool) -> String {
     let arguments = serde_json::json!({ "query": query }).to_string();
     format!(
@@ -430,10 +438,14 @@ impl<'a> Agent<'a> {
             .map_err(|error| error.to_string())?;
         let mut answer = Answer::default();
         let mut sources = Vec::new();
-        let mut prompt = format!(
-            "{}<|im_start|>user\n{question}<|im_end|>\n",
-            system_prompt(&self.config)
-        );
+        let mut prompt = if self.config.prefetch && self.config.tools {
+            format!(
+                "{}<|im_start|>user\n{question}<|im_end|>\n",
+                system_prompt(&self.config)
+            )
+        } else {
+            opening_prompt(&self.config, question)
+        };
         if self.config.prefetch && self.config.tools {
             let query: String = question.chars().take(PREFETCH_CHARS).collect();
             let call = ToolCall {
@@ -442,8 +454,6 @@ impl<'a> Agent<'a> {
             };
             let output = self.run_tool(&call, question, &mut sources, &mut answer);
             prompt.push_str(&prefetch_turn(&query, &output, self.config.thinking));
-        } else {
-            prompt.push_str(assistant_open(self.config.thinking));
         }
         answer.transcript.push_str(&prompt);
         let mut rounds = 0;

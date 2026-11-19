@@ -33,6 +33,17 @@ def prepare(per_subject, seed):
     return questions
 
 
+def questions_for(split, per_subject):
+    if split == "test":
+        return prepare(per_subject, "gaokao")
+    test_ids = {question["id"] for question in prepare(per_subject, "gaokao")}
+    by_subject = {}
+    for question in prepare(10_000, "tune"):
+        if question["id"] not in test_ids:
+            by_subject.setdefault(question["subject"], []).append(question)
+    return [question for items in by_subject.values() for question in items[:per_subject]]
+
+
 def choice(reply):
     text = re.sub(r"<think>.*?</think>", "", reply, flags=re.S)
     candidates = re.findall(r"\\boxed\{([^{}]*)\}", text)
@@ -71,13 +82,13 @@ def main():
     parser.add_argument("--no-tools", action="store_true")
     parser.add_argument("--prefetch", action="store_true", help="作答前先用题目自动检索一次知识库")
     parser.add_argument("--per-subject", type=int, default=12)
-    parser.add_argument("--seed", default="gaokao")
+    parser.add_argument("--split", choices=["test", "tune"], default="test", help="test 为测验题，tune 为定位改动用的题，两者不重叠")
     parser.add_argument("--turn-tokens", type=int, default=0)
     parser.add_argument("--work", type=Path, default=ROOT / "runs")
     args = parser.parse_args()
     work = args.work / args.label
     work.mkdir(parents=True, exist_ok=True)
-    questions = prepare(args.per_subject, args.seed)
+    questions = questions_for(args.split, args.per_subject)
     (work / "questions.jsonl").write_text("".join(json.dumps({"id": q["id"], "question": q["question"]}, ensure_ascii=False) + "\n" for q in questions), encoding="utf-8")
     store = work / "store"
     if store.exists():

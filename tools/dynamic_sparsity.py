@@ -1,9 +1,11 @@
 """测量按输入实时选择 MLP 神经元的代价：每个 token 只保留一部分神经元，其余置零；只测量，不改参数。
 
-两种选择方式：
-  oracle —— 按神经元的实际输出 |silu(gate)·up| 取前 k，代表这种动态结构的上限；
-  gate   —— 只按 |silu(gate)| 取前 k。gate 投影本来就要算，选中后才读 up 与 down 的对应行，
-            这是推理引擎能真正省下读取的做法。
+选择方式：
+  oracle     —— 按神经元的实际输出 |silu(gate)·up| 取前 k，代表这种动态结构的上限；
+  gate       —— 只按 |silu(gate)| 取前 k（gate 投影本来就要算）；
+  previous   —— 用前一个 token 的实际输出挑选，检验相邻 token 用到的神经元是否连续；
+  lowrank:R  —— 把本层 gate、up 权重做 SVD，只保留前 R 个方向，先用这个读取量小得多的近似预判
+                |silu(gate)·up|，再只精确计算选中的神经元。预判器完全来自模型自己的权重，不训练。
 以模型在定位题上不用工具时自己的回答为目标，强制续写前 N 个 token，比较负对数似然与首选一致率。
 """
 
@@ -31,6 +33,8 @@ def main():
     parser.add_argument("--questions", type=int, default=16)
     parser.add_argument("--tokens", type=int, default=64)
     parser.add_argument("--keep", type=float, nargs="+", default=[0.5, 0.3, 0.2, 0.1])
+    parser.add_argument("--modes", nargs="+", default=["oracle", "gate"],
+                        help="oracle、gate、previous 或 lowrank:R（如 lowrank:128）")
     args = parser.parse_args()
     args.work.mkdir(parents=True, exist_ok=True)
 
@@ -58,15 +62,36 @@ def main():
     setting = {"mode": None, "keep": 1.0}
     mass = []
 
+    factors = {}
+
+    def low_rank(module, rank):
+        key = (id(module), rank)
+        if key not in factors:
+            pair = []
+            for weight in (module.gate_proj.weight, module.up_proj.weight):
+                u, s, vt = torch.linalg.svd(weight.detach(), full_matrices=False)
+                pair.append((vt[:rank].T.contiguous(), (u[:, :rank] * s[:rank]).T.contiguous()))
+            factors[key] = pair
+        return factors[key]
+
     def forward(module, inputs):
         x = inputs[0]
         gate = F.silu(module.gate_proj(x))
         hidden = gate * module.up_proj(x)
         if setting["mode"] is not None:
-            score = (hidden if setting["mode"] == "oracle" else gate).abs()
+            mode = setting["mode"]
+            if mode == "oracle":
+                score = hidden.abs()
+            elif mode == "gate":
+                score = gate.abs()
+            elif mode == "previous":
+                score = torch.cat([hidden[:, :1], hidden[:, :-1]], dim=1).abs()
+            else:
+                (gate_in, gate_out), (up_in, up_out) = low_rank(module, int(mode.split(":")[1]))
+                score = (F.silu(x @ gate_in @ gate_out) * (x @ up_in @ up_out)).abs()
             count = max(1, int(round(score.shape[-1] * setting["keep"])))
             kept = torch.zeros_like(hidden).scatter_(-1, score.topk(count, dim=-1).indices, 1.0)
-            if setting["mode"] == "oracle":
+            if mode == "oracle":
                 total = hidden.abs().sum(-1)
                 mass.append(float(((hidden.abs() * kept).sum(-1) / total.clamp_min(1e-12)).mean()))
             hidden = hidden * kept
@@ -88,7 +113,7 @@ def main():
     base_nll, base_agree = score()
     rows = [{"mode": "full", "keep": 1.0, "nll": round(base_nll, 4), "agree": round(base_agree, 4)}]
     print(json.dumps(rows[0]), flush=True)
-    for mode in ("oracle", "gate"):
+    for mode in args.modes:
         for keep in args.keep:
             setting.update(mode=mode, keep=keep)
             mass.clear()

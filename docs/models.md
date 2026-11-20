@@ -74,6 +74,54 @@ target/release/nncoss-edit apply --input model/Qwen3-0.6B/qwen3-0.6b-q4.nncossll
 | 文件 | 字节数 | SHA-256 |
 |---|---|---|
 | `edits/qwen3-0.6b-q4-l1n2997-off.nncossllm`（第 1 层 2997 号神经元置零） | 318,862,912 | `51c5a98653a6acb5a5d89aa310aff1d4d7e2fca128b52590021a2ff827f8cd8c` |
+| `edits/qwen3-0.6b-q4-retrieval-gate.nncossllm`（检索门改写，16 个 MLP 神经元） | 318,862,912 | `8533724547a891030df0da9a9563b90d82f50603dd002766146293e13588a45e` |
+| `edits/qwen3-0.6b-q4-gate-repetition.nncossllm`（检索门 + 重复循环改写，另加 8 个 KV 头） | 318,862,912 | `3c45b262024e7d68e00d7abe4767e3ff591df0cd15144c1aaa4b584f0ab33f2e` |
+
+后两个模型的改动计划由 `tools/retrieval_gate.py` 与 `tools/repetition_edit.py` 定位得到（见[实验记录 5.5](brain-experiments.md#55-定位只依据资料作答的部件)），计划原文如下。把它们分别存为 `tmp/retrieval-gate.json` 与 `tmp/repetition.json` 后执行：
+
+```bash
+target/release/nncoss-edit apply --input model/Qwen3-0.6B/qwen3-0.6b-q4.nncossllm \
+  --output model/edits/qwen3-0.6b-q4-retrieval-gate.nncossllm --plan tmp/retrieval-gate.json
+target/release/nncoss-edit apply --input model/edits/qwen3-0.6b-q4-retrieval-gate.nncossllm \
+  --output model/edits/qwen3-0.6b-q4-gate-repetition.nncossllm --plan tmp/repetition.json
+```
+
+`tmp/retrieval-gate.json`：
+
+```json
+[
+  {"op": "scale", "target": "mlp", "layer": 0, "index": [2], "factor": 1.5},
+  {"op": "scale", "target": "mlp", "layer": 8, "index": [753], "factor": 0.5},
+  {"op": "scale", "target": "mlp", "layer": 11, "index": [1372], "factor": 1.5},
+  {"op": "scale", "target": "mlp", "layer": 13, "index": [1498], "factor": 1.5},
+  {"op": "scale", "target": "mlp", "layer": 14, "index": [3007], "factor": 0.5},
+  {"op": "scale", "target": "mlp", "layer": 14, "index": [1460], "factor": 1.5},
+  {"op": "scale", "target": "mlp", "layer": 15, "index": [1357], "factor": 1.5},
+  {"op": "scale", "target": "mlp", "layer": 17, "index": [3033], "factor": 0.5},
+  {"op": "scale", "target": "mlp", "layer": 22, "index": [734], "factor": 1.5},
+  {"op": "scale", "target": "mlp", "layer": 23, "index": [1706], "factor": 0.5},
+  {"op": "scale", "target": "mlp", "layer": 24, "index": [613], "factor": 1.5},
+  {"op": "scale", "target": "mlp", "layer": 27, "index": [47, 84, 1608], "factor": 0.5},
+  {"op": "scale", "target": "mlp", "layer": 27, "index": [386, 1274], "factor": 1.5}
+]
+```
+
+`tmp/repetition.json`：
+
+```json
+[
+  {"op": "scale", "target": "kv_head", "layer": 6, "index": [5], "factor": 0.5},
+  {"op": "scale", "target": "kv_head", "layer": 6, "index": [3], "factor": 1.5},
+  {"op": "scale", "target": "kv_head", "layer": 10, "index": [3], "factor": 0.5},
+  {"op": "scale", "target": "kv_head", "layer": 13, "index": [2], "factor": 0.5},
+  {"op": "scale", "target": "kv_head", "layer": 13, "index": [0], "factor": 1.5},
+  {"op": "scale", "target": "kv_head", "layer": 18, "index": [2], "factor": 0.5},
+  {"op": "scale", "target": "kv_head", "layer": 18, "index": [1], "factor": 1.5},
+  {"op": "scale", "target": "kv_head", "layer": 21, "index": [4], "factor": 0.5}
+]
+```
+
+这两个改写模型在 108 道高考测验题上不用工具的正确率低于原模型（35.2%、36.1% 对 41.7%），只作为实验记录保留，不推荐使用。
 
 以上哈希以本文给出的 Q4 基础模型为输入；基础模型的 scale 若因重新蒸馏而不同，改写结果也会不同。
 

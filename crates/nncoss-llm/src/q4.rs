@@ -109,7 +109,7 @@ impl Q4Matrix {
         Ok(matrix)
     }
 
-    fn row_scale(&self, row: usize) -> f32 {
+    pub(crate) fn row_scale(&self, row: usize) -> f32 {
         let offset = row * SCALE_BYTES;
         f32::from_le_bytes(
             self.bytes[offset..offset + SCALE_BYTES]
@@ -128,11 +128,11 @@ impl Q4Matrix {
         &self.bytes[start..start + self.rows * self.groups * NIBBLE_BYTES]
     }
 
-    fn row_codes(&self, row: usize) -> &[u8] {
+    pub(crate) fn row_codes(&self, row: usize) -> &[u8] {
         &self.codes()[row * self.groups..(row + 1) * self.groups]
     }
 
-    fn row_nibbles(&self, row: usize) -> &[u8] {
+    pub(crate) fn row_nibbles(&self, row: usize) -> &[u8] {
         let width = self.groups * NIBBLE_BYTES;
         &self.nibbles()[row * width..(row + 1) * width]
     }

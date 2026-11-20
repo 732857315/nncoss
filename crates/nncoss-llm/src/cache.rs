@@ -46,11 +46,14 @@ impl KvValue for F16 {
 
     fn store(values: &[f32], output: &mut [Self]) {
         let length = values.len().min(output.len());
-        let mut done = 0;
         #[cfg(target_arch = "x86_64")]
-        if std::arch::is_x86_feature_detected!("f16c") {
-            done = unsafe { store_f16c(&values[..length], &mut output[..length]) };
-        }
+        let done = if std::arch::is_x86_feature_detected!("f16c") {
+            unsafe { store_f16c(&values[..length], &mut output[..length]) }
+        } else {
+            0
+        };
+        #[cfg(not(target_arch = "x86_64"))]
+        let done = 0;
         for (slot, value) in output[done..length].iter_mut().zip(&values[done..length]) {
             *slot = Self::from_f32(*value);
         }

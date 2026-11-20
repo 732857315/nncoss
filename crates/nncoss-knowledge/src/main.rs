@@ -26,7 +26,9 @@ const USAGE: &str = "用法：
   --temperature T        采样温度，默认思考模式 0.6、非思考模式 0
   --top-k K / --top-p P  采样参数
   --seed S               随机种子
-  --kv f32|f16|i8        KV Cache 精度，默认 Q4 模型用 f16；i8 在长上下文时读得更少";
+  --kv f32|f16|i8        KV Cache 精度，默认 Q4 模型用 f16；i8 在长上下文时读得更少
+  --sparsity SPEC        decode 时丢弃的输入通道比例：单个数（各部分相同），
+                         或 attn=…,mlp=…,head=…（q/k/v、gate/up 与输出层的输入）；只支持 Q4 模型";
 
 #[derive(Default)]
 struct Options {
@@ -102,6 +104,11 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Options, String> {
                     "i8" => KvPrecision::I8,
                     other => return Err(format!("--kv 只能是 f32、f16 或 i8，收到 {other}")),
                 })
+            }
+            "--sparsity" => {
+                options.config.sparsity = value(&mut args, &arg)?
+                    .parse()
+                    .map_err(|error| format!("--sparsity：{error}"))?;
             }
             "--help" | "-h" => return Err(USAGE.to_string()),
             other => return Err(format!("未知参数 {other}\n\n{USAGE}")),

@@ -21,7 +21,7 @@
 
 - `cargo fmt --all --check`。
 - `cargo clippy -p nncoss-llm -p nncoss-web -p nncoss-knowledge -p nncoss-edit --all-targets -- -D warnings`。
-- 在 debug 与 release 下执行 `cargo test -p nncoss-llm`，覆盖模型解析与非法头字段、分块加载在各特性组合、每个二分切点、每个截断长度与各错误路径上同整块加载的一致性、手算 RoPE 与 GQA 头映射、采样、KV Cache 扩容失败与回退、prefill／decode 失败后的状态保持，以及多层 GQA 模型各特性组合上的增量解码与无缓存参考前向对拍；int8 KV Cache 的按行缩放与扩容、注意力在 f32／f16／int8 三种缓存上与标量参考逐位一致、Hadamard 旋转的正交性，以及 int8 缓存下的 logits 与参考前向的偏差，并验证 release 的原生 ABI panic 映射、分配错误回归和测试模型与已提交夹具逐字节一致。
+- 在 debug 与 release 下执行 `cargo test -p nncoss-llm`，覆盖模型解析与非法头字段、分块加载在各特性组合、每个二分切点、每个截断长度与各错误路径上同整块加载的一致性、手算 RoPE 与 GQA 头映射、采样、KV Cache 扩容失败与回退、prefill／decode 失败后的状态保持，以及多层 GQA 模型各特性组合上的增量解码与无缓存参考前向对拍；int8 KV Cache 的按行缩放与扩容、注意力在 f32／f16／int8 三种缓存上与标量参考逐位一致、Hadamard 旋转的正交性，以及 int8 缓存下的 logits 与参考前向的偏差；输入通道稀疏化的按列副本在全保留时与稠密 Q4 内核一致、丢弃通道时等于把这些输入置零后的稠密结果，标量与 AVX2 路径一致，拼接矩阵与多任务分行正确，会话中全保留时与稠密 decode 一致、各部分可单独启用，非 Q4 模型与非法比例被拒绝，并验证 release 的原生 ABI panic 映射、分配错误回归和测试模型与已提交夹具逐字节一致。
 - 执行 `cargo test -p nncoss-web`，覆盖表单解码、HTML 转义、Cookie、mock 对话历史和重置。
 - 执行 `cargo test -p nncoss-knowledge`，覆盖中英文检索分词与 BM25 排序、段落导入与笔记持久化、笔记去重与依据检查、工具调用解析（含 LaTeX 反斜杠的容错）、Qwen 工具模板和网页正文提取，不加载模型、不访问网络。
 - 执行 `cargo test -p nncoss-edit`，覆盖 f32 与 Q4 模型上按神经元、KV 头和 Norm 元素的缩放、删除整层后其余张量逐字节保留、越界与非法改动的拒绝，以及改动后模型仍能被加载器正确加载。

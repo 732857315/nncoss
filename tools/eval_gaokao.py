@@ -85,6 +85,7 @@ def main():
     parser.add_argument("--split", choices=["test", "tune"], default="test", help="test 为测验题，tune 为定位改动用的题，两者不重叠")
     parser.add_argument("--turn-tokens", type=int, default=0)
     parser.add_argument("--kv", choices=["f32", "f16", "i8"], help="KV Cache 精度，默认由引擎决定")
+    parser.add_argument("--sparsity", help="decode 时丢弃的输入通道比例，格式同 nncoss-know --sparsity")
     parser.add_argument("--work", type=Path, default=ROOT / "tmp")
     args = parser.parse_args()
     work = args.work / args.label
@@ -108,6 +109,8 @@ def main():
         command.append("--prefetch")
     if args.kv:
         command += ["--kv", args.kv]
+    if args.sparsity:
+        command += ["--sparsity", args.sparsity]
     turn_tokens = args.turn_tokens or (3072 if args.think else 1024)
     command += ["--turn-tokens", str(turn_tokens)]
     started = time.time()
@@ -115,6 +118,7 @@ def main():
     answers = [json.loads(line) for line in (work / "answers.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
     table, details = judge(questions, answers)
     report = {"label": args.label, "model": str(args.model), "think": args.think, "tools": not args.no_tools, "prefetch": args.prefetch, "kv": args.kv,
+              "sparsity": args.sparsity,
               "seconds": round(time.time() - started), "notes_written": sum(d["notes"] for d in details),
               "searches": sum(d["searches"] for d in details), "table": table, "details": details}
     (work / "report.json").write_text(json.dumps(report, ensure_ascii=False, indent=1), encoding="utf-8")

@@ -77,7 +77,9 @@ def judge(questions, answers):
             table[key][0] += ok
             table[key][1] += 1
         details.append({"id": question["id"], "expected": question["answer"], "picked": picked, "ok": ok,
-                        "searches": len(answer["searches"]) if answer else 0, "notes": len(answer["notes"]) if answer else 0})
+                        "searches": len(answer["searches"]) if answer else 0, "notes": len(answer["notes"]) if answer else 0,
+                        "confidence": answer.get("confidence") if answer else None,
+                        "consulted": bool(answer and answer.get("consulted"))})
     return {key: {"correct": value[0], "total": value[1], "accuracy": round(value[0] / value[1], 3)} for key, value in table.items()}, details
 
 
@@ -97,6 +99,8 @@ def main():
     parser.add_argument("--turn-tokens", type=int, default=0)
     parser.add_argument("--kv", choices=["f32", "f16", "i8"], help="KV Cache 精度，默认由引擎决定")
     parser.add_argument("--sparsity", help="decode 时丢弃的输入通道比例，格式同 nncoss-know --sparsity")
+    parser.add_argument("--reply-prefix", help="第一轮回复由这段文字开头，格式同 nncoss-know --reply-prefix")
+    parser.add_argument("--consult-below", type=float, help="先不用工具作答，对最终选项的把握低于这个值才查资料重答，同 nncoss-know --consult-below")
     parser.add_argument("--work", type=Path, default=ROOT / "tmp")
     parser.add_argument("--rejudge", action="store_true", help="不重新作答，只用现有 answers.jsonl 重新判分并改写 report.json")
     args = parser.parse_args()
@@ -129,6 +133,10 @@ def main():
         command += ["--kv", args.kv]
     if args.sparsity:
         command += ["--sparsity", args.sparsity]
+    if args.reply_prefix:
+        command += ["--reply-prefix", args.reply_prefix]
+    if args.consult_below is not None:
+        command += ["--consult-below", str(args.consult_below)]
     turn_tokens = args.turn_tokens or (3072 if args.think else 1024)
     command += ["--turn-tokens", str(turn_tokens)]
     started = time.time()
@@ -137,7 +145,8 @@ def main():
     table, details = judge(questions, answers)
     report = {"label": args.label, "model": str(args.model), "think": args.think, "tools": not args.no_tools, "prefetch": args.prefetch, "kv": args.kv,
               "tool_rounds": args.tool_rounds, "learn": not args.no_learn,
-              "sparsity": args.sparsity,
+              "sparsity": args.sparsity, "reply_prefix": args.reply_prefix, "consult_below": args.consult_below,
+              "consulted": sum(d["consulted"] for d in details),
               "seconds": round(time.time() - started), "notes_written": sum(d["notes"] for d in details),
               "searches": sum(d["searches"] for d in details), "table": table, "details": details}
     (work / "report.json").write_text(json.dumps(report, ensure_ascii=False, indent=1), encoding="utf-8")

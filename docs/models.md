@@ -76,14 +76,17 @@ target/release/nncoss-edit apply --input model/Qwen3-0.6B/qwen3-0.6b-q4.nncossll
 | `edits/qwen3-0.6b-q4-l1n2997-off.nncossllm`（第 1 层 2997 号神经元置零） | 318,862,912 | `51c5a98653a6acb5a5d89aa310aff1d4d7e2fca128b52590021a2ff827f8cd8c` |
 | `edits/qwen3-0.6b-q4-retrieval-gate.nncossllm`（检索门改写，16 个 MLP 神经元） | 318,862,912 | `8533724547a891030df0da9a9563b90d82f50603dd002766146293e13588a45e` |
 | `edits/qwen3-0.6b-q4-gate-repetition.nncossllm`（检索门 + 重复循环改写，另加 8 个 KV 头） | 318,862,912 | `3c45b262024e7d68e00d7abe4767e3ff591df0cd15144c1aaa4b584f0ab33f2e` |
+| `edits/qwen3-0.6b-q4-repetition.nncossllm`（只有重复循环改写的 8 个 KV 头） | 318,862,912 | `677c230fad9ae3eacf9f8e2b99176b99ca35be02636da42add6996ee3586cd1d` |
 
-后两个模型的改动计划由 `tools/retrieval_gate.py` 与 `tools/repetition_edit.py` 定位得到（见[实验记录 5.5](brain-experiments.md#55-定位只依据资料作答的部件)），计划原文如下。把它们分别存为 `tmp/retrieval-gate.json` 与 `tmp/repetition.json` 后执行：
+后三个模型的改动计划由 `tools/retrieval_gate.py` 与 `tools/repetition_edit.py` 定位得到（见[实验记录 5.5](brain-experiments.md#55-定位只依据资料作答的部件)），计划原文如下。把它们分别存为 `tmp/retrieval-gate.json` 与 `tmp/repetition.json` 后执行：
 
 ```bash
 target/release/nncoss-edit apply --input model/Qwen3-0.6B/qwen3-0.6b-q4.nncossllm \
   --output model/edits/qwen3-0.6b-q4-retrieval-gate.nncossllm --plan tmp/retrieval-gate.json
 target/release/nncoss-edit apply --input model/edits/qwen3-0.6b-q4-retrieval-gate.nncossllm \
   --output model/edits/qwen3-0.6b-q4-gate-repetition.nncossllm --plan tmp/repetition.json
+target/release/nncoss-edit apply --input model/Qwen3-0.6B/qwen3-0.6b-q4.nncossllm \
+  --output model/edits/qwen3-0.6b-q4-repetition.nncossllm --plan tmp/repetition.json
 ```
 
 `tmp/retrieval-gate.json`：
@@ -121,7 +124,7 @@ target/release/nncoss-edit apply --input model/edits/qwen3-0.6b-q4-retrieval-gat
 ]
 ```
 
-这两个改写模型在 108 道高考测验题上不用工具的正确率低于原模型（35.2%、36.1% 对 41.7%），只作为实验记录保留，不推荐使用。
+这三个改写模型在 108 道高考测验题上不用工具的正确率都低于原模型（35.2%、36.1%、30.6% 对 41.7%），只作为实验记录保留，不推荐使用。
 
 以上哈希以本文给出的 Q4 基础模型为输入；基础模型的 scale 若因重新蒸馏而不同，改写结果也会不同。
 

@@ -674,6 +674,7 @@ target/release/nncoss-edit apply --input <模型> --output <新模型> --plan <�
 | `tools/moefy.py` | 按神经元的共同激活把稠密 MLP 切成等大小的专家，测量按 token 选专家的代价 |
 | `tools/regions.py` | 读题时为每层选出一组神经元作为这道题的“区域”，测量作答时只用这些神经元的代价，并与全局共用区域、随机区域比较 |
 | `tools/input_sparsity.py` | 在 f32 模型上测量每个 token 丢弃各矩阵输入中一部分通道的代价，并按参数量估计少读的权重比例 |
+| `tools/answer_confidence.py` | 同一道题作答两次（如不用书与先查书）后，追问最终选项并读出 A–D 的概率，检验能否由模型自己的把握决定采用哪一次的答案 |
 
 ## 示例模型
 

@@ -44,15 +44,24 @@ def questions_for(split, per_subject):
     return [question for items in by_subject.values() for question in items[:per_subject]]
 
 
+LETTER = r"(?<![A-Za-z])([A-D])(?![A-Za-z])"
+# 模型明确给出结论的说法，如“答案：C”“正确选项是 **B**”“故选 D”“\\boxed{A}”。
+STRONG_ANSWERS = (r"\\boxed\{([^{}]*)\}",
+                  r"(?:答案|正确选项|正确的选项|故选|应选|选择)\s*(?:应?是|为|应为)?\s*[:：]?\s*\**\s*[（(]?([A-D])(?![A-Za-z])")
+WEAK_ANSWERS = (r"选项\s*[:：]?\s*\**\s*([A-D])(?![A-Za-z])",)
+
+
 def choice(reply):
+    """取模型最后一处明确给出的选项。模型逐项分析时常写“分析各选项：**A.** …”，
+    开头出现的字母并不是它的选择（旧版取第一处，曾把这类回答一律判成 A），最后的结论才是。"""
     text = re.sub(r"<think>.*?</think>", "", reply, flags=re.S)
-    candidates = re.findall(r"\\boxed\{([^{}]*)\}", text)
-    candidates += re.findall(r"(?:答案|选项|正确选项|选择|故选|应选)\s*(?:是|为)?\s*[:：]?\s*\**\s*([A-D])", text)
-    for candidate in candidates:
-        letters = re.findall(r"(?<![A-Za-z])([A-D])(?![A-Za-z])", candidate)
-        if letters:
-            return letters[0]
-    letters = re.findall(r"(?<![A-Za-z])([A-D])(?![A-Za-z])", text)
+    for patterns in (STRONG_ANSWERS, WEAK_ANSWERS):
+        found = sorted((match.start(), match.group(1)) for pattern in patterns for match in re.finditer(pattern, text))
+        for _, candidate in reversed(found):
+            letters = re.findall(LETTER, candidate)
+            if letters:
+                return letters[0]
+    letters = re.findall(LETTER, text)
     return letters[-1] if letters else None
 
 
@@ -87,8 +96,11 @@ def main():
     parser.add_argument("--kv", choices=["f32", "f16", "i8"], help="KV Cache 精度，默认由引擎决定")
     parser.add_argument("--sparsity", help="decode 时丢弃的输入通道比例，格式同 nncoss-know --sparsity")
     parser.add_argument("--work", type=Path, default=ROOT / "tmp")
+    parser.add_argument("--rejudge", action="store_true", help="不重新作答，只用现有 answers.jsonl 重新判分并改写 report.json")
     args = parser.parse_args()
     work = args.work / args.label
+    if args.rejudge:
+        return rejudge(work, args.split, args.per_subject)
     work.mkdir(parents=True, exist_ok=True)
     questions = questions_for(args.split, args.per_subject)
     (work / "questions.jsonl").write_text("".join(json.dumps({"id": q["id"], "question": q["question"]}, ensure_ascii=False) + "\n" for q in questions), encoding="utf-8")
@@ -124,6 +136,17 @@ def main():
     (work / "report.json").write_text(json.dumps(report, ensure_ascii=False, indent=1), encoding="utf-8")
     print(args.label, json.dumps({key: value["accuracy"] for key, value in table.items()}, ensure_ascii=False),
           f"检索 {report['searches']} 次，新笔记 {report['notes_written']} 条，用时 {report['seconds']}s", flush=True)
+
+
+def rejudge(work, split, per_subject):
+    report = json.loads((work / "report.json").read_text(encoding="utf-8"))
+    answers = [json.loads(line) for line in (work / "answers.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
+    table, details = judge(questions_for(split, per_subject), answers)
+    before = report["table"]["全部"]["accuracy"]
+    report.update(table=table, details=details)
+    (work / "report.json").write_text(json.dumps(report, ensure_ascii=False, indent=1), encoding="utf-8")
+    print(report["label"], f"重新判分：{before} -> {table['全部']['accuracy']}",
+          json.dumps({key: value["accuracy"] for key, value in table.items()}, ensure_ascii=False), flush=True)
 
 
 if __name__ == "__main__":

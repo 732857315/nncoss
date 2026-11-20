@@ -4,7 +4,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
-use nncoss_knowledge::{Agent, AgentConfig, KnowledgeBase, opening_prompt, prefetch_prompt};
+use nncoss_knowledge::{
+    Agent, AgentConfig, KnowledgeBase, opening_prompt, prefetch_prompt, reference_prompt,
+};
 use nncoss_llm::{KvPrecision, Model, ModelLoader};
 use serde::{Deserialize, Serialize};
 use tokenizers::Tokenizer;
@@ -14,14 +16,16 @@ const USAGE: &str = "用法：
   nncoss-know search --store <目录> --query <问题> [--limit N]
   nncoss-know ask    --store <目录> --model <模型> --tokenizer <分词器> --question <问题> [选项]
   nncoss-know batch  --store <目录> --model <模型> --tokenizer <分词器> --input <题目.jsonl> --output <结果.jsonl> [选项]
-  nncoss-know prompt (--question <问题> | --input <题目.jsonl> --output <提示.jsonl>) [--prefetch --store <目录>] [选项]
+  nncoss-know prompt (--question <问题> | --input <题目.jsonl> --output <提示.jsonl>) [--prefetch|--reference --store <目录>] [选项]
 
 选项：
   --think                启用思考模式
-  --no-tools             不提供任何工具（不使用知识库）
+  --no-tools             不提供任何工具（模型不能自己检索或记笔记）
   --browse               提供 browse 工具，允许模型打开网页
   --no-learn             答题后不自动归纳笔记
-  --prefetch             作答前先用题目自动检索一次知识库（对照实验用）
+  --prefetch             作答前先用题目自动检索一次知识库，写成模型的一次工具调用（对照实验用）
+  --reference            作答前先用题目检索一次，把查到的段落作为参考资料写在问题前面；
+                         配合 --no-tools --no-learn 时只读资料、各题互不影响（对照实验用）
   --turn-tokens N        每轮最多生成的 token 数，默认 1024
   --tool-rounds N        最多调用几轮工具，默认 6；配合 --prefetch 用 0 时只读预取的资料
   --temperature T        采样温度，默认思考模式 0.6、非思考模式 0
@@ -32,7 +36,7 @@ const USAGE: &str = "用法：
                          或 attn=…,mlp=…,head=…（q/k/v、gate/up 与输出层的输入）；只支持 Q4 模型
   --reply-prefix TEXT    第一轮回复由这段文字开头，模型接着写（对照实验用）
   --consult-below P      先不用工具作答，再追问最终选项（A–D）；最高概率低于 P（0–1）时
-                         才按其余选项（如 --prefetch）查资料重新作答；只适用于单选题";
+                         才按其余选项（如 --prefetch 或 --reference）查资料重新作答；只适用于单选题";
 
 #[derive(Default)]
 struct Options {
@@ -98,6 +102,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Options, String> {
             "--browse" => options.config.browse = true,
             "--no-learn" => options.config.learn = false,
             "--prefetch" => options.config.prefetch = true,
+            "--reference" => options.config.reference = true,
             "--tool-rounds" => options.config.tool_rounds = number(value(&mut args, &arg)?, &arg)?,
             "--turn-tokens" => options.config.turn_tokens = number(value(&mut args, &arg)?, &arg)?,
             "--temperature" => options.temperature = Some(number(value(&mut args, &arg)?, &arg)?),
@@ -131,8 +136,15 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Options, String> {
             other => return Err(format!("未知参数 {other}\n\n{USAGE}")),
         }
     }
-    if options.config.consult_below.is_some() && !options.config.tools {
-        return Err("--consult-below 的第二次作答要查资料，不能与 --no-tools 同用".to_string());
+    if options.config.reference && options.config.prefetch {
+        return Err("--reference 与 --prefetch 都是先检索一次，只能选一个".to_string());
+    }
+    if options.config.consult_below.is_some() && !options.config.tools && !options.config.reference
+    {
+        return Err(
+            "--consult-below 的第二次作答要查资料，与 --no-tools 同用时需要 --reference"
+                .to_string(),
+        );
     }
     options.config.sampling.temperature = options
         .temperature
@@ -193,13 +205,16 @@ struct PromptRecord<'a> {
 }
 
 fn prompts(options: &Options) -> Result<(), String> {
-    let base = if options.config.prefetch && options.config.tools {
+    let base = if options.config.reference || (options.config.prefetch && options.config.tools) {
         Some(KnowledgeBase::open(&required(&options.store, "--store")?)?)
     } else {
         None
     };
     let render = |question: &str| {
         let prompt = match &base {
+            Some(base) if options.config.reference => {
+                reference_prompt(base, &options.config, question, &mut Vec::new()).0
+            }
             Some(base) => prefetch_prompt(base, &options.config, question, &mut Vec::new()).0,
             None => opening_prompt(&options.config, question),
         };

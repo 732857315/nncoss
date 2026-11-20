@@ -107,6 +107,8 @@ def main():
     parser.add_argument("--think", action="store_true")
     parser.add_argument("--no-tools", action="store_true")
     parser.add_argument("--prefetch", action="store_true", help="作答前先用题目自动检索一次知识库")
+    parser.add_argument("--reference", action="store_true",
+                        help="作答前先用题目检索一次，把查到的段落作为参考资料写在问题前面；配合 --no-tools --no-learn 时只读资料")
     parser.add_argument("--tool-rounds", type=int, help="最多调用几轮工具；配合 --prefetch 用 0 时只读预取的资料")
     parser.add_argument("--no-learn", action="store_true", help="答题后不归纳笔记，各题互不影响")
     parser.add_argument("--per-subject", type=int, help="每科题数，默认 test、tune 为 12，wide 为 48")
@@ -129,7 +131,7 @@ def main():
     store = work / "store"
     if store.exists():
         shutil.rmtree(store)
-    if args.store and not args.no_tools:
+    if args.store and (not args.no_tools or args.reference):
         shutil.copytree(args.store, store)
     else:
         store.mkdir()
@@ -141,6 +143,8 @@ def main():
         command.append("--no-tools")
     if args.prefetch:
         command.append("--prefetch")
+    if args.reference:
+        command.append("--reference")
     if args.tool_rounds is not None:
         command += ["--tool-rounds", str(args.tool_rounds)]
     if args.no_learn:
@@ -159,7 +163,7 @@ def main():
     subprocess.run(command, check=True)
     answers = [json.loads(line) for line in (work / "answers.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
     table, details = judge(questions, answers)
-    report = {"label": args.label, "model": str(args.model), "think": args.think, "tools": not args.no_tools, "prefetch": args.prefetch, "kv": args.kv,
+    report = {"label": args.label, "model": str(args.model), "think": args.think, "tools": not args.no_tools, "prefetch": args.prefetch, "reference": args.reference, "kv": args.kv,
               "tool_rounds": args.tool_rounds, "learn": not args.no_learn,
               "sparsity": args.sparsity, "reply_prefix": args.reply_prefix, "consult_below": args.consult_below,
               "consulted": sum(d["consulted"] for d in details),

@@ -17,6 +17,8 @@ const MIN_SUPPORT: f32 = 0.6;
 /// 作答之后追问最终选项；模型给 A–D 的概率反映它对自己答案的把握（见 `tools/answer_confidence.py`）。
 const CONFIDENCE_PROBE: &str = "<|im_start|>user\n你的最终答案是哪个选项？只回答一个字母。<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
 const CHOICES: [&str; 4] = ["A", "B", "C", "D"];
+const REFERENCE_INTRO: &str =
+    "下面是按题目从课本等资料中检索到的几段内容，不一定与题目相关，仅供参考。";
 const ROUNDS_USED_UP: &str = "工具调用次数已用完，请根据已有信息直接作答。";
 const INSTRUCTION: &str = "你的知识保存在外部知识库里，知识库中有幼儿园到高中的课本、计算机与算法资料，以及你以前记下的笔记。回答需要事实、概念、公式、方法或课文内容的问题时，先用 search_knowledge 查找，再依据查到的内容作答；学到以后用得上的知识时，用 write_note 记下来。";
 const BROWSE_INSTRUCTION: &str = "需要网页上的内容时，用 browse 打开网址阅读。";
@@ -32,6 +34,9 @@ pub struct AgentConfig {
     pub browse: bool,
     pub learn: bool,
     pub prefetch: bool,
+    /// 作答前用题目检索一次，把查到的段落作为参考资料写在问题前面（不经过工具调用）。
+    /// 与 `tools: false` 同用时模型只读这些资料，是“大脑 + 书籍”的只读对照。
+    pub reference: bool,
     pub turn_tokens: usize,
     pub tool_rounds: usize,
     pub search_limit: usize,
@@ -57,6 +62,7 @@ impl Default for AgentConfig {
             browse: false,
             learn: true,
             prefetch: false,
+            reference: false,
             turn_tokens: 1024,
             tool_rounds: 6,
             search_limit: 4,
@@ -247,6 +253,24 @@ pub fn prefetch_prompt(
         "{}<|im_start|>user\n{question}<|im_end|>\n{}",
         system_prompt(config),
         prefetch_turn(&query, &output, config.thinking)
+    );
+    (prompt, query)
+}
+
+/// 参考资料条件下模型开口前看到的完整提示：用题目检索一次，把查到的段落写在问题前面。
+/// 是否另外提供工具仍由 `tools` 决定。返回提示和所用的检索词。
+pub fn reference_prompt(
+    base: &KnowledgeBase,
+    config: &AgentConfig,
+    question: &str,
+    sources: &mut Vec<String>,
+) -> (String, String) {
+    let query: String = question.chars().take(PREFETCH_CHARS).collect();
+    let output = search_output(base, &query, config.search_limit, sources);
+    let prompt = format!(
+        "{}<|im_start|>user\n{REFERENCE_INTRO}\n\n{output}\n\n题目：\n{question}<|im_end|>\n{}",
+        system_prompt(config),
+        assistant_open(config.thinking)
     );
     (prompt, query)
 }
@@ -538,6 +562,7 @@ impl<'a> Agent<'a> {
         let alone = AgentConfig {
             tools: false,
             learn: false,
+            reference: false,
             ..self.config.clone()
         };
         let configured = std::mem::replace(&mut self.config, alone);
@@ -591,7 +616,11 @@ impl<'a> Agent<'a> {
             .map_err(|error| error.to_string())?;
         let mut answer = Answer::default();
         let mut sources = Vec::new();
-        let mut prompt = if self.config.prefetch && self.config.tools {
+        let mut prompt = if self.config.reference {
+            let (prompt, query) = reference_prompt(self.base, &self.config, question, &mut sources);
+            answer.searches.push(query);
+            prompt
+        } else if self.config.prefetch && self.config.tools {
             let (prompt, query) = prefetch_prompt(self.base, &self.config, question, &mut sources);
             answer.searches.push(query);
             prompt
@@ -739,6 +768,37 @@ mod tests {
             prefetch_turn("x", "y", true)
                 .ends_with("</tool_response><|im_end|>\n<|im_start|>assistant\n")
         );
+    }
+
+    #[test]
+    fn reference_puts_passages_before_the_question_without_tools() {
+        let directory =
+            std::env::temp_dir().join(format!("nncoss-reference-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        let mut base = KnowledgeBase::open(&directory).unwrap();
+        let passages = directory.with_extension("jsonl");
+        std::fs::write(
+            &passages,
+            "{\"id\": \"p1\", \"source\": \"化学\", \"text\": \"钠原子失去一个电子形成钠离子\"}\n",
+        )
+        .unwrap();
+        base.import(&passages).unwrap();
+        let config = AgentConfig {
+            tools: false,
+            reference: true,
+            ..AgentConfig::default()
+        };
+        let mut sources = Vec::new();
+        let (prompt, query) = reference_prompt(&base, &config, "钠离子带几个电荷？", &mut sources);
+        assert_eq!(query, "钠离子带几个电荷？");
+        assert_eq!(sources, ["p1"]);
+        assert!(prompt.starts_with("<|im_start|>user\n"));
+        let passage = prompt.find("[化学] 钠原子失去一个电子形成钠离子").unwrap();
+        assert!(passage < prompt.find("题目：\n钠离子带几个电荷？<|im_end|>").unwrap());
+        assert!(!prompt.contains("<tool_call>") && !prompt.contains("<tool_response>"));
+        assert!(prompt.ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n"));
+        std::fs::remove_dir_all(&directory).unwrap();
+        std::fs::remove_file(&passages).unwrap();
     }
 
     #[test]

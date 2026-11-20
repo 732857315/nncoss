@@ -1,4 +1,7 @@
+use std::sync::OnceLock;
+
 use crate::q4::{Weight, matrix_bytes as q4_matrix_bytes};
+use crate::sparse::ColumnWeights;
 use crate::{Error, MODEL_FORMAT_VERSION, Result};
 
 pub(crate) const MODEL_MAGIC: &[u8; 8] = b"NNCSLLM\0";
@@ -131,6 +134,8 @@ pub struct Model {
     pub(crate) layers: Vec<LayerWeights>,
     pub(crate) final_norm: Vec<f32>,
     pub(crate) lm_head: Option<Weight>,
+    /// 按列存放的权重副本，第一次启用输入稀疏化时建立（见 sparse.rs）。
+    pub(crate) columns: OnceLock<Option<ColumnWeights>>,
 }
 
 impl Model {
@@ -146,6 +151,13 @@ impl Model {
 
     pub(crate) fn head(&self) -> &Weight {
         self.lm_head.as_ref().unwrap_or(&self.token_embedding)
+    }
+
+    /// 按列存放的权重副本；只有 Q4 模型才有。建立一次约占与 Q4 权重相同的内存。
+    pub(crate) fn column_weights(&self) -> Option<&ColumnWeights> {
+        self.columns
+            .get_or_init(|| ColumnWeights::build(self))
+            .as_ref()
     }
 }
 
@@ -516,6 +528,7 @@ impl Assembly {
             layers,
             final_norm: self.final_norm,
             lm_head: self.lm_head,
+            columns: OnceLock::new(),
         })
     }
 }

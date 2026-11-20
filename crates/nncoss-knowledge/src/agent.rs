@@ -1,7 +1,7 @@
 use std::process::Command;
 use std::sync::Arc;
 
-use nncoss_llm::{KvPrecision, Model, SamplingConfig, Session};
+use nncoss_llm::{InputSparsity, KvPrecision, Model, SamplingConfig, Session};
 use serde::Serialize;
 use serde_json::Value;
 use tokenizers::Tokenizer;
@@ -36,6 +36,8 @@ pub struct AgentConfig {
     pub seed: u64,
     /// KV Cache 精度；None 时用引擎默认（Q4 模型为 f16）。
     pub kv: Option<KvPrecision>,
+    /// decode 时各部分矩阵输入丢弃的通道比例；默认不稀疏化。
+    pub sparsity: InputSparsity,
 }
 
 impl Default for AgentConfig {
@@ -52,6 +54,7 @@ impl Default for AgentConfig {
             sampling: SamplingConfig::default(),
             seed: 0,
             kv: None,
+            sparsity: InputSparsity::NONE,
         }
     }
 }
@@ -509,6 +512,9 @@ impl<'a> Agent<'a> {
         if let Some(precision) = self.config.kv {
             session.set_kv_precision(precision);
         }
+        session
+            .set_input_sparsity(self.config.sparsity)
+            .map_err(|error| error.to_string())?;
         session
             .set_sampler(self.config.sampling, self.config.seed)
             .map_err(|error| error.to_string())?;

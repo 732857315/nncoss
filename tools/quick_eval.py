@@ -167,6 +167,7 @@ def main():
     parser.add_argument("--seed", type=int, help="抽题种子，默认随机")
     parser.add_argument("--turn-tokens", type=int, default=0)
     parser.add_argument("--kv", choices=["f32", "f16", "i8"])
+    parser.add_argument("--sparsity", help="decode 时丢弃的输入通道比例，格式同 nncoss-know --sparsity")
     parser.add_argument("--temperature", type=float, help="采样温度；默认思考模式 0.6、非思考模式贪心")
     parser.add_argument("--top-k", type=int)
     parser.add_argument("--top-p", type=float)
@@ -201,6 +202,8 @@ def main():
         command.append("--no-tools")
     if args.kv:
         command += ["--kv", args.kv]
+    if args.sparsity:
+        command += ["--sparsity", args.sparsity]
     for flag, value in (("--temperature", args.temperature), ("--top-k", args.top_k), ("--top-p", args.top_p)):
         if value is not None:
             command += [flag, str(value)]
@@ -225,7 +228,7 @@ def main():
                             "full": question["full"], "question": question["question"],
                             "reference": question["reference"], "reply": reply})
     report = {"label": args.label, "model": str(args.model), "seed": seed, "store": str(args.store) if args.store else None,
-              "think": args.think, "temperature": args.temperature, "seconds": round(time.time() - started), "details": details}
+              "think": args.think, "temperature": args.temperature, "sparsity": args.sparsity, "seconds": round(time.time() - started), "details": details}
     (work / "review.json").write_text(json.dumps(report, ensure_ascii=False, indent=1), encoding="utf-8")
     pending = sum(detail["ratio"] is None for detail in details)
     if pending:

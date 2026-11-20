@@ -2,7 +2,9 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Instant;
 
-use nncoss_llm::{KvPrecision, MODEL_FORMAT_VERSION, Model, SamplingConfig, Session};
+use nncoss_llm::{
+    InputSparsity, KvPrecision, MODEL_FORMAT_VERSION, Model, SamplingConfig, Session,
+};
 
 #[derive(Clone, Copy)]
 struct Preset {
@@ -141,6 +143,8 @@ struct Options {
     eos: Vec<u32>,
     kv: Option<KvPrecision>,
     kv_compare: bool,
+    sparsity: InputSparsity,
+    sparsity_compare: Vec<InputSparsity>,
 }
 
 fn parse_options() -> Result<Options, String> {
@@ -156,6 +160,8 @@ fn parse_options() -> Result<Options, String> {
     let mut eos = Vec::new();
     let mut kv = None;
     let mut kv_compare = false;
+    let mut sparsity = InputSparsity::NONE;
+    let mut sparsity_compare = Vec::new();
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         let mut value = || args.next().ok_or(format!("{arg} 需要参数"));
@@ -203,6 +209,17 @@ fn parse_options() -> Result<Options, String> {
             "--tokens" => tokens = Some(value()?),
             "--generate" => generate = true,
             "--kv-compare" => kv_compare = true,
+            "--sparsity" => {
+                sparsity = value()?
+                    .parse()
+                    .map_err(|error| format!("--sparsity：{error}"))?;
+            }
+            "--sparsity-compare" => {
+                let level = value()?
+                    .parse()
+                    .map_err(|error| format!("--sparsity-compare：{error}"))?;
+                sparsity_compare.push(level);
+            }
             "--eos" => {
                 eos = value()?
                     .split(',')
@@ -212,7 +229,7 @@ fn parse_options() -> Result<Options, String> {
             }
             "--help" | "-h" => {
                 return Err(
-                    "用法：bench [--preset tiny|small] [--iterations N] [--write-model PATH]\n      bench --model PATH [--prompt N | --tokens FILE] [--decode N] [--greedy] [--kv f32|f16|i8] [--generate [--eos IDS]] [--iterations N]\n      bench --model PATH --tokens FILE --kv-compare"
+                    "用法：bench [--preset tiny|small] [--iterations N] [--write-model PATH]\n      bench --model PATH [--prompt N | --tokens FILE] [--decode N] [--greedy] [--kv f32|f16|i8] [--sparsity DROP|attn=…,mlp=…,head=…] [--generate [--eos IDS]] [--iterations N]\n      bench --model PATH --tokens FILE --kv-compare\n      bench --model PATH --tokens FILE --sparsity-compare SPEC [--sparsity-compare SPEC …]"
                         .into(),
                 );
             }
@@ -232,6 +249,8 @@ fn parse_options() -> Result<Options, String> {
         eos,
         kv,
         kv_compare,
+        sparsity,
+        sparsity_compare,
     })
 }
 
@@ -281,6 +300,9 @@ fn run_model(path: &str, options: &Options) -> Result<(), String> {
     if options.kv_compare {
         return compare_kv(&model, &prompt);
     }
+    if !options.sparsity_compare.is_empty() {
+        return compare_sparsity(&model, &prompt, &options.sparsity_compare);
+    }
     let mut prefill_ms = Vec::new();
     let mut decode_ms = Vec::new();
     let mut generated = Vec::new();
@@ -289,6 +311,9 @@ fn run_model(path: &str, options: &Options) -> Result<(), String> {
         if let Some(precision) = options.kv {
             session.set_kv_precision(precision);
         }
+        session
+            .set_input_sparsity(options.sparsity)
+            .map_err(|e| e.to_string())?;
         session
             .set_sampler(sampling, 42)
             .map_err(|e| e.to_string())?;
@@ -330,7 +355,10 @@ fn run_model(path: &str, options: &Options) -> Result<(), String> {
             "t0.6/k20/p0.95"
         }
     );
-    println!("load_ms: {load_ms:.2}");
+    println!(
+        "load_ms: {load_ms:.2}  input_sparsity: {}",
+        options.sparsity
+    );
     println!(
         "prefill_ms: {prefill:.2}  prefill_tok_s: {:.1}",
         options.prompt as f64 / prefill * 1e3
@@ -361,19 +389,51 @@ fn log_softmax(logits: &[f32]) -> Vec<f64> {
 /// 以 f32 缓存为参照：前一半 token 作为 prompt，后一半逐个强制输入，
 /// 比较每个位置上 f16 与 int8 缓存给出的下一个 token 分布（KL 与首选一致率）。
 fn compare_kv(model: &Arc<Model>, tokens: &[u32]) -> Result<(), String> {
-    if tokens.len() < 4 {
-        return Err("--kv-compare 至少需要 4 个 token".into());
-    }
-    let split = tokens.len() / 2;
-    let precisions = [KvPrecision::F32, KvPrecision::F16, KvPrecision::I8];
     let mut sessions = Vec::new();
-    for precision in precisions {
+    for (name, precision) in [
+        ("f32", KvPrecision::F32),
+        ("f16", KvPrecision::F16),
+        ("i8", KvPrecision::I8),
+    ] {
         let mut session = Session::new(model.clone(), tokens.len()).map_err(|e| e.to_string())?;
         session.set_kv_precision(precision);
+        sessions.push((name.to_string(), session));
+    }
+    compare_sessions("kv_compare", tokens, sessions)
+}
+
+/// 以完整计算为参照，比较 decode 时丢弃各比例输入通道后的下一个 token 分布。
+fn compare_sparsity(
+    model: &Arc<Model>,
+    tokens: &[u32],
+    levels: &[InputSparsity],
+) -> Result<(), String> {
+    let mut sessions = Vec::new();
+    for level in std::iter::once(InputSparsity::NONE).chain(levels.iter().copied()) {
+        let mut session = Session::new(model.clone(), tokens.len()).map_err(|e| e.to_string())?;
+        session
+            .set_input_sparsity(level)
+            .map_err(|e| e.to_string())?;
+        sessions.push((level.to_string(), session));
+    }
+    compare_sessions("sparsity_compare", tokens, sessions)
+}
+
+/// 第一个会话为参照：前一半 token 作为 prompt，后一半逐个强制输入，
+/// 比较其余会话在每个位置上给出的下一个 token 分布（KL 与首选一致率）。
+fn compare_sessions(
+    title: &str,
+    tokens: &[u32],
+    mut sessions: Vec<(String, Session)>,
+) -> Result<(), String> {
+    if tokens.len() < 4 {
+        return Err(format!("{title} 至少需要 4 个 token"));
+    }
+    let split = tokens.len() / 2;
+    for (_, session) in &mut sessions {
         session
             .prefill(&tokens[..split])
             .map_err(|e| e.to_string())?;
-        sessions.push(session);
     }
     let argmax = |values: &[f32]| {
         values
@@ -382,12 +442,12 @@ fn compare_kv(model: &Arc<Model>, tokens: &[u32]) -> Result<(), String> {
             .max_by(|a, b| a.1.total_cmp(b.1))
             .map(|(index, _)| index)
     };
-    let mut totals = [(0.0_f64, 0.0_f64, 0_usize); 2];
+    let mut totals = vec![(0.0_f64, 0.0_f64, 0_usize); sessions.len() - 1];
     let mut count = 0;
     for (index, token) in tokens[split..].iter().enumerate() {
-        let reference = sessions[0].last_logits().map_err(|e| e.to_string())?;
+        let reference = sessions[0].1.last_logits().map_err(|e| e.to_string())?;
         let reference_log = log_softmax(reference);
-        for (slot, session) in sessions[1..].iter().enumerate() {
+        for (slot, (_, session)) in sessions[1..].iter().enumerate() {
             let candidate = session.last_logits().map_err(|e| e.to_string())?;
             let divergence: f64 = reference_log
                 .iter()
@@ -401,14 +461,15 @@ fn compare_kv(model: &Arc<Model>, tokens: &[u32]) -> Result<(), String> {
         }
         count += 1;
         if index + 1 < tokens.len() - split {
-            for session in &mut sessions {
+            for (_, session) in &mut sessions {
                 session.decode(*token).map_err(|e| e.to_string())?;
             }
         }
     }
-    for (name, (total, worst, agree)) in ["f16", "i8"].iter().zip(totals) {
+    let reference = &sessions[0].0;
+    for ((name, _), (total, worst, agree)) in sessions[1..].iter().zip(totals) {
         println!(
-            "kv_compare {name} vs f32: positions={count} context={split}..{} mean_kl={:.6} max_kl={:.6} top1_agree={:.4}",
+            "{title} {name} vs {reference}: positions={count} context={split}..{} mean_kl={:.6} max_kl={:.6} top1_agree={:.4}",
             tokens.len(),
             total / count as f64,
             worst,
@@ -437,6 +498,9 @@ fn compare_generation(
                 .set_sampler(sampling, 42)
                 .map_err(|e| e.to_string())?;
             session.set_speculation(speculation);
+            session
+                .set_input_sparsity(options.sparsity)
+                .map_err(|e| e.to_string())?;
             if !history.is_empty() {
                 session.prefill(history).map_err(|e| e.to_string())?;
             }

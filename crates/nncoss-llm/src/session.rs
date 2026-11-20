@@ -8,6 +8,7 @@ use crate::ops::{
 };
 use crate::q4::{Activation, Linear, linear_into, linear_many};
 use crate::sampler::Sampler;
+use crate::sparse::{ColumnMatrix, InputSparsity, SparseInput, kept_channels};
 use crate::{Error, Result, SamplingConfig};
 
 const PREFILL_BLOCK: usize = 32;
@@ -31,6 +32,8 @@ struct Scratch {
     activations: Vec<Activation>,
     rope_frequencies: Vec<f32>,
     rope: Vec<(f32, f32)>,
+    sparse: SparseInput,
+    fused: Vec<f32>,
 }
 
 impl Scratch {
@@ -74,6 +77,8 @@ pub struct Session {
     scratch: Scratch,
     history: Vec<u32>,
     speculation: bool,
+    /// decode 时各部分矩阵输入丢弃的通道比例（见 sparse.rs）。
+    sparsity: InputSparsity,
     drafted: usize,
     accepted: usize,
     #[cfg(test)]
@@ -113,6 +118,7 @@ impl Session {
             sampler: Sampler::new(SamplingConfig::default(), 0)?,
             history: Vec::new(),
             speculation: true,
+            sparsity: InputSparsity::NONE,
             drafted: 0,
             accepted: 0,
             #[cfg(test)]
@@ -150,6 +156,22 @@ impl Session {
         self.cache.precision()
     }
 
+    /// decode 时每个 token 只保留各矩阵输入中绝对值最大的一部分通道，其余通道对应的权重列不再读取。
+    /// 只作用于逐 token 的 decode；prefill 与推测解码的两 token 校验仍完整计算。
+    /// 第一次启用时为模型建立按列存放的权重副本（内存约与 Q4 权重相同），只支持 Q4 模型。
+    pub fn set_input_sparsity(&mut self, sparsity: InputSparsity) -> Result<()> {
+        sparsity.validate()?;
+        if sparsity.is_enabled() && self.model.column_weights().is_none() {
+            return Err(Error::Unsupported("输入稀疏化只支持 Q4 模型"));
+        }
+        self.sparsity = sparsity;
+        Ok(())
+    }
+
+    pub fn input_sparsity(&self) -> InputSparsity {
+        self.sparsity
+    }
+
     pub fn set_speculation(&mut self, enabled: bool) {
         self.speculation = enabled;
     }
@@ -175,14 +197,14 @@ impl Session {
                 return Err(error);
             }
         }
-        self.commit_hidden();
+        self.commit_hidden(false);
         Ok(())
     }
 
     pub fn decode(&mut self, token: u32) -> Result<()> {
         self.validate_tokens(&[token])?;
         self.forward(&[token], false)?;
-        self.commit_hidden();
+        self.commit_hidden(true);
         Ok(())
     }
 
@@ -324,16 +346,32 @@ impl Session {
         Ok(())
     }
 
-    fn commit_hidden(&mut self) {
+    fn commit_hidden(&mut self, decoding: bool) {
         let config = &self.model.config;
         self.logits.clear();
         self.logits.resize(config.vocab_size, 0.0);
         let hidden = self.model.config.hidden_size;
-        linear_into(
-            self.model.head(),
-            &self.scratch.hidden[..hidden],
-            &mut self.logits,
-        );
+        let columns = if decoding && self.sparsity.head > 0.0 {
+            self.model.column_weights()
+        } else {
+            None
+        };
+        let sparse = columns.is_some_and(|columns| {
+            sparse_multiply(
+                &mut self.scratch.sparse,
+                &columns.head,
+                &self.scratch.hidden[..hidden],
+                self.sparsity.head,
+                &mut self.logits,
+            )
+        });
+        if !sparse {
+            linear_into(
+                self.model.head(),
+                &self.scratch.hidden[..hidden],
+                &mut self.logits,
+            );
+        }
         self.has_logits = true;
     }
 
@@ -346,10 +384,17 @@ impl Session {
             scratch,
             max_context,
             history,
+            sparsity,
             ..
         } = self;
         let config = &model.config;
         let count = tokens.len();
+        let sparsity = *sparsity;
+        let columns = if count == 1 && sparsity.is_enabled() {
+            model.column_weights()
+        } else {
+            None
+        };
         let start = cache.len();
         let (hidden, q_dim, kv_dim) = (config.hidden_size, config.q_dim(), config.kv_dim());
         let half = config.head_dim / 2;
@@ -372,6 +417,7 @@ impl Session {
             model.token_embedding.row_into(*token as usize, state);
         }
         for (layer_index, layer) in model.layers.iter().enumerate() {
+            let layer_columns = columns.map(|columns| &columns.layers[layer_index]);
             // 输出投影全为零的子层对残差没有贡献，跳过它与结果逐位相同（见 LayerWeights::refresh_skips）。
             if !layer.attn_skipped {
                 normalize(
@@ -381,27 +427,48 @@ impl Session {
                     &mut scratch.normalized,
                     hidden,
                 );
-                linear_many(
-                    &scratch.normalized[..count * hidden],
-                    &mut scratch.activations[..count],
-                    &mut [
-                        Linear {
-                            weight: &layer.q_proj,
-                            bias: layer.q_bias.as_deref(),
-                            output: &mut scratch.query[..count * q_dim],
-                        },
-                        Linear {
-                            weight: &layer.k_proj,
-                            bias: layer.k_bias.as_deref(),
-                            output: &mut scratch.key[..count * kv_dim],
-                        },
-                        Linear {
-                            weight: &layer.v_proj,
-                            bias: layer.v_bias.as_deref(),
-                            output: &mut scratch.value[..count * kv_dim],
-                        },
-                    ],
-                );
+                let sparse = layer_columns.is_some_and(|columns| {
+                    scratch.fused.resize(columns.qkv.rows(), 0.0);
+                    sparse_multiply(
+                        &mut scratch.sparse,
+                        &columns.qkv,
+                        &scratch.normalized[..hidden],
+                        sparsity.attention,
+                        &mut scratch.fused,
+                    )
+                });
+                if sparse {
+                    split_rows(
+                        &scratch.fused,
+                        &mut [
+                            (&mut scratch.query[..q_dim], layer.q_bias.as_deref()),
+                            (&mut scratch.key[..kv_dim], layer.k_bias.as_deref()),
+                            (&mut scratch.value[..kv_dim], layer.v_bias.as_deref()),
+                        ],
+                    );
+                } else {
+                    linear_many(
+                        &scratch.normalized[..count * hidden],
+                        &mut scratch.activations[..count],
+                        &mut [
+                            Linear {
+                                weight: &layer.q_proj,
+                                bias: layer.q_bias.as_deref(),
+                                output: &mut scratch.query[..count * q_dim],
+                            },
+                            Linear {
+                                weight: &layer.k_proj,
+                                bias: layer.k_bias.as_deref(),
+                                output: &mut scratch.key[..count * kv_dim],
+                            },
+                            Linear {
+                                weight: &layer.v_proj,
+                                bias: layer.v_bias.as_deref(),
+                                output: &mut scratch.value[..count * kv_dim],
+                            },
+                        ],
+                    );
+                }
                 for offset in 0..count {
                     let query = &mut scratch.query[offset * q_dim..(offset + 1) * q_dim];
                     let key = &mut scratch.key[offset * kv_dim..(offset + 1) * kv_dim];
@@ -490,22 +557,42 @@ impl Session {
                     hidden,
                 );
                 let inner = count * config.intermediate_size;
-                linear_many(
-                    &scratch.normalized[..count * hidden],
-                    &mut scratch.activations[..count],
-                    &mut [
-                        Linear {
-                            weight: &layer.gate_proj,
-                            bias: None,
-                            output: &mut scratch.gate[..inner],
-                        },
-                        Linear {
-                            weight: &layer.up_proj,
-                            bias: None,
-                            output: &mut scratch.up[..inner],
-                        },
-                    ],
-                );
+                let sparse = layer_columns.is_some_and(|columns| {
+                    scratch.fused.resize(columns.gate_up.rows(), 0.0);
+                    sparse_multiply(
+                        &mut scratch.sparse,
+                        &columns.gate_up,
+                        &scratch.normalized[..hidden],
+                        sparsity.mlp,
+                        &mut scratch.fused,
+                    )
+                });
+                if sparse {
+                    split_rows(
+                        &scratch.fused,
+                        &mut [
+                            (&mut scratch.gate[..inner], None),
+                            (&mut scratch.up[..inner], None),
+                        ],
+                    );
+                } else {
+                    linear_many(
+                        &scratch.normalized[..count * hidden],
+                        &mut scratch.activations[..count],
+                        &mut [
+                            Linear {
+                                weight: &layer.gate_proj,
+                                bias: None,
+                                output: &mut scratch.gate[..inner],
+                            },
+                            Linear {
+                                weight: &layer.up_proj,
+                                bias: None,
+                                output: &mut scratch.up[..inner],
+                            },
+                        ],
+                    );
+                }
                 swiglu(&mut scratch.gate[..inner], &scratch.up[..inner]);
                 linear_many(
                     &scratch.gate[..inner],
@@ -534,6 +621,38 @@ impl Session {
             hidden,
         );
         Ok(())
+    }
+}
+
+/// 单个 token 只读保留列的乘法；这一部分不稀疏化或输入含非有限值时返回 false，调用方改走稠密路径。
+fn sparse_multiply(
+    sparse: &mut SparseInput,
+    matrix: &ColumnMatrix,
+    input: &[f32],
+    drop: f32,
+    output: &mut [f32],
+) -> bool {
+    if drop <= 0.0 || !sparse.select(input, kept_channels(input.len(), drop)) {
+        return false;
+    }
+    matrix.multiply(sparse, output);
+    true
+}
+
+/// 把按行拼接的结果依次拆回各个输出，并加上偏置。
+fn split_rows(fused: &[f32], outputs: &mut [(&mut [f32], Option<&[f32]>)]) {
+    let mut start = 0;
+    for (output, bias) in outputs.iter_mut() {
+        let part = &fused[start..start + output.len()];
+        match bias {
+            Some(bias) => {
+                for ((target, value), bias) in output.iter_mut().zip(part).zip(bias.iter()) {
+                    *target = value + bias;
+                }
+            }
+            None => output.copy_from_slice(part),
+        }
+        start += output.len();
     }
 }
 
@@ -920,6 +1039,111 @@ mod tests {
                 "{actual} != {expected}"
             );
         }
+    }
+
+    fn decoded_logits(model: &Arc<Model>, drop: f32, tokens: &[u32]) -> Vec<Vec<f32>> {
+        let mut session = Session::new(model.clone(), 0).unwrap();
+        session
+            .set_input_sparsity(InputSparsity::uniform(drop))
+            .unwrap();
+        session.prefill(&tokens[..4]).unwrap();
+        tokens[4..]
+            .iter()
+            .map(|token| {
+                session.decode(*token).unwrap();
+                session.last_logits().unwrap().to_vec()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn sparse_decode_keeping_every_channel_matches_dense_decode() {
+        let tokens: Vec<u32> = (0..10).map(|index| (index * 7 + 2) % 23).collect();
+        for spec in [LONG, TinySpec { tied: true, ..LONG }] {
+            let model = Arc::new(spec.quantized_model());
+            let dense = decoded_logits(&model, 0.0, &tokens);
+            // 这些宽度下 0.001 四舍五入后一个通道也不丢，只是改用按列存放的权重计算。
+            let sparse = decoded_logits(&model, 0.001, &tokens);
+            for (sparse, dense) in sparse.iter().zip(&dense) {
+                assert_close(sparse, dense);
+            }
+        }
+    }
+
+    #[test]
+    fn sparse_decode_drops_channels_but_tracks_dense_logits() {
+        let tokens: Vec<u32> = (0..10).map(|index| (index * 7 + 2) % 23).collect();
+        let model = Arc::new(LONG.quantized_model());
+        let dense = decoded_logits(&model, 0.0, &tokens);
+        let sparse = decoded_logits(&model, 0.25, &tokens);
+        let mut changed = false;
+        for (sparse, dense) in sparse.iter().zip(&dense) {
+            let spread = dense
+                .iter()
+                .fold(0.0_f32, |peak, value| peak.max(value.abs()));
+            for (sparse, dense) in sparse.iter().zip(dense) {
+                assert!((sparse - dense).abs() < 0.3 * spread, "{sparse} != {dense}");
+                changed |= sparse != dense;
+            }
+        }
+        assert!(changed);
+    }
+
+    #[test]
+    fn each_part_can_be_sparsified_on_its_own() {
+        let tokens: Vec<u32> = (0..10).map(|index| (index * 7 + 2) % 23).collect();
+        let model = Arc::new(LONG.quantized_model());
+        let dense = decoded_logits(&model, 0.0, &tokens);
+        let parts = [
+            InputSparsity {
+                attention: 0.4,
+                ..InputSparsity::NONE
+            },
+            InputSparsity {
+                mlp: 0.4,
+                ..InputSparsity::NONE
+            },
+            InputSparsity {
+                head: 0.4,
+                ..InputSparsity::NONE
+            },
+        ];
+        for sparsity in parts {
+            let mut session = Session::new(model.clone(), 0).unwrap();
+            session.set_input_sparsity(sparsity).unwrap();
+            session.prefill(&tokens[..4]).unwrap();
+            session.decode(tokens[4]).unwrap();
+            assert_ne!(
+                session.last_logits().unwrap(),
+                dense[0].as_slice(),
+                "{sparsity}"
+            );
+        }
+    }
+
+    #[test]
+    fn input_sparsity_needs_a_q4_model_and_a_valid_ratio() {
+        let mut session = Session::new(Arc::new(LONG.model()), 0).unwrap();
+        assert!(matches!(
+            session.set_input_sparsity(InputSparsity::uniform(0.25)),
+            Err(Error::Unsupported(_))
+        ));
+        session.set_input_sparsity(InputSparsity::NONE).unwrap();
+        let mut session = Session::new(Arc::new(LONG.quantized_model()), 0).unwrap();
+        for invalid in [1.0, -0.1, f32::NAN] {
+            let sparsity = InputSparsity {
+                mlp: invalid,
+                ..InputSparsity::NONE
+            };
+            assert!(session.set_input_sparsity(sparsity).is_err());
+        }
+        let sparsity = InputSparsity {
+            mlp: 0.5,
+            head: 0.2,
+            ..InputSparsity::NONE
+        };
+        session.set_input_sparsity(sparsity).unwrap();
+        assert_eq!(session.input_sparsity(), sparsity);
     }
 
     #[test]

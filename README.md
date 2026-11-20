@@ -470,6 +470,20 @@ cargo run -p nncoss-llm --release --example bench -- --model model/Qwen3-0.6B/qw
 
 int8 的误差约为 f16 的 2.5 倍，但远小于 Q4 权重本身的误差（平均 KL 0.111）。速度收益只在长上下文时出现；测量时机器上同时运行着其他任务，两轮结果互相矛盾，所以还没有可靠的速度数据，默认仍使用 f16。
 
+**decode 时的输入通道稀疏化（可选，实验性）**：`Session::set_input_sparsity(InputSparsity)` 让每个 token 只保留矩阵乘法输入中绝对值最大的一部分通道，被丢弃的通道对应的权重列不再读取。作用于三部分：q/k/v 投影的输入（`attention`）、gate/up 投影的输入（`mlp`）和输出层的输入（`head`），三者约占每步权重读取量的四分之三；o 与 down 只有 1024 行，按列跳读时每个线程每列只读 128 字节，比稠密内核更慢，所以始终完整计算。实现上为 Q4 矩阵另存一份按列存放的副本：每行的 scale 与每行每 32 列的 code 与原矩阵相同，只是半字节按列连续存放，q/k/v 与 gate/up 按行拼接，使每列成为 2–3 KB 的连续数据。因此结果等于把丢弃的通道置零后用原矩阵计算，只有浮点求和顺序不同。第一次启用时建立副本，内存约增加 240 MB（Qwen3-0.6B）。稀疏化只用于逐 token decode；prefill 与推测解码的两 token 校验仍完整计算。默认关闭，只支持 Q4 模型。文本形式为单个比例（三部分相同）或 `attn=0.15,mlp=0.15,head=0.3`，`bench`、`nncoss-know` 与测评脚本的 `--sparsity` 都用这种写法。
+
+在约 1500 token 的真实对话上以完整计算为参照（方法同上表），以及在 24 token prompt、128 token decode 上交替测 4 轮的速度中位数：
+
+| 丢弃比例（attn / mlp / head） | 少读的权重 | 平均 KL | top-1 一致率 | decode 速度 |
+|---|---|---|---|---|
+| 15% / 15% / 30% | 15% | 0.026 | 0.906 | 1.06 倍 |
+| 0 / 0 / 50% | 13% | 0.086 | 0.867 | 1.09 倍 |
+| 25% / 25% / 25% | 19% | 0.049 | 0.879 | 1.13 倍 |
+| 40% / 40% / 40% | 30% | 0.209 | 0.772 | 1.26 倍 |
+| 10% / 10% / 10% | 8% | — | — | 0.94 倍 |
+
+测速时机器处于温度降频（CPU 速度上限在 42%–100% 之间变化），稠密 decode 只有约 45 tokens/s，倍数仅供参考。丢 10% 时选择通道等固定开销超过省下的读取，反而更慢。这些误差都不小：丢 25% 的 KL 约为 Q4 量化本身（0.111）的一半，对答题正确率的影响见[实验记录](docs/brain-experiments.md#64-逐-token-的动态结构)。
+
 `tools/check_q4_llm.py` 在内置的 7 段文本（中英文问答、故事、邮件、数学推导、JSON 与 Rust 代码）上按 teacher forcing 比较 Q4 与 f32 模型的下一 token 分布，共 908 个位置。本地 Q4 模型按下文的校准量化与蒸馏生成，top-1 一致率为 0.859，平均 KL(f32‖Q4) 为 0.111，困惑度从 9.489 升至 9.676（比值 1.020）。脚本默认阈值按这组结果留出余量，只用于发现回归；不经校准导出的 Q4 达不到默认阈值。该脚本需要 numpy、tokenizers 与本地导出的模型，不纳入 CI。
 
 #### 校准量化与蒸馏
@@ -530,7 +544,7 @@ cargo run -p nncoss-llm --release --example bench -- --preset small
 python3 tools/bench_wasm_llm.py --preset small
 ```
 
-传入 `--model` 时改为测量真实模型：`--prompt`、`--decode` 设置 token 数，默认使用 temperature 0.6／top-k 20／top-p 0.95 采样，`--greedy` 改为贪心；输出 decode 的中位与最佳 tokens/s。`--tokens FILE` 从文件读取逗号或空白分隔的 prompt token；`--generate` 改为比较关闭与开启推测解码时 `Session::generate` 的速度，`--eos` 指定停止 token，贪心时同时检查两者输出是否一致。`--kv f32|f16|i8` 指定 KV Cache 精度；`--kv-compare` 配合 `--tokens` 以 f32 KV Cache 为参照，逐位置比较 f16 与 int8 的下一个 token 分布。
+传入 `--model` 时改为测量真实模型：`--prompt`、`--decode` 设置 token 数，默认使用 temperature 0.6／top-k 20／top-p 0.95 采样，`--greedy` 改为贪心；输出 decode 的中位与最佳 tokens/s。`--tokens FILE` 从文件读取逗号或空白分隔的 prompt token；`--generate` 改为比较关闭与开启推测解码时 `Session::generate` 的速度，`--eos` 指定停止 token，贪心时同时检查两者输出是否一致。`--kv f32|f16|i8` 指定 KV Cache 精度；`--kv-compare` 配合 `--tokens` 以 f32 KV Cache 为参照，逐位置比较 f16 与 int8 的下一个 token 分布。`--sparsity SPEC` 启用 decode 时的输入通道稀疏化；`--sparsity-compare SPEC`（可重复）配合 `--tokens` 以完整计算为参照比较各稀疏设置。`examples/sparse_read.rs` 单独测量按块随机跳读内存时能省下多少时间。
 
 基准用于记录基线与优化前后的对比，结果依赖具体机器，不构成性能承诺，也不纳入 CI 门禁。WASM 脚本的 decode 计时包含 Python 宿主逐 token 调用的开销。
 
@@ -654,7 +668,12 @@ target/release/nncoss-edit apply --input <模型> --output <新模型> --plan <�
 | `tools/eval_gaokao.py` | 从 9 个单选题科目各抽 12 道高考题。`--split test` 用于测验，`--split tune` 用于定位改动，两者不重叠。可选择是否思考、是否用工具、是否预取检索，结果写到 `tmp/<标签>/` |
 | `tools/tool_decision.py` | 在开口位置测量模型选择调用检索的概率，以及各 MLP 神经元与 KV 头对这一选择的梯度归因 |
 | `tools/retrieval_gate.py` | 以模型自己的回答为目标（不用标准答案），定位“检索结果为空时拒答、不再自己推理”这一行为相关的神经元和 KV 头，并在留出的一半题上比较候选改动 |
-| `tools/layer_importance.py` | 逐层删除并测量模型自己回答的负对数似然变化，给出删层顺序 |
+| `tools/layer_importance.py` | 逐层删除并测量模型自己回答的负对数似然变化，给出删层顺序；`--part attn|mlp` 改为只删注意力或 MLP 子层 |
+| `tools/repetition_edit.py` | 在模型自己的回答中人为重复一句，测量它继续重复的概率；定位让模型陷入重复循环的神经元与 KV 头，给出改动计划 |
+| `tools/dynamic_sparsity.py` | 测量每个 token 只保留一部分 MLP 神经元的代价，以及几种不训练的预判方式（gate 投影、前一个 token、SVD 低秩近似） |
+| `tools/moefy.py` | 按神经元的共同激活把稠密 MLP 切成等大小的专家，测量按 token 选专家的代价 |
+| `tools/regions.py` | 读题时为每层选出一组神经元作为这道题的“区域”，测量作答时只用这些神经元的代价，并与全局共用区域、随机区域比较 |
+| `tools/input_sparsity.py` | 在 f32 模型上测量每个 token 丢弃各矩阵输入中一部分通道的代价，并按参数量估计少读的权重比例 |
 
 ## 示例模型
 

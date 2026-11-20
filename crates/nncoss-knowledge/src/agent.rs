@@ -14,6 +14,9 @@ const PASSAGE_CHARS: usize = 360;
 const PAGE_CHARS: usize = 4000;
 const PREFETCH_CHARS: usize = 300;
 const MIN_SUPPORT: f32 = 0.6;
+/// 作答之后追问最终选项；模型给 A–D 的概率反映它对自己答案的把握（见 `tools/answer_confidence.py`）。
+const CONFIDENCE_PROBE: &str = "<|im_start|>user\n你的最终答案是哪个选项？只回答一个字母。<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
+const CHOICES: [&str; 4] = ["A", "B", "C", "D"];
 const ROUNDS_USED_UP: &str = "工具调用次数已用完，请根据已有信息直接作答。";
 const INSTRUCTION: &str = "你的知识保存在外部知识库里，知识库中有幼儿园到高中的课本、计算机与算法资料，以及你以前记下的笔记。回答需要事实、概念、公式、方法或课文内容的问题时，先用 search_knowledge 查找，再依据查到的内容作答；学到以后用得上的知识时，用 write_note 记下来。";
 const BROWSE_INSTRUCTION: &str = "需要网页上的内容时，用 browse 打开网址阅读。";
@@ -38,6 +41,12 @@ pub struct AgentConfig {
     pub kv: Option<KvPrecision>,
     /// decode 时各部分矩阵输入丢弃的通道比例；默认不稀疏化。
     pub sparsity: InputSparsity,
+    /// 由框架写好的第一轮回复开头（非思考模式下接在空思考块之后），模型从这里接着写；默认为空。
+    /// 用来检验读了资料以后先推理再作答的效果，见 docs/decisions.md。
+    pub reply_prefix: String,
+    /// 设定后先不用工具作答，再追问最终选项（A–D）；最高概率低于这个值时，
+    /// 才按其余设置（如 `prefetch`）查资料重新作答。只适用于单选题。
+    pub consult_below: Option<f32>,
 }
 
 impl Default for AgentConfig {
@@ -55,6 +64,8 @@ impl Default for AgentConfig {
             seed: 0,
             kv: None,
             sparsity: InputSparsity::NONE,
+            reply_prefix: String::new(),
+            consult_below: None,
         }
     }
 }
@@ -68,6 +79,10 @@ pub struct Answer {
     pub notes: Vec<u64>,
     pub rejected: usize,
     pub generated: usize,
+    /// `consult_below` 模式下，不查资料作答后对最终选项的把握（A–D 中最高的概率）。
+    pub confidence: Option<f32>,
+    /// `consult_below` 模式下是否因为把握不足而查了资料重新作答。
+    pub consulted: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -234,6 +249,13 @@ pub fn prefetch_prompt(
         prefetch_turn(&query, &output, config.thinking)
     );
     (prompt, query)
+}
+
+/// 只在几个选项字母之间归一化时，概率最高的选项的概率。
+pub fn top_choice_probability(logits: &[f32]) -> f32 {
+    let peak = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let total: f32 = logits.iter().map(|logit| (logit - peak).exp()).sum();
+    1.0 / total
 }
 
 fn truncate(text: &str, limit: usize) -> String {
@@ -507,7 +529,56 @@ impl<'a> Agent<'a> {
         }
     }
 
+    /// 回答一道题。设定了 `consult_below` 时，先由模型自己作答，把握不足才查资料重答：
+    /// 两次作答的记录都保留在 transcript 中，reply 取最终采用的那次。
     pub fn ask(&mut self, question: &str) -> Result<Answer, String> {
+        let Some(threshold) = self.config.consult_below else {
+            return self.attempt(question).map(|(answer, _)| answer);
+        };
+        let alone = AgentConfig {
+            tools: false,
+            learn: false,
+            ..self.config.clone()
+        };
+        let configured = std::mem::replace(&mut self.config, alone);
+        let first = self.attempt(question).and_then(|(answer, mut session)| {
+            let confidence = self.choice_confidence(&mut session)?;
+            Ok((answer, confidence))
+        });
+        self.config = configured;
+        let (mut first, confidence) = first?;
+        first.confidence = Some(confidence);
+        if confidence >= threshold {
+            return Ok(first);
+        }
+        let (mut second, _) = self.attempt(question)?;
+        second.transcript = first.transcript + &second.transcript;
+        second.generated += first.generated;
+        second.confidence = Some(confidence);
+        second.consulted = true;
+        Ok(second)
+    }
+
+    /// 在会话末尾（刚结束的回答之后）追问最终选项，返回 A–D 中最高的概率。
+    fn choice_confidence(&self, session: &mut Session) -> Result<f32, String> {
+        let tokens = self.encode(&format!("<|im_end|>\n{CONFIDENCE_PROBE}"))?;
+        session
+            .prefill(&tokens)
+            .map_err(|error| error.to_string())?;
+        let logits = session.last_logits().map_err(|error| error.to_string())?;
+        let mut scores = Vec::with_capacity(CHOICES.len());
+        for letter in CHOICES {
+            let id = self
+                .tokenizer
+                .token_to_id(letter)
+                .ok_or_else(|| format!("分词器里没有选项字母 {letter}"))?;
+            scores.push(logits[id as usize]);
+        }
+        Ok(top_choice_probability(&scores))
+    }
+
+    /// 按当前设置完整作答一次，返回结果和作答后的会话（会话停在最后一次回答末尾）。
+    fn attempt(&mut self, question: &str) -> Result<(Answer, Session), String> {
         let mut session = Session::new(self.model.clone(), 0).map_err(|error| error.to_string())?;
         if let Some(precision) = self.config.kv {
             session.set_kv_precision(precision);
@@ -528,9 +599,13 @@ impl<'a> Agent<'a> {
             opening_prompt(&self.config, question)
         };
         answer.transcript.push_str(&prompt);
+        prompt.push_str(&self.config.reply_prefix);
+        let mut prefix = self.config.reply_prefix.clone();
         let (mut rounds, mut last_turn) = (0, false);
         loop {
-            let text = self.turn(&mut session, &prompt, self.config.turn_tokens, &mut answer)?;
+            let generated =
+                self.turn(&mut session, &prompt, self.config.turn_tokens, &mut answer)?;
+            let text = std::mem::take(&mut prefix) + &generated;
             answer.transcript.push_str(&text);
             answer.transcript.push_str("<|im_end|>\n");
             let calls = if self.config.tools {
@@ -584,7 +659,7 @@ impl<'a> Agent<'a> {
                 self.record_note(&note, &sources, question, &mut answer);
             }
         }
-        Ok(answer)
+        Ok((answer, session))
     }
 }
 
@@ -609,6 +684,17 @@ mod tests {
         );
         assert!(parse_tool_calls("<tool_call>{\"arguments\": {}}</tool_call>")[0].is_err());
         assert!(parse_tool_calls("没有工具调用").is_empty());
+    }
+
+    #[test]
+    fn top_choice_probability_normalizes_among_the_choices_only() {
+        assert!((top_choice_probability(&[0.0; 4]) - 0.25).abs() < 1e-6);
+        assert!(
+            (top_choice_probability(&[2.0_f32.ln(), 0.0, 0.0, f32::NEG_INFINITY]) - 0.5).abs()
+                < 1e-6
+        );
+        assert!(top_choice_probability(&[60.0, 0.0, -5.0, 1.0]) > 0.999);
+        assert!((top_choice_probability(&[1000.0, 1000.0, -1000.0, -1000.0]) - 0.5).abs() < 1e-6);
     }
 
     #[test]

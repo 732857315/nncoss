@@ -29,7 +29,10 @@ const USAGE: &str = "用法：
   --seed S               随机种子
   --kv f32|f16|i8        KV Cache 精度，默认 Q4 模型用 f16；i8 在长上下文时读得更少
   --sparsity SPEC        decode 时丢弃的输入通道比例：单个数（各部分相同），
-                         或 attn=…,mlp=…,head=…（q/k/v、gate/up 与输出层的输入）；只支持 Q4 模型";
+                         或 attn=…,mlp=…,head=…（q/k/v、gate/up 与输出层的输入）；只支持 Q4 模型
+  --reply-prefix TEXT    第一轮回复由这段文字开头，模型接着写（对照实验用）
+  --consult-below P      先不用工具作答，再追问最终选项（A–D）；最高概率低于 P（0–1）时
+                         才按其余选项（如 --prefetch）查资料重新作答；只适用于单选题";
 
 #[derive(Default)]
 struct Options {
@@ -61,6 +64,8 @@ struct Record<'a> {
     rejected: usize,
     generated: usize,
     seconds: f64,
+    confidence: Option<f32>,
+    consulted: bool,
     transcript: &'a str,
 }
 
@@ -112,9 +117,22 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Options, String> {
                     .parse()
                     .map_err(|error| format!("--sparsity：{error}"))?;
             }
+            "--reply-prefix" => options.config.reply_prefix = value(&mut args, &arg)?,
+            "--consult-below" => {
+                let threshold: f32 = number(value(&mut args, &arg)?, &arg)?;
+                if !(threshold > 0.0 && threshold <= 1.0) {
+                    return Err(format!(
+                        "--consult-below 要在 0 到 1 之间（不含 0），收到 {threshold}"
+                    ));
+                }
+                options.config.consult_below = Some(threshold);
+            }
             "--help" | "-h" => return Err(USAGE.to_string()),
             other => return Err(format!("未知参数 {other}\n\n{USAGE}")),
         }
+    }
+    if options.config.consult_below.is_some() && !options.config.tools {
+        return Err("--consult-below 的第二次作答要查资料，不能与 --no-tools 同用".to_string());
     }
     options.config.sampling.temperature = options
         .temperature
@@ -180,9 +198,12 @@ fn prompts(options: &Options) -> Result<(), String> {
     } else {
         None
     };
-    let render = |question: &str| match &base {
-        Some(base) => prefetch_prompt(base, &options.config, question, &mut Vec::new()).0,
-        None => opening_prompt(&options.config, question),
+    let render = |question: &str| {
+        let prompt = match &base {
+            Some(base) => prefetch_prompt(base, &options.config, question, &mut Vec::new()).0,
+            None => opening_prompt(&options.config, question),
+        };
+        prompt + &options.config.reply_prefix
     };
     if let Some(question) = &options.query {
         print!("{}", render(question));
@@ -249,6 +270,16 @@ fn run(options: Options) -> Result<(), String> {
             let answer =
                 Agent::new(model, &tokenizer, &mut base, options.config.clone()).ask(&question)?;
             println!("{}", answer.reply);
+            if let Some(confidence) = answer.confidence {
+                eprintln!(
+                    "不查资料时对最终选项的把握 {confidence:.3}，{}",
+                    if answer.consulted {
+                        "已查资料重答"
+                    } else {
+                        "未查资料"
+                    }
+                );
+            }
             eprintln!(
                 "检索 {:?}，网页 {:?}，新笔记 {:?}，生成 {} token",
                 answer.searches, answer.pages, answer.notes, answer.generated
@@ -286,6 +317,8 @@ fn run(options: Options) -> Result<(), String> {
                     rejected: answer.rejected,
                     generated: answer.generated,
                     seconds: started.elapsed().as_secs_f64(),
+                    confidence: answer.confidence,
+                    consulted: answer.consulted,
                     transcript: &answer.transcript,
                 };
                 writeln!(

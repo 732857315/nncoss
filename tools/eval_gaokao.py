@@ -33,15 +33,30 @@ def prepare(per_subject, seed):
     return questions
 
 
-def questions_for(split, per_subject):
-    if split == "test":
-        return prepare(per_subject, "gaokao")
-    test_ids = {question["id"] for question in prepare(per_subject, "gaokao")}
+# 测验题与定位题每科的标准题数；wide 题组避开这两组标准题。
+STANDARD = 12
+DEFAULT_PER_SUBJECT = {"test": STANDARD, "tune": STANDARD, "wide": 48}
+
+
+def remainder(excluded, seed, per_subject):
+    """按种子打乱各科全部题目，去掉 excluded 中的题后每科取前 per_subject 道。"""
     by_subject = {}
-    for question in prepare(10_000, "tune"):
-        if question["id"] not in test_ids:
+    for question in prepare(10_000, seed):
+        if question["id"] not in excluded:
             by_subject.setdefault(question["subject"], []).append(question)
     return [question for items in by_subject.values() for question in items[:per_subject]]
+
+
+def questions_for(split, per_subject=None):
+    """test：测验题；tune：定位改动用的题，与 test 不重叠；
+    wide：与标准的 test、tune 都不重叠的大题组（每科默认 48 道，物理、语文题少，取完为止），用于分辨较小的差别。"""
+    per_subject = per_subject or DEFAULT_PER_SUBJECT[split]
+    if split == "test":
+        return prepare(per_subject, "gaokao")
+    if split == "tune":
+        return remainder({question["id"] for question in prepare(per_subject, "gaokao")}, "tune", per_subject)
+    used = {question["id"] for question in prepare(STANDARD, "gaokao") + questions_for("tune", STANDARD)}
+    return remainder(used, "wide", per_subject)
 
 
 LETTER = r"(?<![A-Za-z])([A-D])(?![A-Za-z])"
@@ -94,8 +109,9 @@ def main():
     parser.add_argument("--prefetch", action="store_true", help="作答前先用题目自动检索一次知识库")
     parser.add_argument("--tool-rounds", type=int, help="最多调用几轮工具；配合 --prefetch 用 0 时只读预取的资料")
     parser.add_argument("--no-learn", action="store_true", help="答题后不归纳笔记，各题互不影响")
-    parser.add_argument("--per-subject", type=int, default=12)
-    parser.add_argument("--split", choices=["test", "tune"], default="test", help="test 为测验题，tune 为定位改动用的题，两者不重叠")
+    parser.add_argument("--per-subject", type=int, help="每科题数，默认 test、tune 为 12，wide 为 48")
+    parser.add_argument("--split", choices=["test", "tune", "wide"], default="test",
+                        help="test 为测验题，tune 为定位改动用的题，wide 为与两者都不重叠的大题组")
     parser.add_argument("--turn-tokens", type=int, default=0)
     parser.add_argument("--kv", choices=["f32", "f16", "i8"], help="KV Cache 精度，默认由引擎决定")
     parser.add_argument("--sparsity", help="decode 时丢弃的输入通道比例，格式同 nncoss-know --sparsity")

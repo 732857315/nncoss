@@ -90,6 +90,8 @@ def main():
     parser.add_argument("--think", action="store_true")
     parser.add_argument("--no-tools", action="store_true")
     parser.add_argument("--prefetch", action="store_true", help="作答前先用题目自动检索一次知识库")
+    parser.add_argument("--tool-rounds", type=int, help="最多调用几轮工具；配合 --prefetch 用 0 时只读预取的资料")
+    parser.add_argument("--no-learn", action="store_true", help="答题后不归纳笔记，各题互不影响")
     parser.add_argument("--per-subject", type=int, default=12)
     parser.add_argument("--split", choices=["test", "tune"], default="test", help="test 为测验题，tune 为定位改动用的题，两者不重叠")
     parser.add_argument("--turn-tokens", type=int, default=0)
@@ -119,6 +121,10 @@ def main():
         command.append("--no-tools")
     if args.prefetch:
         command.append("--prefetch")
+    if args.tool_rounds is not None:
+        command += ["--tool-rounds", str(args.tool_rounds)]
+    if args.no_learn:
+        command.append("--no-learn")
     if args.kv:
         command += ["--kv", args.kv]
     if args.sparsity:
@@ -130,6 +136,7 @@ def main():
     answers = [json.loads(line) for line in (work / "answers.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
     table, details = judge(questions, answers)
     report = {"label": args.label, "model": str(args.model), "think": args.think, "tools": not args.no_tools, "prefetch": args.prefetch, "kv": args.kv,
+              "tool_rounds": args.tool_rounds, "learn": not args.no_learn,
               "sparsity": args.sparsity,
               "seconds": round(time.time() - started), "notes_written": sum(d["notes"] for d in details),
               "searches": sum(d["searches"] for d in details), "table": table, "details": details}

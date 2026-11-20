@@ -23,6 +23,7 @@ const USAGE: &str = "用法：
   --no-learn             答题后不自动归纳笔记
   --prefetch             作答前先用题目自动检索一次知识库（对照实验用）
   --turn-tokens N        每轮最多生成的 token 数，默认 1024
+  --tool-rounds N        最多调用几轮工具，默认 6；配合 --prefetch 用 0 时只读预取的资料
   --temperature T        采样温度，默认思考模式 0.6、非思考模式 0
   --top-k K / --top-p P  采样参数
   --seed S               随机种子
@@ -92,6 +93,7 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Options, String> {
             "--browse" => options.config.browse = true,
             "--no-learn" => options.config.learn = false,
             "--prefetch" => options.config.prefetch = true,
+            "--tool-rounds" => options.config.tool_rounds = number(value(&mut args, &arg)?, &arg)?,
             "--turn-tokens" => options.config.turn_tokens = number(value(&mut args, &arg)?, &arg)?,
             "--temperature" => options.temperature = Some(number(value(&mut args, &arg)?, &arg)?),
             "--top-k" => options.config.sampling.top_k = number(value(&mut args, &arg)?, &arg)?,

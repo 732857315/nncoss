@@ -217,7 +217,7 @@ def main():
         if question["kind"] == "exam":
             picked = eval_gaokao.choice(reply)
             ok = picked == question["answer"]
-            details.append({"id": question["id"], "kind": "exam", "ratio": float(ok),
+            details.append({"id": question["id"], "kind": "exam", "ratio": float(ok), "expected": question["answer"],
                             "note": f"答 {picked}，标准答案 {question['answer']}"})
         elif question["kind"] == "acm":
             ok, note = judge_acm(question, reply)
@@ -236,8 +236,24 @@ def main():
     finalize(work)
 
 
+def rejudge_exam(work, report):
+    """用当前的选项提取规则重新判客观题，主观题与 ACM 的结果不变。"""
+    path = work / "answers.jsonl"
+    if not path.exists():
+        return
+    answers = {answer["id"]: answer for answer in map(json.loads, path.read_text(encoding="utf-8").splitlines())}
+    for detail in report["details"]:
+        if detail["kind"] != "exam":
+            continue
+        expected = detail.get("expected") or re.search(r"标准答案 ([A-D])", detail["note"]).group(1)
+        picked = eval_gaokao.choice(answers.get(detail["id"], {}).get("reply", ""))
+        detail.update(expected=expected, ratio=float(picked == expected), note=f"答 {picked}，标准答案 {expected}")
+    (work / "review.json").write_text(json.dumps(report, ensure_ascii=False, indent=1), encoding="utf-8")
+
+
 def finalize(work):
     report = json.loads((work / "review.json").read_text(encoding="utf-8"))
+    rejudge_exam(work, report)
     details = report["details"]
     points = 100 / len(details)
     for detail in details:

@@ -633,7 +633,7 @@ fn load(path: &str) -> Result<Model, Box<dyn std::error::Error>> {
 - **工具**：`search_knowledge` 检索，`write_note` 记笔记，可选的 `browse` 用 curl 打开网页并提取正文；调用格式是 Qwen3 的工具调用模板。模型抄进参数的 LaTeX 反斜杠不构成合法 JSON 转义时，会改成字面反斜杠后再解析；工具轮数用尽时，告诉模型直接作答，再给它一次机会。
 - **笔记依据检查**：笔记里的检索词至少 60% 要出现在本题检索到的课本段落里，否则拒绝记录，避免把模型的臆测写进知识库。作答后若检索过资料，会再请模型归纳一条笔记（`--no-learn` 关闭）。
 - **对照条件**：`--no-tools` 不提供工具；`--prefetch` 在作答前先用题目自动检索一次，作为“必然查到资料”的对照，配合 `--tool-rounds 0 --no-learn` 时模型只读这次预取的资料、各题互不影响；`--reply-prefix TEXT` 让第一轮回复由给定文字开头，模型接着写；`--think` 开启思考模式（默认按 Qwen 推荐的 temperature 0.6、top-k 20、top-p 0.95 采样，非思考模式默认贪心）。
-- **把握不足才查书（单选题）**：`--consult-below P` 先不用工具作答，再在同一会话里追问“你的最终答案是哪个选项？只回答一个字母”，读出模型给 A–D 的概率；最高概率不低于 P 时采用这次回答，否则按其余选项（如 `--prefetch`）查资料重新作答。两次作答的记录都留在 transcript 中，`batch` 输出的 `confidence` 与 `consulted` 记录追问的把握和是否查了资料。
+- **把握不足才查书（单选题）**：`--consult-below P` 先不用工具作答，再在同一会话里追问“你的最终答案是哪个选项？只回答一个字母”，读出模型给 A–D 的概率；最高概率不低于 P 时采用这次回答，否则按其余选项（如 `--prefetch`）查资料重新作答。两次作答的记录都留在 transcript 中，`batch` 输出的 `confidence` 与 `consulted` 记录追问的把握和是否查了资料。阈值 0.8 在两组高考题上合计没有净收益（[实验记录 5.6](docs/brain-experiments.md#56-先自己作答没把握才查书)），这一方式只用于实验。
 
 ```bash
 target/release/nncoss-know ingest --store modelbook/knowledge/store-base --input modelbook/knowledge/oiwiki.jsonl

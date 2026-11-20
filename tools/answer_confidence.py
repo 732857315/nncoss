@@ -42,7 +42,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--model-dir", type=Path, required=True)
     parser.add_argument("--runs", nargs=2, required=True, help="两个 eval_gaokao.py 输出目录（tmp/ 下的标签）")
-    parser.add_argument("--split", choices=["test", "tune"], default="test")
+    parser.add_argument("--split", choices=["test", "tune", "wide"], default="test")
     parser.add_argument("--work", type=Path, default=ROOT / "tmp/answer_confidence")
     parser.add_argument("--max-tokens", type=int, default=6000, help="超过这个长度的记录只保留末尾")
     args = parser.parse_args()
@@ -54,7 +54,7 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(args.model_dir)
     model = AutoModelForCausalLM.from_pretrained(args.model_dir, dtype=torch.float32).eval()
     letter_ids = [tokenizer.convert_tokens_to_ids(letter) for letter in LETTERS]
-    questions = {question["id"]: question for question in eval_gaokao.questions_for(args.split, 12)}
+    questions = {question["id"]: question for question in eval_gaokao.questions_for(args.split)}
     runs = []
     for label in args.runs:
         answers = {record["id"]: record for record in read_jsonl(ROOT / "tmp" / label / "answers.jsonl")}

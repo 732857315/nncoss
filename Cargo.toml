@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/nncoss-llm", "crates/nncoss-web", "crates/nncoss-knowledge"]
+members = ["crates/nncoss-llm", "crates/nncoss-web", "crates/nncoss-knowledge", "crates/nncoss-edit"]
 resolver = "3"
 
 [profile.release]

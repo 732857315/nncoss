@@ -1,0 +1,140 @@
+# 模型
+
+模型文件不随仓库分发，只在本文记录来源和生成方法。按下面的步骤可以在本地复现 `model/` 下的全部文件，每步给出了测试机上得到的文件大小和 SHA-256，便于核对。整个 `model/` 目录都不纳入版本库，中间文件写到同样不入库的 `tmp/`。
+
+测试机为 Intel Core i7-9750H（6 核 12 线程、16 GiB 内存、macOS）。Python 3.11 依赖见 [tools/knowledge_requirements.txt](../tools/knowledge_requirements.txt)。所有命令都从仓库根目录执行。
+
+## 基础模型
+
+| 目录 | 来源 | 许可 |
+|---|---|---|
+| `Qwen3-0.6B/` | [Qwen/Qwen3-0.6B](https://huggingface.co/Qwen/Qwen3-0.6B) | Apache License 2.0 |
+| `Qwen3-1.7B/` | [Qwen/Qwen3-1.7B](https://huggingface.co/Qwen/Qwen3-1.7B) | Apache License 2.0 |
+
+```bash
+python3 -c "from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen3-0.6B', local_dir='model/Qwen3-0.6B')"
+python3 -c "from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen3-1.7B', local_dir='model/Qwen3-1.7B')"
+```
+
+测试机使用的 Qwen3-0.6B 权重 `model.safetensors` 的 SHA-256 为 `f47f71177f32bcd101b7573ec9171e6a57f4f4d31148d38e382306f42996874b`。
+
+## 导出为 nncoss 格式
+
+f32 模型直接复制权重，结果是确定的：
+
+```bash
+python3 tools/export_llm.py --model model/Qwen3-0.6B --output model/Qwen3-0.6B/qwen3-0.6b-f32.nncossllm
+```
+
+| 文件 | 字节数 | SHA-256 |
+|---|---|---|
+| `Qwen3-0.6B/qwen3-0.6b-f32.nncossllm` | 2,384,199,744 | `1738cc3266f38cd84bee2ba9d9638fa0bca1902bbb46693e0871e8b76c97b632` |
+
+Q4 模型先做 GPTQ 校准量化，再蒸馏行 scale、Norm 与 bias。命令与效果见 [README 的校准量化与蒸馏一节](../README.md#校准量化与蒸馏)，在测试机上约需 1 小时：
+
+```bash
+CAL="tools/calibration/qwen3_chat.txt README.md crates/nncoss-llm/src/session.rs crates/nncoss-llm/src/model.rs tools/export_llm.py crates/nncoss-web/src/lib.rs"
+python3 tools/export_llm.py --model model/Qwen3-0.6B --output tmp/qwen3-0.6b-q4-gptq.nncossllm --outtype q4 --calibration $CAL
+python3 tools/distill_q4_llm.py --model model/Qwen3-0.6B --input tmp/qwen3-0.6b-q4-gptq.nncossllm \
+  --output model/Qwen3-0.6B/qwen3-0.6b-q4.nncossllm --steps 300 --calibration $CAL
+```
+
+在 zsh 中 `$CAL` 不会自动按空格拆分，需要直接写出文件列表或改用 bash。
+
+| 文件 | 字节数 | SHA-256 |
+|---|---|---|
+| `Qwen3-0.6B/qwen3-0.6b-q4.nncossllm` | 318,862,912 | `81c66fdfa82eb696172806cb265d5dc98012e435df20cf515f1fd8f9d1bbefba` |
+
+蒸馏使用 PyTorch 在 CPU 上训练，不同机器、线程数或库版本得到的 scale 会有微小差异，因此 Q4 文件不保证逐字节一致；可用 `tools/check_q4_llm.py` 检查质量是否达到 README 给出的水平。
+
+### Qwen3-1.7B
+
+1.7B 只做了不经校准的最小二乘 Q4 导出，用时几分钟，结果是确定的：
+
+```bash
+python3 tools/export_llm.py --model model/Qwen3-1.7B --output model/Qwen3-1.7B/qwen3-1.7b-q4-ls.nncossllm --outtype q4
+```
+
+| 文件 | 字节数 | SHA-256 |
+|---|---|---|
+| `Qwen3-1.7B/qwen3-1.7b-q4-ls.nncossllm` | 917,386,816 | `7307b7eb14782bd1e422a84cb77ead6dc502063d263e0254ca84bcc92caa0ab8` |
+
+GPTQ 校准导出在 16 GiB 内存的测试机上没有完成：第一次进程无报错退出，第二次运行 3 小时 40 分钟后占用约 3.6 GB 交换空间，已手动停止。因此 1.7B 目前没有校准版。在 0.6B 上，不经校准的 Q4 与 f32 的平均 KL 约为校准加蒸馏版本的两倍（0.215 对 0.111）；1.7B 的对应数值没有测过。
+
+## 直接改写权重得到的模型
+
+`nncoss-edit` 按改动计划改写 Q4 文件中的行 scale 或删除整层，几秒内完成，结果是确定的。用法见 [README](../README.md#知识库与权重改写实验)。目前保留的改写模型：
+
+```bash
+target/release/nncoss-edit apply --input model/Qwen3-0.6B/qwen3-0.6b-q4.nncossllm \
+  --output model/edits/qwen3-0.6b-q4-l1n2997-off.nncossllm \
+  --edit '{"op": "scale", "target": "mlp", "layer": 1, "index": [2997], "factor": 0.0}'
+```
+
+| 文件 | 字节数 | SHA-256 |
+|---|---|---|
+| `edits/qwen3-0.6b-q4-l1n2997-off.nncossllm`（第 1 层 2997 号神经元置零） | 318,862,912 | `51c5a98653a6acb5a5d89aa310aff1d4d7e2fca128b52590021a2ff827f8cd8c` |
+| `edits/qwen3-0.6b-q4-retrieval-gate.nncossllm`（检索门改写，16 个 MLP 神经元） | 318,862,912 | `8533724547a891030df0da9a9563b90d82f50603dd002766146293e13588a45e` |
+| `edits/qwen3-0.6b-q4-gate-repetition.nncossllm`（检索门 + 重复循环改写，另加 8 个 KV 头） | 318,862,912 | `3c45b262024e7d68e00d7abe4767e3ff591df0cd15144c1aaa4b584f0ab33f2e` |
+| `edits/qwen3-0.6b-q4-repetition.nncossllm`（只有重复循环改写的 8 个 KV 头） | 318,862,912 | `677c230fad9ae3eacf9f8e2b99176b99ca35be02636da42add6996ee3586cd1d` |
+
+后三个模型的改动计划由 `tools/retrieval_gate.py` 与 `tools/repetition_edit.py` 定位得到（见[实验记录 5.5](brain-experiments.md#55-定位只依据资料作答的部件)），计划原文如下。把它们分别存为 `tmp/retrieval-gate.json` 与 `tmp/repetition.json` 后执行：
+
+```bash
+target/release/nncoss-edit apply --input model/Qwen3-0.6B/qwen3-0.6b-q4.nncossllm \
+  --output model/edits/qwen3-0.6b-q4-retrieval-gate.nncossllm --plan tmp/retrieval-gate.json
+target/release/nncoss-edit apply --input model/edits/qwen3-0.6b-q4-retrieval-gate.nncossllm \
+  --output model/edits/qwen3-0.6b-q4-gate-repetition.nncossllm --plan tmp/repetition.json
+target/release/nncoss-edit apply --input model/Qwen3-0.6B/qwen3-0.6b-q4.nncossllm \
+  --output model/edits/qwen3-0.6b-q4-repetition.nncossllm --plan tmp/repetition.json
+```
+
+`tmp/retrieval-gate.json`：
+
+```json
+[
+  {"op": "scale", "target": "mlp", "layer": 0, "index": [2], "factor": 1.5},
+  {"op": "scale", "target": "mlp", "layer": 8, "index": [753], "factor": 0.5},
+  {"op": "scale", "target": "mlp", "layer": 11, "index": [1372], "factor": 1.5},
+  {"op": "scale", "target": "mlp", "layer": 13, "index": [1498], "factor": 1.5},
+  {"op": "scale", "target": "mlp", "layer": 14, "index": [3007], "factor": 0.5},
+  {"op": "scale", "target": "mlp", "layer": 14, "index": [1460], "factor": 1.5},
+  {"op": "scale", "target": "mlp", "layer": 15, "index": [1357], "factor": 1.5},
+  {"op": "scale", "target": "mlp", "layer": 17, "index": [3033], "factor": 0.5},
+  {"op": "scale", "target": "mlp", "layer": 22, "index": [734], "factor": 1.5},
+  {"op": "scale", "target": "mlp", "layer": 23, "index": [1706], "factor": 0.5},
+  {"op": "scale", "target": "mlp", "layer": 24, "index": [613], "factor": 1.5},
+  {"op": "scale", "target": "mlp", "layer": 27, "index": [47, 84, 1608], "factor": 0.5},
+  {"op": "scale", "target": "mlp", "layer": 27, "index": [386, 1274], "factor": 1.5}
+]
+```
+
+`tmp/repetition.json`：
+
+```json
+[
+  {"op": "scale", "target": "kv_head", "layer": 6, "index": [5], "factor": 0.5},
+  {"op": "scale", "target": "kv_head", "layer": 6, "index": [3], "factor": 1.5},
+  {"op": "scale", "target": "kv_head", "layer": 10, "index": [3], "factor": 0.5},
+  {"op": "scale", "target": "kv_head", "layer": 13, "index": [2], "factor": 0.5},
+  {"op": "scale", "target": "kv_head", "layer": 13, "index": [0], "factor": 1.5},
+  {"op": "scale", "target": "kv_head", "layer": 18, "index": [2], "factor": 0.5},
+  {"op": "scale", "target": "kv_head", "layer": 18, "index": [1], "factor": 1.5},
+  {"op": "scale", "target": "kv_head", "layer": 21, "index": [4], "factor": 0.5}
+]
+```
+
+这三个改写模型在 108 道高考测验题上不用工具的正确率都低于原模型（35.2%、36.1%、30.6% 对 41.7%），只作为实验记录保留，不推荐使用。
+
+以上哈希以本文给出的 Q4 基础模型为输入；基础模型的 scale 若因重新蒸馏而不同，改写结果也会不同。
+
+## 自我学习模型（对照组）
+
+`Qwen3-0.6B-school-r1/` 是在 Qwen3-0.6B 上做一轮拒绝采样自我学习得到的模型，继承 Apache License 2.0。实验过程与测评结果见[实验记录](brain-experiments.md)。
+
+生成它的是 Python 训练流程。按项目约定，功能代码须用 Rust 实现，所以这套流程已经删除，不再提供复现命令。当时的脚本和经验数据可以在提交 `aa625fd` 中查看。测试机上生成的文件如下：
+
+| 文件 | 字节数 | SHA-256 |
+|---|---|---|
+| `Qwen3-0.6B-school-r1/model.safetensors`（f32 合并权重） | 3,006,565,056 | `9a2414a22822a1b830dd3325517906aad404ae1662b5b91c6c5920d5a037dc66` |
+| `Qwen3-0.6B-school-r1/qwen3-0.6b-school-r1-q4.nncossllm` | 318,862,912 | `f473d21bab9abb58b0337eef72b8152e4b448eb08c51c6de1308976e64411d85` |

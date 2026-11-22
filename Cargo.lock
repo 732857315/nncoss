@@ -301,6 +301,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "nncoss-edit"
+version = "0.1.0"
+dependencies = [
+ "nncoss-llm",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "nncoss-knowledge"
 version = "0.1.0"
 dependencies = [

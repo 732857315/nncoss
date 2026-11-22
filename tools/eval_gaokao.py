@@ -120,14 +120,30 @@ def main():
     parser.add_argument("--reply-prefix", help="第一轮回复由这段文字开头，格式同 nncoss-know --reply-prefix")
     parser.add_argument("--consult-below", type=float, help="先不用工具作答，对最终选项的把握低于这个值才查资料重答，同 nncoss-know --consult-below")
     parser.add_argument("--work", type=Path, default=ROOT / "tmp")
+    parser.add_argument("--resume", action="store_true",
+                        help="保留已有 answers.jsonl 中的回答，只答剩下的题；要求 --no-learn（各题互不影响，分段作答与一次答完相同）")
     parser.add_argument("--rejudge", action="store_true", help="不重新作答，只用现有 answers.jsonl 重新判分并改写 report.json")
     args = parser.parse_args()
     work = args.work / args.label
     if args.rejudge:
         return rejudge(work, args.split, args.per_subject)
+    if args.resume and not args.no_learn:
+        parser.error("--resume 要求 --no-learn：归纳笔记时前面的题会影响后面的题，不能分段作答")
     work.mkdir(parents=True, exist_ok=True)
     questions = questions_for(args.split, args.per_subject)
+    answers_path = work / "answers.jsonl"
+    done = {}
+    if args.resume and answers_path.exists():
+        for line in answers_path.read_text(encoding="utf-8").splitlines():
+            if line.strip():
+                done[json.loads(line)["id"]] = line
+    pending = [q for q in questions if q["id"] not in done]
     (work / "questions.jsonl").write_text("".join(json.dumps({"id": q["id"], "question": q["question"]}, ensure_ascii=False) + "\n" for q in questions), encoding="utf-8")
+    batch_input, batch_output = work / "questions.jsonl", answers_path
+    if done:
+        batch_input, batch_output = work / "pending.jsonl", work / "answers-pending.jsonl"
+        batch_input.write_text("".join(json.dumps({"id": q["id"], "question": q["question"]}, ensure_ascii=False) + "\n" for q in pending), encoding="utf-8")
+        print(f"接着已有的 {len(done)} 个回答，还剩 {len(pending)} 题", flush=True)
     store = work / "store"
     if store.exists():
         shutil.rmtree(store)
@@ -136,7 +152,7 @@ def main():
     else:
         store.mkdir()
     command = [str(ROOT / "target/release/nncoss-know"), "batch", "--store", str(store), "--model", str(args.model),
-               "--tokenizer", str(args.tokenizer), "--input", str(work / "questions.jsonl"), "--output", str(work / "answers.jsonl")]
+               "--tokenizer", str(args.tokenizer), "--input", str(batch_input), "--output", str(batch_output)]
     if args.think:
         command.append("--think")
     if args.no_tools:
@@ -160,14 +176,25 @@ def main():
     turn_tokens = args.turn_tokens or (3072 if args.think else 1024)
     command += ["--turn-tokens", str(turn_tokens)]
     started = time.time()
-    subprocess.run(command, check=True)
-    answers = [json.loads(line) for line in (work / "answers.jsonl").read_text(encoding="utf-8").splitlines() if line.strip()]
+    if pending:
+        subprocess.run(command, check=True)
+    if done:
+        fresh = {}
+        if pending:
+            for line in batch_output.read_text(encoding="utf-8").splitlines():
+                if line.strip():
+                    fresh[json.loads(line)["id"]] = line
+        merged = [done.get(q["id"]) or fresh[q["id"]] for q in questions]
+        answers_path.write_text("".join(line + "\n" for line in merged), encoding="utf-8")
+        for path in (batch_input, batch_output):
+            path.unlink(missing_ok=True)
+    answers = [json.loads(line) for line in answers_path.read_text(encoding="utf-8").splitlines() if line.strip()]
     table, details = judge(questions, answers)
     report = {"label": args.label, "model": str(args.model), "think": args.think, "tools": not args.no_tools, "prefetch": args.prefetch, "reference": args.reference, "kv": args.kv,
               "tool_rounds": args.tool_rounds, "learn": not args.no_learn,
               "sparsity": args.sparsity, "reply_prefix": args.reply_prefix, "consult_below": args.consult_below,
               "consulted": sum(d["consulted"] for d in details),
-              "seconds": round(time.time() - started), "notes_written": sum(d["notes"] for d in details),
+              "seconds": round(time.time() - started), "resumed_from": len(done), "notes_written": sum(d["notes"] for d in details),
               "searches": sum(d["searches"] for d in details), "table": table, "details": details}
     (work / "report.json").write_text(json.dumps(report, ensure_ascii=False, indent=1), encoding="utf-8")
     print(args.label, json.dumps({key: value["accuracy"] for key, value in table.items()}, ensure_ascii=False),

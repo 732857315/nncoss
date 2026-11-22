@@ -27,6 +27,14 @@ impl Default for Weight {
 }
 
 impl Weight {
+    /// 全部权重为零。Q4 只需检查每行的 scale：scale 为零时整行还原值都是零。
+    pub(crate) fn is_zero(&self) -> bool {
+        match self {
+            Self::F32(values) => values.iter().all(|value| *value == 0.0),
+            Self::Q4(matrix) => (0..matrix.rows).all(|row| matrix.row_scale(row) == 0.0),
+        }
+    }
+
     pub fn into_f32(self) -> Vec<f32> {
         match self {
             Self::F32(values) => values,
@@ -101,7 +109,7 @@ impl Q4Matrix {
         Ok(matrix)
     }
 
-    fn row_scale(&self, row: usize) -> f32 {
+    pub(crate) fn row_scale(&self, row: usize) -> f32 {
         let offset = row * SCALE_BYTES;
         f32::from_le_bytes(
             self.bytes[offset..offset + SCALE_BYTES]
@@ -120,11 +128,11 @@ impl Q4Matrix {
         &self.bytes[start..start + self.rows * self.groups * NIBBLE_BYTES]
     }
 
-    fn row_codes(&self, row: usize) -> &[u8] {
+    pub(crate) fn row_codes(&self, row: usize) -> &[u8] {
         &self.codes()[row * self.groups..(row + 1) * self.groups]
     }
 
-    fn row_nibbles(&self, row: usize) -> &[u8] {
+    pub(crate) fn row_nibbles(&self, row: usize) -> &[u8] {
         let width = self.groups * NIBBLE_BYTES;
         &self.nibbles()[row * width..(row + 1) * width]
     }

@@ -10,7 +10,8 @@ from urllib.parse import unquote, urlsplit
 
 
 ROOT = Path(__file__).resolve().parents[1]
-REQUIRED = {"README.md", "AGENTS.md", "docs/naming.md", "docs/ci.md"}
+REQUIRED = {"README.md", "AGENTS.md", "docs/naming.md", "docs/ci.md", "docs/modelbook.md", "docs/models.md",
+            "docs/brain-experiments.md", "docs/decisions.md"}
 FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
 HEADING = re.compile(r"^ {0,3}#{1,6}\s+(.+?)(?:\s+#+\s*)?$")
 LINK = re.compile(r"!?\[[^\]\n]*\]\(\s*(<[^>\n]+>|[^\s)]+)(?:\s+[\"'][^\n]*?[\"'])?\s*\)")

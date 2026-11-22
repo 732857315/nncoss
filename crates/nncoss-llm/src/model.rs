@@ -1,4 +1,7 @@
+use std::sync::OnceLock;
+
 use crate::q4::{Weight, matrix_bytes as q4_matrix_bytes};
+use crate::sparse::ColumnWeights;
 use crate::{Error, MODEL_FORMAT_VERSION, Result};
 
 pub(crate) const MODEL_MAGIC: &[u8; 8] = b"NNCSLLM\0";
@@ -110,6 +113,18 @@ pub(crate) struct LayerWeights {
     pub gate_proj: Weight,
     pub up_proj: Weight,
     pub down_proj: Weight,
+    /// o_proj 全为零：注意力子层的输出恒为零，前向时整块跳过，也不写入这一层的 KV Cache。
+    pub attn_skipped: bool,
+    /// down_proj 全为零：MLP 子层的输出恒为零，前向时整块跳过。
+    pub mlp_skipped: bool,
+}
+
+impl LayerWeights {
+    /// 根据输出投影是否全为零，标记可以整块跳过的子层。删去子层可用 nncoss-edit 把输出投影置零。
+    pub(crate) fn refresh_skips(&mut self) {
+        self.attn_skipped = self.o_proj.is_zero();
+        self.mlp_skipped = self.down_proj.is_zero();
+    }
 }
 
 #[derive(Debug)]
@@ -119,6 +134,8 @@ pub struct Model {
     pub(crate) layers: Vec<LayerWeights>,
     pub(crate) final_norm: Vec<f32>,
     pub(crate) lm_head: Option<Weight>,
+    /// 按列存放的权重副本，第一次启用输入稀疏化时建立（见 sparse.rs）。
+    pub(crate) columns: OnceLock<Option<ColumnWeights>>,
 }
 
 impl Model {
@@ -134,6 +151,13 @@ impl Model {
 
     pub(crate) fn head(&self) -> &Weight {
         self.lm_head.as_ref().unwrap_or(&self.token_embedding)
+    }
+
+    /// 按列存放的权重副本；只有 Q4 模型才有。建立一次约占与 Q4 权重相同的内存。
+    pub(crate) fn column_weights(&self) -> Option<&ColumnWeights> {
+        self.columns
+            .get_or_init(|| ColumnWeights::build(self))
+            .as_ref()
     }
 }
 
@@ -291,6 +315,77 @@ impl Slot {
     }
 }
 
+impl Slot {
+    fn name(self) -> &'static str {
+        match self {
+            Self::TokenEmbedding => "embed_tokens",
+            Self::AttnNorm => "input_layernorm",
+            Self::QProj => "q_proj",
+            Self::KProj => "k_proj",
+            Self::VProj => "v_proj",
+            Self::QBias => "q_bias",
+            Self::KBias => "k_bias",
+            Self::VBias => "v_bias",
+            Self::QNorm => "q_norm",
+            Self::KNorm => "k_norm",
+            Self::OProj => "o_proj",
+            Self::FfnNorm => "post_attention_layernorm",
+            Self::GateProj => "gate_proj",
+            Self::UpProj => "up_proj",
+            Self::DownProj => "down_proj",
+            Self::FinalNorm => "norm",
+            Self::LmHead => "lm_head",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TensorLayout {
+    pub kind: &'static str,
+    pub layer: Option<usize>,
+    pub offset: usize,
+    pub byte_count: usize,
+    pub rows: usize,
+    pub columns: usize,
+    pub quantized: bool,
+}
+
+pub fn tensor_layout(bytes: &[u8]) -> Result<(Config, Vec<TensorLayout>)> {
+    let header = bytes
+        .get(..HEADER_LENGTH)
+        .ok_or(Error::InvalidModel("模型数据被截断"))?;
+    let config = parse_header(header)?;
+    let mut tensors = Vec::new();
+    let mut offset = HEADER_LENGTH;
+    let mut finished = 0;
+    let mut slot = Some(Slot::TokenEmbedding);
+    while let Some(current) = slot {
+        let (rows, columns) = current.shape(&config);
+        let byte_count = current.byte_count(&config)?;
+        let global = matches!(
+            current,
+            Slot::TokenEmbedding | Slot::FinalNorm | Slot::LmHead
+        );
+        tensors.push(TensorLayout {
+            kind: current.name(),
+            layer: (!global).then_some(finished),
+            offset,
+            byte_count,
+            rows,
+            columns,
+            quantized: config.quantized && current.is_matrix(),
+        });
+        offset = offset
+            .checked_add(byte_count)
+            .ok_or(Error::InvalidModel("模型长度溢出"))?;
+        if current == Slot::DownProj {
+            finished += 1;
+        }
+        slot = current.next(&config, finished);
+    }
+    Ok((config, tensors))
+}
+
 #[derive(Debug)]
 struct Tensor {
     slot: Slot,
@@ -425,12 +520,15 @@ impl Assembly {
         if self.tensor.is_some() {
             return Err(Error::InvalidModel("模型数据被截断"));
         }
+        let mut layers = self.layers;
+        layers.iter_mut().for_each(LayerWeights::refresh_skips);
         Ok(Model {
             config: self.config,
             token_embedding: self.token_embedding,
-            layers: self.layers,
+            layers,
             final_norm: self.final_norm,
             lm_head: self.lm_head,
+            columns: OnceLock::new(),
         })
     }
 }
@@ -617,6 +715,32 @@ mod tests {
         let mut trailing = bytes;
         trailing.push(0);
         assert!(Model::from_bytes(&trailing).is_err());
+    }
+
+    #[test]
+    fn tensor_layout_covers_every_byte_in_loader_order() {
+        use crate::test_utils::TinySpec;
+        for spec in TinySpec::wide_variants() {
+            let bytes = spec.bytes();
+            let (config, tensors) = tensor_layout(&bytes).unwrap();
+            assert_eq!(config, *spec.model().config());
+            assert_eq!(tensors[0].kind, "embed_tokens");
+            assert_eq!(tensors[0].offset, HEADER_LENGTH);
+            for pair in tensors.windows(2) {
+                assert_eq!(pair[0].offset + pair[0].byte_count, pair[1].offset);
+            }
+            let last = tensors.last().unwrap();
+            assert_eq!(last.offset + last.byte_count, bytes.len());
+            assert_eq!(last.kind, if spec.tied { "norm" } else { "lm_head" });
+            let downs: Vec<_> = tensors
+                .iter()
+                .filter(|t| t.kind == "down_proj")
+                .map(|t| t.layer)
+                .collect();
+            assert_eq!(downs, (0..spec.layers).map(Some).collect::<Vec<_>>());
+            assert!(tensors.iter().all(|t| !t.quantized));
+        }
+        assert!(tensor_layout(&tiny_model_bytes()[..10]).is_err());
     }
 
     #[test]

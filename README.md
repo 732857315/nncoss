@@ -13,7 +13,7 @@ A WebAssembly-based neural network framework for any platform and language, with
 ![deployment](https://img.shields.io/badge/deployment-WASM%20%2B%20native-654ff0)
 ![interface](https://img.shields.io/badge/interface-language%20neutral-dea584)
 
-[项目定位](#项目定位) · [编译流水线](#编译流水线) · [多语言调用](#多语言调用) · [扩展机制](#扩展机制) · [使用流程草案](#使用流程草案) · [引擎](#引擎) · [训练](#训练) · [推理](#推理) · [WASM LLM 原型](#wasm-llm-推理原型) · [模型迁移](#模型迁移) · [路线图](#路线图)
+[项目定位](#项目定位) · [编译流水线](#编译流水线) · [多语言调用](#多语言调用) · [扩展机制](#扩展机制) · [使用流程草案](#使用流程草案) · [引擎](#引擎) · [训练](#训练) · [推理](#推理) · [WASM LLM 原型](#wasm-llm-推理原型) · [知识库与权重改写](#知识库与权重改写实验) · [模型迁移](#模型迁移) · [路线图](#路线图)
 
 </div>
 
@@ -25,7 +25,7 @@ WASM 承载可移植的计算与扩展模块；LLVM 负责优化与目标代码�
 
 「枢」是门轴，也是中枢。吻灵枢想做模型的枢纽：外部模型迁移进来，自己的模型训练出来，最终都能部署出去；同时保持克制，只接管你不想写的部分，点到为止。
 
-> **项目状态**：当前仓库包含设计文档、验收工具及 `nncoss-llm` 早期原型。该原型已能构建并执行 WASM decoder-only 推理，但尚无可安装的完整框架软件包、浏览器宿主示例或已完成验收的公开模型。除 [WASM LLM 原型](#wasm-llm-推理原型)明确列出的能力外，下文 API、平台与命令仍为设计目标或使用草案。
+> **项目状态**：当前仓库包含设计文档、验收工具、`nncoss-llm` 早期原型，以及基于它的本地对话界面 `nncoss-web`、外部知识库 `nncoss-knowledge` 与权重改写工具 `nncoss-edit`。`nncoss-llm` 已能构建并执行 WASM 与原生 decoder-only 推理，但尚无可安装的完整框架软件包、浏览器宿主示例或已完成验收的公开模型。除 [WASM LLM 原型](#wasm-llm-推理原型)与[知识库与权重改写实验](#知识库与权重改写实验)明确列出的能力外，下文 API、平台与命令仍为设计目标或使用草案。
 >
 > **当前优先级**：框架主线先完成可复现的最小纵向原型，以 f32 张量、标量 CPU 内核和固定结构的 MLP 为边界，验证 WASM 与原生 CPU 的数值一致性，再打通 MNIST 训练闭环。`nncoss-llm` 作为独立实验原型提前验证 LLM 会话、KV Cache 与 WASM ABI，不代表框架 v0.1 已完成；GPU、通用迁移和更多平台仍在核心链路验证后分批推进。
 
@@ -411,7 +411,7 @@ python3 tools/make_golden_llm.py
 
 整块加载要求输入缓冲区与解析后的权重同时驻留内存，且 wasm32 的单次分配不能超过 `isize::MAX`（2 GiB − 1 字节）。分块加载不需要整文件输入缓冲区，最大的单次分配是最大的单个权重张量。
 
-模型文件不随仓库分发，按[模型说明](model/README.md)下载 Qwen3-0.6B 并导出 `model/Qwen3-0.6B/qwen3-0.6b-f32.nncossllm`（2,384,199,744 字节）。下列命令以 1 MiB 分块把它分别加载到原生动态库与 `wasm32-unknown-unknown` 产物，执行 5 个 token 的 prefill 与 4 步贪心 decode 并比较 logits；`--hf-model` 为可选项，需要 `tools/golden_requirements.txt` 的依赖，用 Hugging Face f32 eager 前向作为参考：
+模型文件不随仓库分发，按[模型说明](docs/models.md)下载 Qwen3-0.6B 并导出 `model/Qwen3-0.6B/qwen3-0.6b-f32.nncossllm`（2,384,199,744 字节）。下列命令以 1 MiB 分块把它分别加载到原生动态库与 `wasm32-unknown-unknown` 产物，执行 5 个 token 的 prefill 与 4 步贪心 decode 并比较 logits；`--hf-model` 为可选项，需要 `tools/golden_requirements.txt` 的依赖，用 Hugging Face f32 eager 前向作为参考：
 
 ```bash
 python3 tools/check_real_llm.py
@@ -435,7 +435,7 @@ python3 tools/check_real_llm.py --hf-model model/Qwen3-0.6B
 
 `tools/export_llm.py --outtype q4` 提供项目内的 Q4 权重编码，不改变模型 ABI 或分块加载协议。矩阵按 32 列分组，每个矩阵依次保存三段数据：每行一个 f32 行 scale、每组一个 i8 组倍率（可为负）、每组 16 字节的 4-bit 打包值，末尾补零到 4 字节对齐；权重还原值为 `行 scale × 组倍率 × q`，`q ∈ [-8, 7]`，平均约 4.25 bit／权重。导出器对每组尝试 17 个候选步长与两种符号，用最小二乘重新拟合步长并取还原误差最小者，在 Qwen3-0.6B 上比按 absmax/7 取整的权重相对均方误差低约 32%。Norm 与 bias 保持 f32，嵌入查表和 LM Head 共用同一编码。
 
-推理时线性层的输入按同样的 32 列分组量化为 int8（每组一个 f32 scale），组内做整数点积后乘以 `组倍率 × 输入 scale` 累加。x86_64 在运行时检测到 AVX2 时使用向量化内核和常驻线程池（默认取物理核数，最多 8 个，可用环境变量 `NNCOSS_THREADS` 覆盖），每个线程顺序读取一段连续的权重行；prefill 每批 32 个 token，同一行权重对多个 token 复用，注意力把每个 KV 头的历史位置切成固定的 256 个位置一块，按块分别计算局部最大值、指数和与未归一化输出，再按块的顺序合并；单 token decode 时（KV 头 × 块）并行，长上下文下 6 个线程负载均衡，prefill 每块的 K/V 对整批 token 复用。指数小于 e^-41 的注意力权重视为 0，以免产生非规格化浮点数拖慢计算，对结果的影响低于 f32 精度。分块与合并顺序与线程数无关，标量与 AVX2 路径逐位一致。KV Cache 按 `[KV 头][位置][head_dim]` 连续存放；Q4 模型的 KV Cache 以 f16 存储（Qwen3-0.6B 每个位置 114,688 字节），f32 模型保持 f32（每个位置 229,376 字节），f16 与 f32 之间的转换使用软件实现的就近舍入，原生目标在支持 F16C 时批量转换，两者逐位一致。其他目标（包括 WASM）使用标量实现。向量化与标量路径按相同的通道划分和求和顺序计算，RoPE 的幂与正余弦、softmax 与 SiLU 的指数使用只依赖 IEEE 754 基本运算的实现，因此原生与 WASM 的 logits 逐位一致；批量 prefill 与逐 token decode 的结果也逐位一致。
+推理时线性层的输入按同样的 32 列分组量化为 int8（每组一个 f32 scale），组内做整数点积后乘以 `组倍率 × 输入 scale` 累加。x86_64 在运行时检测到 AVX2 时使用向量化内核和常驻线程池（默认取物理核数，最多 8 个，可用环境变量 `NNCOSS_THREADS` 覆盖），每个线程顺序读取一段连续的权重行；prefill 每批 32 个 token，同一行权重对多个 token 复用，注意力把每个 KV 头的历史位置切成固定的 256 个位置一块，按块分别计算局部最大值、指数和与未归一化输出，再按块的顺序合并；单 token decode 时（KV 头 × 块）并行，长上下文下 6 个线程负载均衡，prefill 每块的 K/V 对整批 token 复用。指数小于 e^-41 的注意力权重视为 0，以免产生非规格化浮点数拖慢计算，对结果的影响低于 f32 精度。分块与合并顺序与线程数无关，标量与 AVX2 路径逐位一致。KV Cache 按 `[KV 头][位置][head_dim]` 连续存放；Q4 模型的 KV Cache 以 f16 存储（Qwen3-0.6B 每个位置 114,688 字节），f32 模型保持 f32（每个位置 229,376 字节），f16 与 f32 之间的转换使用软件实现的就近舍入，原生目标在支持 F16C 时批量转换，两者逐位一致。其他目标（包括 WASM）使用标量实现。另有可选的 int8 KV Cache，见下文。向量化与标量路径按相同的通道划分和求和顺序计算，RoPE 的幂与正余弦、softmax 与 SiLU 的指数使用只依赖 IEEE 754 基本运算的实现，因此原生与 WASM 的 logits 逐位一致；批量 prefill 与逐 token decode 的结果也逐位一致。
 
 ```bash
 python3 tools/export_llm.py --model model/Qwen3-0.6B --output model/Qwen3-0.6B/qwen3-0.6b-q4.nncossllm --outtype q4
@@ -460,7 +460,31 @@ cargo run -p nncoss-llm --release --example bench -- --model model/Qwen3-0.6B/qw
 
 `Session::generate` 默认启用推测解码：在会话已有的 token 中查找与当前末尾相同的 2–3 个 token 片段，取其后一个 token 作为草稿，与新采样的 token 组成 2 个 token 的批次一起前向，再按草稿验证规则接受或拒绝。贪心时只在草稿等于 argmax 时接受；采样时以目标分布中草稿的概率接受，拒绝时从去掉草稿后重新归一化的分布中采样，因此生成分布与逐 token 采样完全相同。贪心输出与关闭推测解码时逐 token 一致；采样输出的分布不变，但同一种子下随机数的使用顺序不同，具体序列可能不同。`Session::set_speculation(false)` 可关闭该功能；C ABI 的 `decode`／`sample` 逐 token 接口不受影响。2 个 token 的前向约为单步的 1.2 倍，在 7 组真实多轮对话上实测：代码类约快 10–20%，摘要类约 5–10%，开放式对话约 0–10%，整体约 5–8%（测量噪声约 ±6%）。
 
-`tools/check_q4_llm.py` 在内置的 7 段文本（中英文问答、故事、邮件、数学推导、JSON 与 Rust 代码）上按 teacher forcing 比较 Q4 与 f32 模型的下一 token 分布，共 908 个位置。仓库当前的 Q4 模型按下文的校准量化与蒸馏生成，top-1 一致率为 0.859，平均 KL(f32‖Q4) 为 0.111，困惑度从 9.489 升至 9.676（比值 1.020）。脚本默认阈值按这组结果留出余量，只用于发现回归；不经校准导出的 Q4 达不到默认阈值。该脚本需要 numpy、tokenizers 与本地导出的模型，不纳入 CI。
+**int8 KV Cache（可选）**：`Session::set_kv_precision(KvPrecision::I8)` 把 K、V 存成 int8，每个位置的每个 KV 头另存一个 f32 系数（绝对值最大值 / 127），每个位置约 58 KB，是 f16 的一半。键的系数乘到注意力分数上，值的系数乘到注意力权重上，因此复用同一套分块注意力内核，标量与 AVX2 路径逐位一致。Qwen3 的键里有少数数值很大的维度，按行缩放会让其余维度几乎没有精度；因此 int8 模式下对 Q、K、V 做同一个归一化的 Hadamard 旋转把离群值摊开（Q·K 不变），注意力输出再旋转回来。在 3 段约 1500 token 的真实检索对话上，以 f32 KV Cache 为参照逐位置比较后半段的下一个 token 分布：
+
+| KV Cache | 平均 KL | 最大 KL | top-1 一致率 |
+|----------|---------|---------|--------------|
+| f16（Q4 模型默认） | 0.0016–0.0018 | 0.028–0.050 | 0.969–0.983 |
+| int8 + Hadamard 旋转 | 0.0040–0.0046 | 0.12–0.20 | 0.965–0.975 |
+| int8，不旋转 | 0.10–0.14（以 f16 为参照） | 6.5–9.2 | 0.86–0.87 |
+
+int8 的误差约为 f16 的 2.5 倍，但远小于 Q4 权重本身的误差（平均 KL 0.111）。速度收益只在长上下文时出现；测量时机器上同时运行着其他任务，两轮结果互相矛盾，所以还没有可靠的速度数据，默认仍使用 f16。
+
+**decode 时的输入通道稀疏化（可选，实验性）**：`Session::set_input_sparsity(InputSparsity)` 让每个 token 只保留矩阵乘法输入中绝对值最大的一部分通道，被丢弃的通道对应的权重列不再读取。作用于三部分：q/k/v 投影的输入（`attention`）、gate/up 投影的输入（`mlp`）和输出层的输入（`head`），三者约占每步权重读取量的四分之三；o 与 down 只有 1024 行，按列跳读时每个线程每列只读 128 字节，比稠密内核更慢，所以始终完整计算。实现上为 Q4 矩阵另存一份按列存放的副本：每行的 scale 与每行每 32 列的 code 与原矩阵相同，只是半字节按列连续存放，q/k/v 与 gate/up 按行拼接，使每列成为 2–3 KB 的连续数据。因此结果等于把丢弃的通道置零后用原矩阵计算，只有浮点求和顺序不同。第一次启用时建立副本，内存约增加 240 MB（Qwen3-0.6B）。稀疏化只用于逐 token decode；prefill 与推测解码的两 token 校验仍完整计算。默认关闭，只支持 Q4 模型。文本形式为单个比例（三部分相同）或 `attn=0.15,mlp=0.15,head=0.3`，`bench`、`nncoss-know` 与测评脚本的 `--sparsity` 都用这种写法。
+
+在约 1500 token 的真实对话上以完整计算为参照（方法同上表），以及在 24 token prompt、128 token decode 上交替测 4 轮的速度中位数：
+
+| 丢弃比例（attn / mlp / head） | 少读的权重 | 平均 KL | top-1 一致率 | decode 速度 |
+|---|---|---|---|---|
+| 15% / 15% / 30% | 15% | 0.026 | 0.906 | 1.06 倍 |
+| 0 / 0 / 50% | 13% | 0.086 | 0.867 | 1.09 倍 |
+| 25% / 25% / 25% | 19% | 0.049 | 0.879 | 1.13 倍 |
+| 40% / 40% / 40% | 30% | 0.209 | 0.772 | 1.26 倍 |
+| 10% / 10% / 10% | 8% | — | — | 0.94 倍 |
+
+测速时机器处于温度降频（CPU 速度上限在 42%–100% 之间变化），稠密 decode 只有约 45 tokens/s，倍数仅供参考。丢 10% 时选择通道等固定开销超过省下的读取，反而更慢。这些误差都不小：丢 25% 的 KL 约为 Q4 量化本身（0.111）的一半；但在高考单选题上（贪心，不用工具），三部分各丢 25% 不降正确率：108 道测验题上都是 41.7%，另外 373 道题上为 41.3% 对 40.5%，见[实验记录](docs/brain-experiments.md#64-逐-token-的动态结构)。实际生成时提速比上表小：`Session::generate` 默认开启的推测解码会把约 56% 的前向变成两 token 的校验，校验仍完整计算，373 道题的测评用时只少 2.6%。
+
+`tools/check_q4_llm.py` 在内置的 7 段文本（中英文问答、故事、邮件、数学推导、JSON 与 Rust 代码）上按 teacher forcing 比较 Q4 与 f32 模型的下一 token 分布，共 908 个位置。本地 Q4 模型按下文的校准量化与蒸馏生成，top-1 一致率为 0.859，平均 KL(f32‖Q4) 为 0.111，困惑度从 9.489 升至 9.676（比值 1.020）。脚本默认阈值按这组结果留出余量，只用于发现回归；不经校准导出的 Q4 达不到默认阈值。该脚本需要 numpy、tokenizers 与本地导出的模型，不纳入 CI。
 
 #### 校准量化与蒸馏
 
@@ -469,13 +493,13 @@ cargo run -p nncoss-llm --release --example bench -- --model model/Qwen3-0.6B/qw
 - **GPTQ 量化**：`tools/export_llm.py --outtype q4 --calibration FILE...` 先用 transformers 以 f32 运行原模型，统计每个线性层输入的二阶矩 E[xxᵀ]，再逐列量化：每列量化后把舍入误差按输入协方差分摊到尚未量化的列，使每层输出的误差最小。组步长仍按最小二乘候选搜索。校准 token 按文件平均分配，默认最多 65,536 个。不传 `--calibration` 时保持原来的最小二乘量化。
 - **蒸馏**：`tools/distill_q4_llm.py` 以 f32 原模型为教师，在校准文本上最小化 KL(f32‖Q4)，只训练 Q4 文件中本来就以 f32 保存的参数，即每行 scale、RMSNorm 权重与 QKV bias；4-bit 值与组倍率保持不变。
 
-`tools/calibration/qwen3_chat.txt` 是 Qwen3-0.6B 按 96 条中英文提示（科普、生活、写作、编程、数学、翻译等）生成的对话，与 `check_q4_llm.py` 的评估文本不重叠。只用对话文本校准的效果不如混合文本，因此当前模型同时使用了 README 与几份 Rust、Python 源码。仓库中的 Q4 模型由以下命令生成，在测试机上导出约 25 分钟、蒸馏约 37 分钟，需要 torch 与 transformers：
+`tools/calibration/qwen3_chat.txt` 是 Qwen3-0.6B 按 96 条中英文提示（科普、生活、写作、编程、数学、翻译等）生成的对话，与 `check_q4_llm.py` 的评估文本不重叠。只用对话文本校准的效果不如混合文本，因此当前模型同时使用了 README 与几份 Rust、Python 源码。本地 Q4 模型由以下命令生成，在测试机上导出约 25 分钟、蒸馏约 37 分钟，需要 torch 与 transformers：
 
 ```bash
-python3 tools/export_llm.py --model model/Qwen3-0.6B --output /tmp/qwen3-0.6b-q4-gptq.nncossllm --outtype q4 \
+python3 tools/export_llm.py --model model/Qwen3-0.6B --output tmp/qwen3-0.6b-q4-gptq.nncossllm --outtype q4 \
   --calibration tools/calibration/qwen3_chat.txt README.md crates/nncoss-llm/src/session.rs \
   crates/nncoss-llm/src/model.rs tools/export_llm.py crates/nncoss-web/src/lib.rs
-python3 tools/distill_q4_llm.py --model model/Qwen3-0.6B --input /tmp/qwen3-0.6b-q4-gptq.nncossllm \
+python3 tools/distill_q4_llm.py --model model/Qwen3-0.6B --input tmp/qwen3-0.6b-q4-gptq.nncossllm \
   --output model/Qwen3-0.6B/qwen3-0.6b-q4.nncossllm --steps 300 \
   --calibration tools/calibration/qwen3_chat.txt README.md crates/nncoss-llm/src/session.rs \
   crates/nncoss-llm/src/model.rs tools/export_llm.py crates/nncoss-web/src/lib.rs
@@ -520,7 +544,7 @@ cargo run -p nncoss-llm --release --example bench -- --preset small
 python3 tools/bench_wasm_llm.py --preset small
 ```
 
-传入 `--model` 时改为测量真实模型：`--prompt`、`--decode` 设置 token 数，默认使用 temperature 0.6／top-k 20／top-p 0.95 采样，`--greedy` 改为贪心；输出 decode 的中位与最佳 tokens/s。`--tokens FILE` 从文件读取逗号或空白分隔的 prompt token；`--generate` 改为比较关闭与开启推测解码时 `Session::generate` 的速度，`--eos` 指定停止 token，贪心时同时检查两者输出是否一致。
+传入 `--model` 时改为测量真实模型：`--prompt`、`--decode` 设置 token 数，默认使用 temperature 0.6／top-k 20／top-p 0.95 采样，`--greedy` 改为贪心；输出 decode 的中位与最佳 tokens/s。`--tokens FILE` 从文件读取逗号或空白分隔的 prompt token；`--generate` 改为比较关闭与开启推测解码时 `Session::generate` 的速度，`--eos` 指定停止 token，贪心时同时检查两者输出是否一致。`--kv f32|f16|i8` 指定 KV Cache 精度；`--kv-compare` 配合 `--tokens` 以 f32 KV Cache 为参照，逐位置比较 f16 与 int8 的下一个 token 分布。`--sparsity SPEC` 启用 decode 时的输入通道稀疏化；`--sparsity-compare SPEC`（可重复）配合 `--tokens` 以完整计算为参照比较各稀疏设置。`examples/sparse_read.rs` 单独测量按块随机跳读内存时能省下多少时间。
 
 基准用于记录基线与优化前后的对比，结果依赖具体机器，不构成性能承诺，也不纳入 CI 门禁。WASM 脚本的 decode 计时包含 Python 宿主逐 token 调用的开销。
 
@@ -596,6 +620,62 @@ fn load(path: &str) -> Result<Model, Box<dyn std::error::Error>> {
 分块加载接口是 ABI 版本 1 的增量扩展，已有接口的签名与行为不变；宿主可通过导出符号是否存在判断其可用性。分块可以在任意字节处切分，累计写入不得超过声明的总长度。加载器报告模型格式、长度或分配错误后即释放已解析的权重，后续写入与 `finish` 返回同一错误；空句柄、空指针等参数错误不改变加载器状态。数据未写满就调用 `finish` 按截断处理。`finish` 无论成败只能调用一次，加载器句柄始终需要 `nncoss_llm_model_loader_free` 释放，模型句柄的生命周期与加载器无关。
 
 当前已实现 Q4 权重量化与原生多线程；尚未实现 WASM SIMD、WASM 多线程、GPU、浏览器 JavaScript 宿主和流式文本绑定。f32 权重约占每个参数 4 字节，Q4 约 0.53 字节，模型、KV Cache 与临时张量必须共同满足 wasm32 地址空间及宿主内存限制；超过 `isize::MAX` 字节的模型文件在 wasm32 上只能分块加载，权重总量接近或超过 4 GiB 的模型无法以当前 f32 格式装入 wasm32。
+
+## 知识库与权重改写实验
+
+这部分是“大脑与知识分离”的探索性实验：模型只负责理解和推理，知识放在外部文件里现查现学；同时尝试不经训练、直接改写权重或网络结构来改进模型。方向、判断标准与每项改动的原因见[决策记录](docs/decisions.md)，实验过程与结果见[实验记录](docs/brain-experiments.md)，用到的资料见[外部资料](docs/modelbook.md)，模型见[模型说明](docs/models.md)。以下工具都是实验原型，不属于框架的公开接口。
+
+### 外部知识库：nncoss-knowledge
+
+`crates/nncoss-knowledge` 提供命令行 `nncoss-know`，用 `nncoss-llm` 原生后端运行 Qwen3，并把知识库作为工具交给模型使用：
+
+- **知识库**：段落与模型自己写的笔记分别保存在 `passages.jsonl` 与 `notes.jsonl`，检索用 BM25，中文按相邻两字切分，英文与数字按词切分，笔记的得分加权 1.5 倍。
+- **工具**：`search_knowledge` 检索，`write_note` 记笔记，可选的 `browse` 用 curl 打开网页并提取正文；调用格式是 Qwen3 的工具调用模板。模型抄进参数的 LaTeX 反斜杠不构成合法 JSON 转义时，会改成字面反斜杠后再解析；工具轮数用尽时，告诉模型直接作答，再给它一次机会。
+- **笔记依据检查**：笔记里的检索词至少 60% 要出现在本题检索到的课本段落里，否则拒绝记录，避免把模型的臆测写进知识库。作答后若检索过资料，会再请模型归纳一条笔记（`--no-learn` 关闭）。
+- **对照条件**：`--no-tools` 不提供工具；`--prefetch` 在作答前先用题目自动检索一次，作为“必然查到资料”的对照，配合 `--tool-rounds 0 --no-learn` 时模型只读这次预取的资料、各题互不影响；`--reference` 同样先用题目检索一次，但把查到的段落作为参考资料写在问题前面，不经过工具调用，配合 `--no-tools --no-learn` 时模型只读资料、不能再检索（1.7B 在 `--prefetch` 条件下常常坚持再次调用工具而不作答，见[实验记录 5.9](docs/brain-experiments.md#59-17b只读资料的两种写法)）；`--reply-prefix TEXT` 让第一轮回复由给定文字开头，模型接着写；`--think` 开启思考模式（默认按 Qwen 推荐的 temperature 0.6、top-k 20、top-p 0.95 采样，非思考模式默认贪心）。
+- **把握不足才查书（单选题）**：`--consult-below P` 先不用工具作答，再在同一会话里追问“你的最终答案是哪个选项？只回答一个字母”，读出模型给 A–D 的概率；最高概率不低于 P 时采用这次回答，否则按其余选项（如 `--prefetch` 或 `--reference`）查资料重新作答。两次作答的记录都留在 transcript 中，`batch` 输出的 `confidence` 与 `consulted` 记录追问的把握和是否查了资料。阈值 0.8 在两组高考题上合计没有净收益（[实验记录 5.6](docs/brain-experiments.md#56-先自己作答没把握才查书)），这一方式只用于实验。
+
+```bash
+target/release/nncoss-know ingest --store modelbook/knowledge/store-base --input modelbook/knowledge/oiwiki.jsonl
+target/release/nncoss-know search --store modelbook/knowledge/store-base --query "光合作用 产物"
+target/release/nncoss-know ask --store tmp/store-try --model model/Qwen3-0.6B/qwen3-0.6b-q4.nncossllm \
+  --tokenizer model/Qwen3-0.6B/tokenizer.json --question "光合作用的产物是什么？"
+target/release/nncoss-know batch --store <知识库> --model <模型> --tokenizer <分词器> --input <题目.jsonl> --output <结果.jsonl>
+target/release/nncoss-know prompt --input <题目.jsonl> --output <提示.jsonl> [--prefetch|--reference --store <知识库>]
+```
+
+`ask` 与 `batch` 会把模型写的笔记存进 `--store` 指向的目录，试用时应先复制一份知识库。`prompt` 只输出模型开口前看到的完整提示，供测量脚本使用。
+
+### 权重改写：nncoss-edit
+
+`crates/nncoss-edit` 提供命令行 `nncoss-edit`，按 JSON 改动计划直接改写 `.nncossllm` 文件，不做任何训练：
+
+- **缩放**：`{"op": "scale", "target": ..., "layer": ..., "index": [...], "factor": ...}`。`mlp` 的第 i 个神经元对应 up_proj 的第 i 行（SwiGLU 对 up 是线性的，缩放这一行等于缩放该神经元的输出）；`kv_head` 对应 v_proj 中该头的全部行；另可缩放 `q_norm`、`k_norm`、`attn_norm`、`ffn_norm`、`final_norm` 的单个元素和词嵌入 `token` 的行。Q4 文件只改每行的 f32 scale，因此不接受负数因子。
+- **删层**：`{"op": "drop_layers", "layers": [...]}` 删除整层，其余张量逐字节保留，层号随后重新连续编号。
+- 改动后默认用 `nncoss-llm` 的加载器检查模型能否加载，再原子地写出新文件。
+
+```bash
+target/release/nncoss-edit inspect model/Qwen3-0.6B/qwen3-0.6b-q4.nncossllm
+target/release/nncoss-edit apply --input <模型> --output <新模型> --plan <改动.json> --edit '{"op": "drop_layers", "layers": [20]}'
+```
+
+### 测评与测量脚本
+
+以下 Python 脚本只做辅助的抽题、判分与测量，作答都由 `nncoss-know` 完成。脚本不改动参数，改动计划交给 `nncoss-edit` 执行。输出默认写到不入库的 `tmp/`。
+
+| 脚本 | 作用 |
+|------|------|
+| `tools/quick_eval.py` | 快速考评，满分 100 分：随机抽 6 道高考客观题、2 道主观题、2 道 ACM 题，每题 10 分。ACM 程序在本机用官方测试数据判题；主观题由评审者按参考答案打分后用 `--finalize` 计分。90 分以上优秀、80 分良好、70 分普通、60 分及格，60 分以下为没学会 |
+| `tools/eval_gaokao.py` | 从 9 个单选题科目各抽 12 道高考题。`--split test` 用于测验，`--split tune` 用于定位改动，两者不重叠；`--split wide` 是与两者都不重叠的大题组（每科 48 道，物理、语文题少，共 373 道），用于分辨较小的差别。可选择是否思考、是否用工具、是否预取检索或把资料写进提问（`--reference`），以及稀疏化、回复开头与“把握不足才查书”等设置，结果写到 `tmp/<标签>/`；`--no-learn` 时各题互不影响，中断后可用 `--resume` 只答剩下的题 |
+| `tools/tool_decision.py` | 在开口位置测量模型选择调用检索的概率，以及各 MLP 神经元与 KV 头对这一选择的梯度归因 |
+| `tools/retrieval_gate.py` | 以模型自己的回答为目标（不用标准答案），定位“检索结果为空时拒答、不再自己推理”这一行为相关的神经元和 KV 头，并在留出的一半题上比较候选改动 |
+| `tools/layer_importance.py` | 逐层删除并测量模型自己回答的负对数似然变化，给出删层顺序；`--part attn|mlp` 改为只删注意力或 MLP 子层 |
+| `tools/repetition_edit.py` | 在模型自己的回答中人为重复一句，测量它继续重复的概率；定位让模型陷入重复循环的神经元与 KV 头，给出改动计划 |
+| `tools/dynamic_sparsity.py` | 测量每个 token 只保留一部分 MLP 神经元的代价，以及几种不训练的预判方式（gate 投影、前一个 token、SVD 低秩近似） |
+| `tools/moefy.py` | 按神经元的共同激活把稠密 MLP 切成等大小的专家，测量按 token 选专家的代价 |
+| `tools/regions.py` | 读题时为每层选出一组神经元作为这道题的“区域”，测量作答时只用这些神经元的代价，并与全局共用区域、随机区域比较 |
+| `tools/input_sparsity.py` | 在 f32 模型上测量每个 token 丢弃各矩阵输入中一部分通道的代价，并按参数量估计少读的权重比例 |
+| `tools/answer_confidence.py` | 同一道题作答两次（如不用书与先查书）后，追问最终选项并读出 A–D 的概率，检验能否由模型自己的把握决定采用哪一次的答案 |
 
 ## 示例模型
 
@@ -691,14 +771,29 @@ nncoss migrate resnet50.safetensors --model resnet50 \
 
 ## 项目结构
 
-`crates/nncoss-llm` 为当前已实现的早期原型，其余模块、绑定和示例目录仍为规划结构。
+当前仓库中已有的内容：
 
 ```text
 nncoss/
-├── Cargo.toml            # workspace，同时是门面 crate nncoss
-├── src/                  # 门面：统一 API，按 feature 组合各模块
+├── Cargo.toml              # workspace
 ├── crates/
-│   ├── nncoss-llm/       # 已实现的 f32 decoder-only WASM／原生推理原型
+│   ├── nncoss-llm/         # f32／Q4 decoder-only 推理原型，WASM 与原生，C ABI
+│   ├── nncoss-web/         # 本地浏览器对话界面，原生后端
+│   ├── nncoss-knowledge/   # 外部知识库、检索与笔记，命令行 nncoss-know
+│   └── nncoss-edit/        # 直接改写 .nncossllm 的权重与删层，命令行 nncoss-edit
+├── modelbook/              # 外部资料：测验题、课本清单、OI Wiki；课本 PDF 与知识库只保存在本机
+├── docs/                   # 文档：外部资料、模型、实验记录、CI/CD 验收、命名
+├── tools/                  # 辅助脚本（Python）：导出、校验、下载、测评与测量
+├── model/                  # 本地模型文件，不入库，来源见 docs/models.md
+└── tmp/                    # 临时数据：实验输出、日志与中间文件，不入库
+```
+
+以下模块、绑定和示例目录仍是规划结构：
+
+```text
+nncoss/
+├── src/                  # 门面 crate nncoss：统一 API，按 feature 组合各模块
+├── crates/
 │   ├── nncoss-engine/    # 引擎：张量、自动微分、内存管理、设备调度
 │   ├── nncoss-kernels/   # 内置算子与参考实现：AI 使用 Rust，编译为 WASM
 │   ├── nncoss-compiler/  # 编译器：WASM → LLVM IR → CPU 机器码 / GPU 内核
@@ -714,8 +809,7 @@ nncoss/
 ├── bindings/             # 各语言绑定；非 Rust 程序代码由人类维护
 │   ├── js/               # JavaScript / TypeScript SDK
 │   └── python/           # Python 绑定；其他语言按需加入
-├── examples/             # 可运行示例：mnist、cifar10、poetry、web-mnist、web-poetry……
-└── tools/                # 辅助工具：AI 功能实现用 Rust，辅助脚本只用 Python
+└── examples/             # 可运行示例：mnist、cifar10、poetry、web-mnist、web-poetry……
 ```
 
 ## 路线图

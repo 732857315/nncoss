@@ -1,7 +1,7 @@
 use std::process::Command;
 use std::sync::Arc;
 
-use nncoss_llm::{Model, SamplingConfig, Session};
+use nncoss_llm::{InputSparsity, KvPrecision, Model, SamplingConfig, Session};
 use serde::Serialize;
 use serde_json::Value;
 use tokenizers::Tokenizer;
@@ -12,6 +12,14 @@ pub const EOS_TOKENS: [u32; 2] = [151643, 151645];
 const NO_THINK: &str = "<think>\n\n</think>\n\n";
 const PASSAGE_CHARS: usize = 360;
 const PAGE_CHARS: usize = 4000;
+const PREFETCH_CHARS: usize = 300;
+const MIN_SUPPORT: f32 = 0.6;
+/// 作答之后追问最终选项；模型给 A–D 的概率反映它对自己答案的把握（见 `tools/answer_confidence.py`）。
+const CONFIDENCE_PROBE: &str = "<|im_start|>user\n你的最终答案是哪个选项？只回答一个字母。<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
+const CHOICES: [&str; 4] = ["A", "B", "C", "D"];
+const REFERENCE_INTRO: &str =
+    "下面是按题目从课本等资料中检索到的几段内容，不一定与题目相关，仅供参考。";
+const ROUNDS_USED_UP: &str = "工具调用次数已用完，请根据已有信息直接作答。";
 const INSTRUCTION: &str = "你的知识保存在外部知识库里，知识库中有幼儿园到高中的课本、计算机与算法资料，以及你以前记下的笔记。回答需要事实、概念、公式、方法或课文内容的问题时，先用 search_knowledge 查找，再依据查到的内容作答；学到以后用得上的知识时，用 write_note 记下来。";
 const BROWSE_INSTRUCTION: &str = "需要网页上的内容时，用 browse 打开网址阅读。";
 const LEARN_PROMPT: &str = "请把刚才从资料中学到、以后解决同类问题时用得上的知识归纳成一条简洁的笔记。只写知识本身（概念、规律、公式、方法或事实），不要写本题的答案，也不要写推理过程。";
@@ -25,11 +33,25 @@ pub struct AgentConfig {
     pub tools: bool,
     pub browse: bool,
     pub learn: bool,
+    pub prefetch: bool,
+    /// 作答前用题目检索一次，把查到的段落作为参考资料写在问题前面（不经过工具调用）。
+    /// 与 `tools: false` 同用时模型只读这些资料，是“大脑 + 书籍”的只读对照。
+    pub reference: bool,
     pub turn_tokens: usize,
     pub tool_rounds: usize,
     pub search_limit: usize,
     pub sampling: SamplingConfig,
     pub seed: u64,
+    /// KV Cache 精度；None 时用引擎默认（Q4 模型为 f16）。
+    pub kv: Option<KvPrecision>,
+    /// decode 时各部分矩阵输入丢弃的通道比例；默认不稀疏化。
+    pub sparsity: InputSparsity,
+    /// 由框架写好的第一轮回复开头（非思考模式下接在空思考块之后），模型从这里接着写；默认为空。
+    /// 用来检验读了资料以后先推理再作答的效果，见 docs/decisions.md。
+    pub reply_prefix: String,
+    /// 设定后先不用工具作答，再追问最终选项（A–D）；最高概率低于这个值时，
+    /// 才按其余设置（如 `prefetch`）查资料重新作答。只适用于单选题。
+    pub consult_below: Option<f32>,
 }
 
 impl Default for AgentConfig {
@@ -39,11 +61,17 @@ impl Default for AgentConfig {
             tools: true,
             browse: false,
             learn: true,
+            prefetch: false,
+            reference: false,
             turn_tokens: 1024,
             tool_rounds: 6,
             search_limit: 4,
             sampling: SamplingConfig::default(),
             seed: 0,
+            kv: None,
+            sparsity: InputSparsity::NONE,
+            reply_prefix: String::new(),
+            consult_below: None,
         }
     }
 }
@@ -55,7 +83,12 @@ pub struct Answer {
     pub searches: Vec<String>,
     pub pages: Vec<String>,
     pub notes: Vec<u64>,
+    pub rejected: usize,
     pub generated: usize,
+    /// `consult_below` 模式下，不查资料作答后对最终选项的把握（A–D 中最高的概率）。
+    pub confidence: Option<f32>,
+    /// `consult_below` 模式下是否因为把握不足而查了资料重新作答。
+    pub consulted: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -98,6 +131,44 @@ pub fn visible(text: &str) -> &str {
     text.trim()
 }
 
+/// 模型常把题目里的 LaTeX（如 `\quad`、`\left`）原样抄进 JSON 字符串，
+/// 这些反斜杠不构成合法转义。把它们改成字面反斜杠后再解析一次。
+fn repair_escapes(body: &str) -> String {
+    let chars: Vec<char> = body.chars().collect();
+    let mut repaired = String::with_capacity(body.len() + 8);
+    let mut index = 0;
+    while index < chars.len() {
+        let current = chars[index];
+        if current != '\\' {
+            repaired.push(current);
+            index += 1;
+            continue;
+        }
+        let next = chars.get(index + 1).copied();
+        let unicode = next == Some('u')
+            && chars.len() >= index + 6
+            && chars[index + 2..index + 6]
+                .iter()
+                .all(char::is_ascii_hexdigit);
+        match next {
+            Some('"' | '\\' | '/' | 'b' | 'f' | 'n' | 'r' | 't') => {
+                repaired.push('\\');
+                repaired.push(chars[index + 1]);
+                index += 2;
+            }
+            Some('u') if unicode => {
+                repaired.push('\\');
+                index += 1;
+            }
+            _ => {
+                repaired.push_str("\\\\");
+                index += 1;
+            }
+        }
+    }
+    repaired
+}
+
 pub fn parse_tool_calls(text: &str) -> Vec<Result<ToolCall, String>> {
     let mut calls = Vec::new();
     let mut rest = text;
@@ -108,6 +179,9 @@ pub fn parse_tool_calls(text: &str) -> Vec<Result<ToolCall, String>> {
             None => (after, ""),
         };
         let parsed = serde_json::from_str::<Value>(body.trim())
+            .or_else(|error| {
+                serde_json::from_str::<Value>(&repair_escapes(body.trim())).map_err(|_| error)
+            })
             .map_err(|error| format!("工具调用不是合法的 JSON：{error}"))
             .and_then(|value| {
                 let name = value
@@ -122,6 +196,90 @@ pub fn parse_tool_calls(text: &str) -> Vec<Result<ToolCall, String>> {
         rest = next;
     }
     calls
+}
+
+pub fn opening_prompt(config: &AgentConfig, question: &str) -> String {
+    format!(
+        "{}<|im_start|>user\n{question}<|im_end|>\n{}",
+        system_prompt(config),
+        assistant_open(config.thinking)
+    )
+}
+
+pub fn prefetch_turn(query: &str, output: &str, thinking: bool) -> String {
+    let arguments = serde_json::json!({ "query": query }).to_string();
+    format!(
+        "<|im_start|>assistant\n{NO_THINK}<tool_call>\n{{\"name\": \"search_knowledge\", \"arguments\": {arguments}}}\n</tool_call><|im_end|>\n<|im_start|>user\n<tool_response>\n{output}\n</tool_response><|im_end|>\n{}",
+        assistant_open(thinking)
+    )
+}
+
+/// 检索知识库并格式化成工具回复；引用到的课本段落记入 `sources`，供笔记依据检查使用。
+fn search_output(
+    base: &KnowledgeBase,
+    query: &str,
+    limit: usize,
+    sources: &mut Vec<String>,
+) -> String {
+    let hits = base.search(query, limit);
+    if hits.is_empty() {
+        return "知识库中没有找到相关内容".to_string();
+    }
+    hits.iter()
+        .map(|hit| match hit.kind {
+            Kind::Note => format!("[笔记 {}] {}", hit.id, hit.text),
+            Kind::Passage => {
+                if !sources.contains(&hit.id) {
+                    sources.push(hit.id.clone());
+                }
+                format!("[{}] {}", hit.source, truncate(&hit.text, PASSAGE_CHARS))
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// 预取检索条件下模型开口前看到的完整提示：先用题目检索一次，把这次调用和结果写进对话。
+/// 返回提示和所用的检索词。
+pub fn prefetch_prompt(
+    base: &KnowledgeBase,
+    config: &AgentConfig,
+    question: &str,
+    sources: &mut Vec<String>,
+) -> (String, String) {
+    let query: String = question.chars().take(PREFETCH_CHARS).collect();
+    let output = search_output(base, &query, config.search_limit, sources);
+    let prompt = format!(
+        "{}<|im_start|>user\n{question}<|im_end|>\n{}",
+        system_prompt(config),
+        prefetch_turn(&query, &output, config.thinking)
+    );
+    (prompt, query)
+}
+
+/// 参考资料条件下模型开口前看到的完整提示：用题目检索一次，把查到的段落写在问题前面。
+/// 是否另外提供工具仍由 `tools` 决定。返回提示和所用的检索词。
+pub fn reference_prompt(
+    base: &KnowledgeBase,
+    config: &AgentConfig,
+    question: &str,
+    sources: &mut Vec<String>,
+) -> (String, String) {
+    let query: String = question.chars().take(PREFETCH_CHARS).collect();
+    let output = search_output(base, &query, config.search_limit, sources);
+    let prompt = format!(
+        "{}<|im_start|>user\n{REFERENCE_INTRO}\n\n{output}\n\n题目：\n{question}<|im_end|>\n{}",
+        system_prompt(config),
+        assistant_open(config.thinking)
+    );
+    (prompt, query)
+}
+
+/// 只在几个选项字母之间归一化时，概率最高的选项的概率。
+pub fn top_choice_probability(logits: &[f32]) -> f32 {
+    let peak = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let total: f32 = logits.iter().map(|logit| (logit - peak).exp()).sum();
+    1.0 / total
 }
 
 fn truncate(text: &str, limit: usize) -> String {
@@ -322,6 +480,38 @@ impl<'a> Agent<'a> {
             .map_err(|error| error.to_string())
     }
 
+    fn record_note(
+        &mut self,
+        text: &str,
+        sources: &[String],
+        question: &str,
+        answer: &mut Answer,
+    ) -> String {
+        if sources.is_empty() {
+            answer.rejected += 1;
+            return "还没有查到任何资料，笔记必须以查到的资料为依据，没有记录".to_string();
+        }
+        let support = self.base.support(text, sources);
+        if support < MIN_SUPPORT {
+            answer.rejected += 1;
+            return format!(
+                "笔记中只有 {:.0}% 的内容能在查到的资料中找到依据，没有记录",
+                support * 100.0
+            );
+        }
+        match self
+            .base
+            .add_note(text, sources.to_vec(), Some(question.to_string()))
+        {
+            Ok(Some(id)) => {
+                answer.notes.push(id);
+                format!("已记下笔记 note-{id}")
+            }
+            Ok(None) => "笔记为空或已经存在，没有重复记录".to_string(),
+            Err(error) => format!("记笔记失败：{error}"),
+        }
+    }
+
     fn run_tool(
         &mut self,
         call: &ToolCall,
@@ -344,36 +534,11 @@ impl<'a> Agent<'a> {
                     return "缺少 query 参数".to_string();
                 }
                 answer.searches.push(query.clone());
-                let hits = self.base.search(&query, self.config.search_limit);
-                if hits.is_empty() {
-                    return "知识库中没有找到相关内容".to_string();
-                }
-                hits.iter()
-                    .map(|hit| match hit.kind {
-                        Kind::Note => format!("[笔记 {}] {}", hit.id, hit.text),
-                        Kind::Passage => {
-                            if !sources.contains(&hit.id) {
-                                sources.push(hit.id.clone());
-                            }
-                            format!("[{}] {}", hit.source, truncate(&hit.text, PASSAGE_CHARS))
-                        }
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n")
+                search_output(self.base, &query, self.config.search_limit, sources)
             }
             "write_note" => {
                 let content = argument("content");
-                match self
-                    .base
-                    .add_note(&content, sources.clone(), Some(question.to_string()))
-                {
-                    Ok(Some(id)) => {
-                        answer.notes.push(id);
-                        format!("已记下笔记 note-{id}")
-                    }
-                    Ok(None) => "笔记为空或已经存在，没有重复记录".to_string(),
-                    Err(error) => format!("记笔记失败：{error}"),
-                }
+                self.record_note(&content, sources, question, answer)
             }
             "browse" if self.config.browse => {
                 let url = argument("url");
@@ -388,22 +553,88 @@ impl<'a> Agent<'a> {
         }
     }
 
+    /// 回答一道题。设定了 `consult_below` 时，先由模型自己作答，把握不足才查资料重答：
+    /// 两次作答的记录都保留在 transcript 中，reply 取最终采用的那次。
     pub fn ask(&mut self, question: &str) -> Result<Answer, String> {
+        let Some(threshold) = self.config.consult_below else {
+            return self.attempt(question).map(|(answer, _)| answer);
+        };
+        let alone = AgentConfig {
+            tools: false,
+            learn: false,
+            reference: false,
+            ..self.config.clone()
+        };
+        let configured = std::mem::replace(&mut self.config, alone);
+        let first = self.attempt(question).and_then(|(answer, mut session)| {
+            let confidence = self.choice_confidence(&mut session)?;
+            Ok((answer, confidence))
+        });
+        self.config = configured;
+        let (mut first, confidence) = first?;
+        first.confidence = Some(confidence);
+        if confidence >= threshold {
+            return Ok(first);
+        }
+        let (mut second, _) = self.attempt(question)?;
+        second.transcript = first.transcript + &second.transcript;
+        second.generated += first.generated;
+        second.confidence = Some(confidence);
+        second.consulted = true;
+        Ok(second)
+    }
+
+    /// 在会话末尾（刚结束的回答之后）追问最终选项，返回 A–D 中最高的概率。
+    fn choice_confidence(&self, session: &mut Session) -> Result<f32, String> {
+        let tokens = self.encode(&format!("<|im_end|>\n{CONFIDENCE_PROBE}"))?;
+        session
+            .prefill(&tokens)
+            .map_err(|error| error.to_string())?;
+        let logits = session.last_logits().map_err(|error| error.to_string())?;
+        let mut scores = Vec::with_capacity(CHOICES.len());
+        for letter in CHOICES {
+            let id = self
+                .tokenizer
+                .token_to_id(letter)
+                .ok_or_else(|| format!("分词器里没有选项字母 {letter}"))?;
+            scores.push(logits[id as usize]);
+        }
+        Ok(top_choice_probability(&scores))
+    }
+
+    /// 按当前设置完整作答一次，返回结果和作答后的会话（会话停在最后一次回答末尾）。
+    fn attempt(&mut self, question: &str) -> Result<(Answer, Session), String> {
         let mut session = Session::new(self.model.clone(), 0).map_err(|error| error.to_string())?;
+        if let Some(precision) = self.config.kv {
+            session.set_kv_precision(precision);
+        }
+        session
+            .set_input_sparsity(self.config.sparsity)
+            .map_err(|error| error.to_string())?;
         session
             .set_sampler(self.config.sampling, self.config.seed)
             .map_err(|error| error.to_string())?;
         let mut answer = Answer::default();
         let mut sources = Vec::new();
-        let mut prompt = format!(
-            "{}<|im_start|>user\n{question}<|im_end|>\n{}",
-            system_prompt(&self.config),
-            assistant_open(self.config.thinking)
-        );
+        let mut prompt = if self.config.reference {
+            let (prompt, query) = reference_prompt(self.base, &self.config, question, &mut sources);
+            answer.searches.push(query);
+            prompt
+        } else if self.config.prefetch && self.config.tools {
+            let (prompt, query) = prefetch_prompt(self.base, &self.config, question, &mut sources);
+            answer.searches.push(query);
+            prompt
+        } else {
+            opening_prompt(&self.config, question)
+        };
         answer.transcript.push_str(&prompt);
-        let mut rounds = 0;
+        prompt.push_str(&self.config.reply_prefix);
+        let mut prefix = self.config.reply_prefix.clone();
+        let (mut rounds, mut last_turn) = (0, false);
         loop {
-            let text = self.turn(&mut session, &prompt, self.config.turn_tokens, &mut answer)?;
+            let generated =
+                self.turn(&mut session, &prompt, self.config.turn_tokens, &mut answer)?;
+            let text = std::mem::take(&mut prefix) + &generated;
             answer.transcript.push_str(&text);
             answer.transcript.push_str("<|im_end|>\n");
             let calls = if self.config.tools {
@@ -411,17 +642,25 @@ impl<'a> Agent<'a> {
             } else {
                 Vec::new()
             };
-            if calls.is_empty() || rounds >= self.config.tool_rounds {
+            if calls.is_empty() || last_turn {
                 answer.reply = visible(&text).to_string();
                 break;
             }
-            rounds += 1;
-            let responses: Vec<String> = calls
-                .iter()
-                .map(|call| match call {
-                    Ok(call) => self.run_tool(call, question, &mut sources, &mut answer),
-                    Err(error) => error.clone(),
-                })
+            let outputs: Vec<String> = if rounds >= self.config.tool_rounds {
+                last_turn = true;
+                vec![ROUNDS_USED_UP.to_string(); calls.len()]
+            } else {
+                rounds += 1;
+                calls
+                    .iter()
+                    .map(|call| match call {
+                        Ok(call) => self.run_tool(call, question, &mut sources, &mut answer),
+                        Err(error) => error.clone(),
+                    })
+                    .collect()
+            };
+            let responses: Vec<String> = outputs
+                .into_iter()
                 .map(|output| format!("<tool_response>\n{output}\n</tool_response>"))
                 .collect();
             let body = format!(
@@ -444,17 +683,12 @@ impl<'a> Agent<'a> {
             )?;
             answer.transcript.push_str(&body);
             answer.transcript.push_str(&text);
-            let note = visible(&text);
-            if parse_tool_calls(note).is_empty() {
-                if let Some(id) =
-                    self.base
-                        .add_note(note, sources.clone(), Some(question.to_string()))?
-                {
-                    answer.notes.push(id);
-                }
+            let note = visible(&text).to_string();
+            if parse_tool_calls(&note).is_empty() {
+                self.record_note(&note, &sources, question, &mut answer);
             }
         }
-        Ok(answer)
+        Ok((answer, session))
     }
 }
 
@@ -471,8 +705,25 @@ mod tests {
         assert_eq!(call.name, "search_knowledge");
         assert_eq!(call.arguments["query"], "光合作用");
         assert!(parse_tool_calls("<tool_call>{bad json}</tool_call>")[0].is_err());
+        let latex = r#"<tool_call>{"name": "search_knowledge", "arguments": {"query": "$(\quad)$ \frac{1}{2}\n一 \underline{x}"}}</tool_call>"#;
+        let call = parse_tool_calls(latex).remove(0).unwrap();
+        assert_eq!(
+            call.arguments["query"],
+            "$(\\quad)$ \u{c}rac{1}{2}\n一 \\underline{x}"
+        );
         assert!(parse_tool_calls("<tool_call>{\"arguments\": {}}</tool_call>")[0].is_err());
         assert!(parse_tool_calls("没有工具调用").is_empty());
+    }
+
+    #[test]
+    fn top_choice_probability_normalizes_among_the_choices_only() {
+        assert!((top_choice_probability(&[0.0; 4]) - 0.25).abs() < 1e-6);
+        assert!(
+            (top_choice_probability(&[2.0_f32.ln(), 0.0, 0.0, f32::NEG_INFINITY]) - 0.5).abs()
+                < 1e-6
+        );
+        assert!(top_choice_probability(&[60.0, 0.0, -5.0, 1.0]) > 0.999);
+        assert!((top_choice_probability(&[1000.0, 1000.0, -1000.0, -1000.0]) - 0.5).abs() < 1e-6);
     }
 
     #[test]
@@ -500,6 +751,54 @@ mod tests {
             "<|im_start|>assistant\n<think>\n\n</think>\n\n"
         );
         assert_eq!(assistant_open(true), "<|im_start|>assistant\n");
+    }
+
+    #[test]
+    fn prefetched_search_looks_like_a_model_tool_call() {
+        let turn = prefetch_turn("钠离子", "[课本] 钠原子失去电子形成钠离子", false);
+        assert!(turn.starts_with("<|im_start|>assistant\n<think>\n\n</think>\n\n<tool_call>\n"));
+        let calls = parse_tool_calls(&turn);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].as_ref().unwrap().arguments["query"], "钠离子");
+        assert!(
+            turn.contains("<tool_response>\n[课本] 钠原子失去电子形成钠离子\n</tool_response>")
+        );
+        assert!(turn.ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n"));
+        assert!(
+            prefetch_turn("x", "y", true)
+                .ends_with("</tool_response><|im_end|>\n<|im_start|>assistant\n")
+        );
+    }
+
+    #[test]
+    fn reference_puts_passages_before_the_question_without_tools() {
+        let directory =
+            std::env::temp_dir().join(format!("nncoss-reference-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        let mut base = KnowledgeBase::open(&directory).unwrap();
+        let passages = directory.with_extension("jsonl");
+        std::fs::write(
+            &passages,
+            "{\"id\": \"p1\", \"source\": \"化学\", \"text\": \"钠原子失去一个电子形成钠离子\"}\n",
+        )
+        .unwrap();
+        base.import(&passages).unwrap();
+        let config = AgentConfig {
+            tools: false,
+            reference: true,
+            ..AgentConfig::default()
+        };
+        let mut sources = Vec::new();
+        let (prompt, query) = reference_prompt(&base, &config, "钠离子带几个电荷？", &mut sources);
+        assert_eq!(query, "钠离子带几个电荷？");
+        assert_eq!(sources, ["p1"]);
+        assert!(prompt.starts_with("<|im_start|>user\n"));
+        let passage = prompt.find("[化学] 钠原子失去一个电子形成钠离子").unwrap();
+        assert!(passage < prompt.find("题目：\n钠离子带几个电荷？<|im_end|>").unwrap());
+        assert!(!prompt.contains("<tool_call>") && !prompt.contains("<tool_response>"));
+        assert!(prompt.ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n"));
+        std::fs::remove_dir_all(&directory).unwrap();
+        std::fs::remove_file(&passages).unwrap();
     }
 
     #[test]

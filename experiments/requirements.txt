@@ -1,5 +1,0 @@
--r ../tools/golden_requirements.txt
-tokenizers==0.22.2
-huggingface_hub==0.36.2
-pymupdf==1.24.10
-pyarrow==17.0.0

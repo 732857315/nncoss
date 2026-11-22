@@ -10,13 +10,16 @@ mod pool;
 mod q4;
 mod sampler;
 mod session;
+mod sparse;
 #[cfg(test)]
 mod test_utils;
 
+pub use cache::KvPrecision;
 pub use error::Error;
-pub use model::{Config, Model, ModelLoader, RopeMode};
+pub use model::{Config, Model, ModelLoader, RopeMode, TensorLayout, tensor_layout};
 pub use sampler::SamplingConfig;
 pub use session::Session;
+pub use sparse::InputSparsity;
 
 pub type Result<T> = std::result::Result<T, Error>;
 

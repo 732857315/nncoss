@@ -277,9 +277,62 @@ pub fn reference_prompt(
 
 /// 只在几个选项字母之间归一化时，概率最高的选项的概率。
 pub fn top_choice_probability(logits: &[f32]) -> f32 {
+    choice_probabilities(logits).into_iter().fold(0.0, f32::max)
+}
+
+/// 只在几个选项字母之间归一化的概率。
+pub fn choice_probabilities(logits: &[f32]) -> Vec<f32> {
     let peak = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let total: f32 = logits.iter().map(|logit| (logit - peak).exp()).sum();
-    1.0 / total
+    let weights: Vec<f32> = logits.iter().map(|logit| (logit - peak).exp()).collect();
+    let total: f32 = weights.iter().sum();
+    weights.into_iter().map(|weight| weight / total).collect()
+}
+
+/// 在会话末尾（刚结束的回答之后）追问最终选项，返回 A–D 四个字母的 logits。
+fn probe_choice_logits(tokenizer: &Tokenizer, session: &mut Session) -> Result<Vec<f32>, String> {
+    let tokens = tokenizer
+        .encode(format!("<|im_end|>\n{CONFIDENCE_PROBE}"), false)
+        .map_err(|error| error.to_string())?;
+    session
+        .prefill(tokens.get_ids())
+        .map_err(|error| error.to_string())?;
+    let logits = session.last_logits().map_err(|error| error.to_string())?;
+    CHOICES
+        .iter()
+        .map(|letter| {
+            tokenizer
+                .token_to_id(letter)
+                .map(|id| logits[id as usize])
+                .ok_or_else(|| format!("分词器里没有选项字母 {letter}"))
+        })
+        .collect()
+}
+
+/// 对一段已有的作答记录（`Answer::transcript`，须以作答回复结束，即不含归纳笔记的一轮）
+/// 追问最终选项，返回 A–D 的概率。追问与 `consult_below` 相同，用于离线比较作答方式。
+pub fn probe_transcript(
+    model: Arc<Model>,
+    tokenizer: &Tokenizer,
+    kv: Option<KvPrecision>,
+    transcript: &str,
+) -> Result<Vec<f32>, String> {
+    let context = transcript
+        .strip_suffix("<|im_end|>\n")
+        .unwrap_or(transcript);
+    let tokens = tokenizer
+        .encode(context, false)
+        .map_err(|error| error.to_string())?;
+    let mut session = Session::new(model, 0).map_err(|error| error.to_string())?;
+    if let Some(precision) = kv {
+        session.set_kv_precision(precision);
+    }
+    session
+        .prefill(tokens.get_ids())
+        .map_err(|error| error.to_string())?;
+    Ok(choice_probabilities(&probe_choice_logits(
+        tokenizer,
+        &mut session,
+    )?))
 }
 
 fn truncate(text: &str, limit: usize) -> String {
@@ -586,20 +639,10 @@ impl<'a> Agent<'a> {
 
     /// 在会话末尾（刚结束的回答之后）追问最终选项，返回 A–D 中最高的概率。
     fn choice_confidence(&self, session: &mut Session) -> Result<f32, String> {
-        let tokens = self.encode(&format!("<|im_end|>\n{CONFIDENCE_PROBE}"))?;
-        session
-            .prefill(&tokens)
-            .map_err(|error| error.to_string())?;
-        let logits = session.last_logits().map_err(|error| error.to_string())?;
-        let mut scores = Vec::with_capacity(CHOICES.len());
-        for letter in CHOICES {
-            let id = self
-                .tokenizer
-                .token_to_id(letter)
-                .ok_or_else(|| format!("分词器里没有选项字母 {letter}"))?;
-            scores.push(logits[id as usize]);
-        }
-        Ok(top_choice_probability(&scores))
+        Ok(top_choice_probability(&probe_choice_logits(
+            self.tokenizer,
+            session,
+        )?))
     }
 
     /// 按当前设置完整作答一次，返回结果和作答后的会话（会话停在最后一次回答末尾）。
@@ -724,6 +767,14 @@ mod tests {
         );
         assert!(top_choice_probability(&[60.0, 0.0, -5.0, 1.0]) > 0.999);
         assert!((top_choice_probability(&[1000.0, 1000.0, -1000.0, -1000.0]) - 0.5).abs() < 1e-6);
+        let probabilities = choice_probabilities(&[2.0_f32.ln(), 0.0, 0.0, f32::NEG_INFINITY]);
+        let expected = [0.5, 0.25, 0.25, 0.0];
+        assert!(
+            probabilities
+                .iter()
+                .zip(expected)
+                .all(|(p, e)| (p - e).abs() < 1e-6)
+        );
     }
 
     #[test]

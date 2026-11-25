@@ -642,9 +642,10 @@ target/release/nncoss-know ask --store tmp/store-try --model model/Qwen3-0.6B/qw
   --tokenizer model/Qwen3-0.6B/tokenizer.json --question "光合作用的产物是什么？"
 target/release/nncoss-know batch --store <知识库> --model <模型> --tokenizer <分词器> --input <题目.jsonl> --output <结果.jsonl>
 target/release/nncoss-know prompt --input <题目.jsonl> --output <提示.jsonl> [--prefetch|--reference --store <知识库>]
+target/release/nncoss-know probe --model <模型> --tokenizer <分词器> --input <batch 结果.jsonl> --output <把握.jsonl>
 ```
 
-`ask` 与 `batch` 会把模型写的笔记存进 `--store` 指向的目录，试用时应先复制一份知识库。`prompt` 只输出模型开口前看到的完整提示，供测量脚本使用。
+`ask` 与 `batch` 会把模型写的笔记存进 `--store` 指向的目录，试用时应先复制一份知识库。`prompt` 只输出模型开口前看到的完整提示，供测量脚本使用。`probe` 对 `batch` 已有的作答记录逐条追问最终选项，输出 A–D 的概率，追问与 `--consult-below` 相同，用来离线比较“把握不足才查书”等作答方式而不必重新作答；记录须以作答回复结束（`--no-learn`）。
 
 ### 权重改写：nncoss-edit
 

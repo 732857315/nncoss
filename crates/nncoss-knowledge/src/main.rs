@@ -5,7 +5,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use nncoss_knowledge::{
-    Agent, AgentConfig, KnowledgeBase, opening_prompt, prefetch_prompt, reference_prompt,
+    Agent, AgentConfig, KnowledgeBase, opening_prompt, prefetch_prompt, probe_transcript,
+    reference_prompt,
 };
 use nncoss_llm::{KvPrecision, Model, ModelLoader};
 use serde::{Deserialize, Serialize};
@@ -17,6 +18,8 @@ const USAGE: &str = "用法：
   nncoss-know ask    --store <目录> --model <模型> --tokenizer <分词器> --question <问题> [选项]
   nncoss-know batch  --store <目录> --model <模型> --tokenizer <分词器> --input <题目.jsonl> --output <结果.jsonl> [选项]
   nncoss-know prompt (--question <问题> | --input <题目.jsonl> --output <提示.jsonl>) [--prefetch|--reference --store <目录>] [选项]
+  nncoss-know probe  --model <模型> --tokenizer <分词器> --input <batch 结果.jsonl> --output <把握.jsonl> [--kv …]
+                     对每条作答记录追问最终选项，输出 A–D 的概率（单选题；记录须以作答回复结束，即 --no-learn）
 
 选项：
   --think                启用思考模式
@@ -253,9 +256,62 @@ fn prompts(options: &Options) -> Result<(), String> {
     writer.flush().map_err(|error| error.to_string())
 }
 
+#[derive(Deserialize)]
+struct Answered {
+    id: String,
+    transcript: String,
+}
+
+#[derive(Serialize)]
+struct ProbeRecord<'a> {
+    id: &'a str,
+    probabilities: Vec<f32>,
+}
+
+fn probes(options: &Options) -> Result<(), String> {
+    let (model, tokenizer) = engine(options)?;
+    let input = required(&options.input, "--input")?;
+    let output = required(&options.output, "--output")?;
+    let reader = BufReader::new(
+        File::open(&input).map_err(|error| format!("无法打开 {}: {error}", input.display()))?,
+    );
+    let mut writer = BufWriter::new(
+        File::create(&output).map_err(|error| format!("无法写入 {}: {error}", output.display()))?,
+    );
+    for (number, line) in reader.lines().enumerate() {
+        let line = line.map_err(|error| error.to_string())?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let answered: Answered = serde_json::from_str(&line)
+            .map_err(|error| format!("第 {} 行格式错误: {error}", number + 1))?;
+        let probabilities = probe_transcript(
+            model.clone(),
+            &tokenizer,
+            options.config.kv,
+            &answered.transcript,
+        )?;
+        let record = ProbeRecord {
+            id: &answered.id,
+            probabilities,
+        };
+        writeln!(
+            writer,
+            "{}",
+            serde_json::to_string(&record).map_err(|error| error.to_string())?
+        )
+        .map_err(|error| error.to_string())?;
+        writer.flush().map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
 fn run(options: Options) -> Result<(), String> {
     if options.command == "prompt" {
         return prompts(&options);
+    }
+    if options.command == "probe" {
+        return probes(&options);
     }
     let store = required(&options.store, "--store")?;
     let mut base = KnowledgeBase::open(&store)?;

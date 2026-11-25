@@ -37,6 +37,9 @@ pub struct AgentConfig {
     /// 作答前用题目检索一次，把查到的段落作为参考资料写在问题前面（不经过工具调用）。
     /// 与 `tools: false` 同用时模型只读这些资料，是“大脑 + 书籍”的只读对照。
     pub reference: bool,
+    /// `reference` 条件下用来检索的文字；默认用题目本身。对照实验可换成别的题目，
+    /// 得到格式与长度相同、但不对题的资料。
+    pub reference_query: Option<String>,
     pub turn_tokens: usize,
     pub tool_rounds: usize,
     pub search_limit: usize,
@@ -63,6 +66,7 @@ impl Default for AgentConfig {
             learn: true,
             prefetch: false,
             reference: false,
+            reference_query: None,
             turn_tokens: 1024,
             tool_rounds: 6,
             search_limit: 4,
@@ -265,7 +269,8 @@ pub fn reference_prompt(
     question: &str,
     sources: &mut Vec<String>,
 ) -> (String, String) {
-    let query: String = question.chars().take(PREFETCH_CHARS).collect();
+    let source = config.reference_query.as_deref().unwrap_or(question);
+    let query: String = source.chars().take(PREFETCH_CHARS).collect();
     let output = search_output(base, &query, config.search_limit, sources);
     let prompt = format!(
         "{}<|im_start|>user\n{REFERENCE_INTRO}\n\n{output}\n\n题目：\n{question}<|im_end|>\n{}",
@@ -848,6 +853,15 @@ mod tests {
         assert!(passage < prompt.find("题目：\n钠离子带几个电荷？<|im_end|>").unwrap());
         assert!(!prompt.contains("<tool_call>") && !prompt.contains("<tool_response>"));
         assert!(prompt.ends_with("<|im_start|>assistant\n<think>\n\n</think>\n\n"));
+        let other = AgentConfig {
+            reference_query: Some("光合作用的产物".to_string()),
+            ..config
+        };
+        let (prompt, query) =
+            reference_prompt(&base, &other, "钠离子带几个电荷？", &mut Vec::new());
+        assert_eq!(query, "光合作用的产物");
+        assert!(prompt.contains("知识库中没有找到相关内容"));
+        assert!(prompt.contains("题目：\n钠离子带几个电荷？<|im_end|>"));
         std::fs::remove_dir_all(&directory).unwrap();
         std::fs::remove_file(&passages).unwrap();
     }

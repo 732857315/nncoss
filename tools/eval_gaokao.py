@@ -98,6 +98,18 @@ def judge(questions, answers):
     return {key: {"correct": value[0], "total": value[1], "accuracy": round(value[0] / value[1], 3)} for key, value in table.items()}, details
 
 
+def other_questions(questions):
+    """为每道题指定另一科目的一道题作检索词：按题目顺序错开一半，同科目时再往后找。"""
+    n = len(questions)
+    paired = {}
+    for k, q in enumerate(questions):
+        j = (k + n // 2) % n
+        while questions[j]["id"].split("-")[0] == q["id"].split("-")[0]:
+            j = (j + 1) % n
+        paired[q["id"]] = questions[j]["question"]
+    return paired
+
+
 def main():
     parser = argparse.ArgumentParser(description="用 nncoss-know 在高考客观题上测评；作答由 Rust 完成，本脚本只负责抽题与判分")
     parser.add_argument("--model", type=Path, required=True)
@@ -109,6 +121,8 @@ def main():
     parser.add_argument("--prefetch", action="store_true", help="作答前先用题目自动检索一次知识库")
     parser.add_argument("--reference", action="store_true",
                         help="作答前先用题目检索一次，把查到的段落作为参考资料写在问题前面；配合 --no-tools --no-learn 时只读资料")
+    parser.add_argument("--reference-query", choices=["question", "other"], default="question",
+                        help="--reference 的检索词：question 用题目本身；other 用另一科目的一道题，得到格式相同但不对题的资料（对照）")
     parser.add_argument("--tool-rounds", type=int, help="最多调用几轮工具；配合 --prefetch 用 0 时只读预取的资料")
     parser.add_argument("--no-learn", action="store_true", help="答题后不归纳笔记，各题互不影响")
     parser.add_argument("--per-subject", type=int, help="每科题数，默认 test、tune 为 12，wide 为 48")
@@ -138,11 +152,17 @@ def main():
             if line.strip():
                 done[json.loads(line)["id"]] = line
     pending = [q for q in questions if q["id"] not in done]
-    (work / "questions.jsonl").write_text("".join(json.dumps({"id": q["id"], "question": q["question"]}, ensure_ascii=False) + "\n" for q in questions), encoding="utf-8")
+    others = other_questions(questions) if args.reference_query == "other" else {}
+    def line(q):
+        row = {"id": q["id"], "question": q["question"]}
+        if q["id"] in others:
+            row["reference_query"] = others[q["id"]]
+        return json.dumps(row, ensure_ascii=False) + "\n"
+    (work / "questions.jsonl").write_text("".join(line(q) for q in questions), encoding="utf-8")
     batch_input, batch_output = work / "questions.jsonl", answers_path
     if done:
         batch_input, batch_output = work / "pending.jsonl", work / "answers-pending.jsonl"
-        batch_input.write_text("".join(json.dumps({"id": q["id"], "question": q["question"]}, ensure_ascii=False) + "\n" for q in pending), encoding="utf-8")
+        batch_input.write_text("".join(line(q) for q in pending), encoding="utf-8")
         print(f"接着已有的 {len(done)} 个回答，还剩 {len(pending)} 题", flush=True)
     store = work / "store"
     if store.exists():
@@ -190,7 +210,7 @@ def main():
             path.unlink(missing_ok=True)
     answers = [json.loads(line) for line in answers_path.read_text(encoding="utf-8").splitlines() if line.strip()]
     table, details = judge(questions, answers)
-    report = {"label": args.label, "model": str(args.model), "think": args.think, "tools": not args.no_tools, "prefetch": args.prefetch, "reference": args.reference, "kv": args.kv,
+    report = {"label": args.label, "model": str(args.model), "think": args.think, "tools": not args.no_tools, "prefetch": args.prefetch, "reference": args.reference, "reference_query": args.reference_query, "kv": args.kv,
               "tool_rounds": args.tool_rounds, "learn": not args.no_learn,
               "sparsity": args.sparsity, "reply_prefix": args.reply_prefix, "consult_below": args.consult_below,
               "consulted": sum(d["consulted"] for d in details),

@@ -28,7 +28,8 @@ const USAGE: &str = "用法：
   --no-learn             答题后不自动归纳笔记
   --prefetch             作答前先用题目自动检索一次知识库，写成模型的一次工具调用（对照实验用）
   --reference            作答前先用题目检索一次，把查到的段落作为参考资料写在问题前面；
-                         配合 --no-tools --no-learn 时只读资料、各题互不影响（对照实验用）
+                         配合 --no-tools --no-learn 时只读资料、各题互不影响（对照实验用）；
+                         batch 的题目可带 reference_query 字段，代替题目用来检索
   --turn-tokens N        每轮最多生成的 token 数，默认 1024
   --tool-rounds N        最多调用几轮工具，默认 6；配合 --prefetch 用 0 时只读预取的资料
   --temperature T        采样温度，默认思考模式 0.6、非思考模式 0
@@ -59,6 +60,9 @@ struct Options {
 struct Question {
     id: String,
     question: String,
+    /// `--reference` 时代替题目用来检索的文字（对照实验用）。
+    #[serde(default)]
+    reference_query: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -213,18 +217,22 @@ fn prompts(options: &Options) -> Result<(), String> {
     } else {
         None
     };
-    let render = |question: &str| {
+    let render = |question: &str, reference_query: Option<&String>| {
+        let mut config = options.config.clone();
+        if reference_query.is_some() {
+            config.reference_query = reference_query.cloned();
+        }
         let prompt = match &base {
-            Some(base) if options.config.reference => {
-                reference_prompt(base, &options.config, question, &mut Vec::new()).0
+            Some(base) if config.reference => {
+                reference_prompt(base, &config, question, &mut Vec::new()).0
             }
-            Some(base) => prefetch_prompt(base, &options.config, question, &mut Vec::new()).0,
-            None => opening_prompt(&options.config, question),
+            Some(base) => prefetch_prompt(base, &config, question, &mut Vec::new()).0,
+            None => opening_prompt(&config, question),
         };
-        prompt + &options.config.reply_prefix
+        prompt + &config.reply_prefix
     };
     if let Some(question) = &options.query {
-        print!("{}", render(question));
+        print!("{}", render(question, None));
         return Ok(());
     }
     let input = required(&options.input, "--input")?;
@@ -244,7 +252,7 @@ fn prompts(options: &Options) -> Result<(), String> {
             .map_err(|error| format!("第 {} 行格式错误: {error}", number + 1))?;
         let record = PromptRecord {
             id: &question.id,
-            prompt: render(&question.question),
+            prompt: render(&question.question, question.reference_query.as_ref()),
         };
         writeln!(
             writer,
@@ -376,9 +384,12 @@ fn run(options: Options) -> Result<(), String> {
                 let question: Question = serde_json::from_str(&line)
                     .map_err(|error| format!("第 {} 行格式错误: {error}", number + 1))?;
                 let started = Instant::now();
-                let answer =
-                    Agent::new(model.clone(), &tokenizer, &mut base, options.config.clone())
-                        .ask(&question.question)?;
+                let mut config = options.config.clone();
+                if question.reference_query.is_some() {
+                    config.reference_query = question.reference_query.clone();
+                }
+                let answer = Agent::new(model.clone(), &tokenizer, &mut base, config)
+                    .ask(&question.question)?;
                 let record = Record {
                     id: &question.id,
                     reply: &answer.reply,

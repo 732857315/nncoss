@@ -237,20 +237,25 @@ impl Q4Matrix {
     ) {
         use std::arch::x86_64::*;
 
+        // 外层按 token 分组（每组最多 4 个），内层逐行：每组 token 的激活约 4 KB，留在 L1 里，
+        // 每组 token 都要重读一遍的是这一段行的权重（每行约 0.5 KB），从 L2 读。
+        // 反过来（逐行、行内遍历全部 token）时，prefill 一块 32 个 token 的激活约 40 KB，
+        // 超出 L1，每一行都要从 L2 重读全部激活。每个 (行, token) 的求和顺序不变，结果逐位相同。
         let row_bytes = self.groups * NIBBLE_BYTES;
-        for (offset, row) in rows.enumerate() {
-            let nibbles = self.row_nibbles(row).as_ptr();
-            for line in 0..row_bytes.div_ceil(64) {
-                _mm_prefetch::<_MM_HINT_T0>(
-                    nibbles.wrapping_add(PREFETCH_BYTES + line * 64).cast(),
-                );
-            }
-            let mut first = 0;
-            while first < activations.len() {
-                let tile = &activations[first..];
+        let mut first = 0;
+        while first < activations.len() {
+            let tile = &activations[first..];
+            let width = tile.len().min(4);
+            for (offset, row) in rows.clone().enumerate() {
+                let nibbles = self.row_nibbles(row).as_ptr();
+                for line in 0..row_bytes.div_ceil(64) {
+                    _mm_prefetch::<_MM_HINT_T0>(
+                        nibbles.wrapping_add(PREFETCH_BYTES + line * 64).cast(),
+                    );
+                }
                 let target = unsafe { output.add(first * stride + offset) };
-                first += unsafe {
-                    match tile.len() {
+                unsafe {
+                    match width {
                         1 => self.row_tile_avx2::<1>(tile, row, bias, target, stride),
                         2 => self.row_tile_avx2::<2>(tile, row, bias, target, stride),
                         3 => self.row_tile_avx2::<3>(tile, row, bias, target, stride),
@@ -258,6 +263,7 @@ impl Q4Matrix {
                     }
                 };
             }
+            first += width;
         }
     }
 

@@ -31,6 +31,8 @@ const USAGE: &str = "用法：
                          配合 --no-tools --no-learn 时只读资料、各题互不影响（对照实验用）；
                          batch 的题目可带 reference_query 字段，代替题目用来检索
   --turn-tokens N        每轮最多生成的 token 数，默认 1024
+  --think-answer-tokens N  思考模式下一轮写满仍未结束思考时，补上结束思考的话再作答的 token 上限，
+                         默认 512；0 表示不补
   --tool-rounds N        最多调用几轮工具，默认 6；配合 --prefetch 用 0 时只读预取的资料
   --temperature T        采样温度，默认思考模式 0.6、非思考模式 0
   --top-k K / --top-p P  采样参数
@@ -109,6 +111,9 @@ fn parse(mut args: impl Iterator<Item = String>) -> Result<Options, String> {
             "--browse" => options.config.browse = true,
             "--no-learn" => options.config.learn = false,
             "--prefetch" => options.config.prefetch = true,
+            "--think-answer-tokens" => {
+                options.config.think_answer_tokens = number(value(&mut args, &arg)?, &arg)?
+            }
             "--reference" => options.config.reference = true,
             "--tool-rounds" => options.config.tool_rounds = number(value(&mut args, &arg)?, &arg)?,
             "--turn-tokens" => options.config.turn_tokens = number(value(&mut args, &arg)?, &arg)?,

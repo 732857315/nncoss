@@ -19,6 +19,8 @@ const CONFIDENCE_PROBE: &str = "<|im_start|>user\n你的最终答案是哪个选
 const CHOICES: [&str; 4] = ["A", "B", "C", "D"];
 const REFERENCE_INTRO: &str =
     "下面是按题目从课本等资料中检索到的几段内容，不一定与题目相关，仅供参考。";
+/// 思考写满一轮的 token 仍未结束时，由框架替模型收尾的话（Qwen 推荐的思考预算做法）。
+const THINK_CLOSE: &str = "\n\n思考时间有限，我现在根据已有的思考直接给出答案。\n</think>\n\n";
 const ROUNDS_USED_UP: &str = "工具调用次数已用完，请根据已有信息直接作答。";
 const INSTRUCTION: &str = "你的知识保存在外部知识库里，知识库中有幼儿园到高中的课本、计算机与算法资料，以及你以前记下的笔记。回答需要事实、概念、公式、方法或课文内容的问题时，先用 search_knowledge 查找，再依据查到的内容作答；学到以后用得上的知识时，用 write_note 记下来。";
 const BROWSE_INSTRUCTION: &str = "需要网页上的内容时，用 browse 打开网址阅读。";
@@ -41,6 +43,9 @@ pub struct AgentConfig {
     /// 得到格式与长度相同、但不对题的资料。
     pub reference_query: Option<String>,
     pub turn_tokens: usize,
+    /// 思考模式下一轮写满 `turn_tokens` 仍未结束思考时，框架补上结束思考的话，
+    /// 再让模型用最多这么多 token 作答；0 表示不补，这一轮就没有可见的回答。
+    pub think_answer_tokens: usize,
     pub tool_rounds: usize,
     pub search_limit: usize,
     pub sampling: SamplingConfig,
@@ -68,6 +73,7 @@ impl Default for AgentConfig {
             reference: false,
             reference_query: None,
             turn_tokens: 1024,
+            think_answer_tokens: 512,
             tool_rounds: 6,
             search_limit: 4,
             sampling: SamplingConfig::default(),
@@ -123,6 +129,11 @@ pub fn assistant_open(thinking: bool) -> &'static str {
     } else {
         "<|im_start|>assistant\n<think>\n\n</think>\n\n"
     }
+}
+
+/// 思考模式的一轮回复里还没有出现结束思考的标记。
+pub fn thinking_unfinished(text: &str) -> bool {
+    !text.contains("</think>")
 }
 
 pub fn visible(text: &str) -> &str {
@@ -682,7 +693,20 @@ impl<'a> Agent<'a> {
         loop {
             let generated =
                 self.turn(&mut session, &prompt, self.config.turn_tokens, &mut answer)?;
-            let text = std::mem::take(&mut prefix) + &generated;
+            let mut text = std::mem::take(&mut prefix) + &generated;
+            if self.config.thinking
+                && self.config.think_answer_tokens > 0
+                && thinking_unfinished(&text)
+            {
+                let tail = self.turn(
+                    &mut session,
+                    THINK_CLOSE,
+                    self.config.think_answer_tokens,
+                    &mut answer,
+                )?;
+                text.push_str(THINK_CLOSE);
+                text.push_str(&tail);
+            }
             answer.transcript.push_str(&text);
             answer.transcript.push_str("<|im_end|>\n");
             let calls = if self.config.tools {
@@ -784,6 +808,11 @@ mod tests {
 
     #[test]
     fn visible_hides_unfinished_thinking() {
+        assert!(thinking_unfinished("<think>\n还在想"));
+        assert!(!thinking_unfinished("<think>\nx\n</think>\n\n答案是 3"));
+        let closed = format!("<think>\n还在想{THINK_CLOSE}答案是 3");
+        assert!(!thinking_unfinished(&closed));
+        assert_eq!(visible(&closed), "答案是 3");
         assert_eq!(visible("<think>\n还在想"), "");
         assert_eq!(visible("<think>\nx\n</think>\n\n答案是 3"), "答案是 3");
         assert_eq!(visible("直接回答"), "直接回答");

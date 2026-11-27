@@ -10,6 +10,8 @@
 |---|---|---|
 | `Qwen3-0.6B/` | [Qwen/Qwen3-0.6B](https://huggingface.co/Qwen/Qwen3-0.6B) | Apache License 2.0 |
 | `Qwen3-1.7B/` | [Qwen/Qwen3-1.7B](https://huggingface.co/Qwen/Qwen3-1.7B) | Apache License 2.0 |
+| `MNN-Pocket-0.3B/`（配置、分词器与 BF16 权重） | [taobao-mnn/MNN-Pocket-0.3B](https://huggingface.co/taobao-mnn/MNN-Pocket-0.3B) | Apache License 2.0 |
+| `MNN-Pocket-0.3B-GGUF/`（官方 QAT 后的 Q4_1） | [taobao-mnn/MNN-Pocket-0.3B-GGUF](https://huggingface.co/taobao-mnn/MNN-Pocket-0.3B-GGUF) | Apache License 2.0 |
 
 ```bash
 python3 -c "from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen3-0.6B', local_dir='model/Qwen3-0.6B')"
@@ -60,6 +62,29 @@ python3 tools/export_llm.py --model model/Qwen3-1.7B --output model/Qwen3-1.7B/q
 | `Qwen3-1.7B/qwen3-1.7b-q4-ls.nncossllm` | 917,386,816 | `7307b7eb14782bd1e422a84cb77ead6dc502063d263e0254ca84bcc92caa0ab8` |
 
 GPTQ 校准导出在 16 GiB 内存的测试机上没有完成：第一次进程无报错退出，第二次运行 3 小时 40 分钟后占用约 3.6 GB 交换空间，已手动停止。因此 1.7B 目前没有校准版。在 0.6B 上，不经校准的 Q4 与 f32 的平均 KL 约为校准加蒸馏版本的两倍（0.215 对 0.111）；1.7B 的对应数值没有测过。
+
+### MNN-Pocket-0.3B（与 ncnn-MoE-Runtime 对比用）
+
+MNN-Pocket-0.3B 是 Qwen3 结构的稠密模型（28 层、hidden 896、14/2 个注意力头、head_dim 64、FFN 2560、词表 65,536、嵌入与输出层共用）。为了与 [ncnn-MoE-Runtime](https://github.com/crafcat7/ncnn-MoE-Runtime) 用同一份权重比较，本项目的模型不从 BF16 权重导出，而是把官方 Q4_1 GGUF 精确还原成 f32（`tools/gguf_to_safetensors.py`，需要 `pip install gguf`），再导出成 f32 与 Q4 两种格式。f32 版与 ncnn-MoE-Runtime 运行 Q4_1 时的权重完全相同；Q4 版在此基础上又按本项目的对称 4-bit 格式量化一次。下载时 Hugging Face 只能经本机代理访问，`huggingface_hub` 的下载停在 0 字节，改用带断点续传的 curl：
+
+```bash
+curl -L -C - -o model/MNN-Pocket-0.3B-GGUF/MNN-Pocket-0.3B-Instruct-Q4_1.gguf \
+  https://huggingface.co/taobao-mnn/MNN-Pocket-0.3B-GGUF/resolve/main/MNN-Pocket-0.3B-Instruct-Q4_1.gguf
+# config.json、分词器文件与 model.safetensors 同样从 taobao-mnn/MNN-Pocket-0.3B 下载到 model/MNN-Pocket-0.3B/
+python3 tools/gguf_to_safetensors.py --gguf model/MNN-Pocket-0.3B-GGUF/MNN-Pocket-0.3B-Instruct-Q4_1.gguf \
+  --config model/MNN-Pocket-0.3B --output model/MNN-Pocket-0.3B-qat
+python3 tools/export_llm.py --model model/MNN-Pocket-0.3B-qat --output model/MNN-Pocket-0.3B-qat/mnn-pocket-0.3b-qat-q4.nncossllm --outtype q4
+python3 tools/export_llm.py --model model/MNN-Pocket-0.3B-qat --output model/MNN-Pocket-0.3B-qat/mnn-pocket-0.3b-qat-f32.nncossllm --outtype f32
+```
+
+| 文件 | 字节数 | SHA-256 |
+|---|---|---|
+| `MNN-Pocket-0.3B-GGUF/MNN-Pocket-0.3B-Instruct-Q4_1.gguf` | 191,896,672 | `a281c127e388b16537fd3f5d31ab32d3f87739e6dc514ac1093c80d9eac8d097` |
+| `MNN-Pocket-0.3B/model.safetensors`（BF16，未在对比中使用） | 723,137,248 | — |
+| `MNN-Pocket-0.3B-qat/mnn-pocket-0.3b-qat-q4.nncossllm` | 162,233,920 | `c10cbd1ad2de3ea5acf7b2730d6fa3f0a9b70f61bf4bf4e3d133a7e7a7661b0e` |
+| `MNN-Pocket-0.3B-qat/mnn-pocket-0.3b-qat-f32.nncossllm` | 1,211,323,968 | `55d1c285954adf016c48da6d4baec1daf53af65ce6a841e77eb7e3732190137e` |
+
+对比方法与结果见[决策记录](decisions.md)。
 
 ## 直接改写权重得到的模型
 

@@ -435,7 +435,7 @@ python3 tools/check_real_llm.py --hf-model model/Qwen3-0.6B
 
 `tools/export_llm.py --outtype q4` 提供项目内的 Q4 权重编码，不改变模型 ABI 或分块加载协议。矩阵按 32 列分组，每个矩阵依次保存三段数据：每行一个 f32 行 scale、每组一个 i8 组倍率（可为负）、每组 16 字节的 4-bit 打包值，末尾补零到 4 字节对齐；权重还原值为 `行 scale × 组倍率 × q`，`q ∈ [-8, 7]`，平均约 4.25 bit／权重。导出器对每组尝试 17 个候选步长与两种符号，用最小二乘重新拟合步长并取还原误差最小者，在 Qwen3-0.6B 上比按 absmax/7 取整的权重相对均方误差低约 32%。Norm 与 bias 保持 f32，嵌入查表和 LM Head 共用同一编码。
 
-推理时线性层的输入按同样的 32 列分组量化为 int8（每组一个 f32 scale），组内做整数点积后乘以 `组倍率 × 输入 scale` 累加。x86_64 在运行时检测到 AVX2 时使用向量化内核和常驻线程池（默认取物理核数，最多 8 个，可用环境变量 `NNCOSS_THREADS` 覆盖），每个线程顺序读取一段连续的权重行；prefill 每批 32 个 token，同一行权重对多个 token 复用，注意力把每个 KV 头的历史位置切成固定的 256 个位置一块，按块分别计算局部最大值、指数和与未归一化输出，再按块的顺序合并；单 token decode 时（KV 头 × 块）并行，长上下文下 6 个线程负载均衡，prefill 每块的 K/V 对整批 token 复用。指数小于 e^-41 的注意力权重视为 0，以免产生非规格化浮点数拖慢计算，对结果的影响低于 f32 精度。分块与合并顺序与线程数无关，标量与 AVX2 路径逐位一致。KV Cache 按 `[KV 头][位置][head_dim]` 连续存放；Q4 模型的 KV Cache 以 f16 存储（Qwen3-0.6B 每个位置 114,688 字节），f32 模型保持 f32（每个位置 229,376 字节），f16 与 f32 之间的转换使用软件实现的就近舍入，原生目标在支持 F16C 时批量转换，两者逐位一致。其他目标（包括 WASM）使用标量实现。另有可选的 int8 KV Cache，见下文。向量化与标量路径按相同的通道划分和求和顺序计算，RoPE 的幂与正余弦、softmax 与 SiLU 的指数使用只依赖 IEEE 754 基本运算的实现，因此原生与 WASM 的 logits 逐位一致；批量 prefill 与逐 token decode 的结果也逐位一致。
+推理时线性层的输入按同样的 32 列分组量化为 int8（每组一个 f32 scale），组内做整数点积后乘以 `组倍率 × 输入 scale` 累加。x86_64 在运行时检测到 AVX2 时使用向量化内核和常驻线程池（默认取物理核数，最多 8 个，可用环境变量 `NNCOSS_THREADS` 覆盖），每个线程顺序读取一段连续的权重行；prefill 每批 32 个 token，内核外层按每 4 个 token 一组、内层逐行计算，这组 token 的激活（约 4 KB）留在 L1，同一段权重行对各组 token 复用、从 L2 重读，注意力把每个 KV 头的历史位置切成固定的 256 个位置一块，按块分别计算局部最大值、指数和与未归一化输出，再按块的顺序合并；单 token decode 时（KV 头 × 块）并行，长上下文下 6 个线程负载均衡，prefill 每块的 K/V 对整批 token 复用。指数小于 e^-41 的注意力权重视为 0，以免产生非规格化浮点数拖慢计算，对结果的影响低于 f32 精度。分块与合并顺序与线程数无关，标量与 AVX2 路径逐位一致。KV Cache 按 `[KV 头][位置][head_dim]` 连续存放；Q4 模型的 KV Cache 以 f16 存储（Qwen3-0.6B 每个位置 114,688 字节），f32 模型保持 f32（每个位置 229,376 字节），f16 与 f32 之间的转换使用软件实现的就近舍入，原生目标在支持 F16C 时批量转换，两者逐位一致。其他目标（包括 WASM）使用标量实现。另有可选的 int8 KV Cache，见下文。向量化与标量路径按相同的通道划分和求和顺序计算，RoPE 的幂与正余弦、softmax 与 SiLU 的指数使用只依赖 IEEE 754 基本运算的实现，因此原生与 WASM 的 logits 逐位一致；批量 prefill 与逐 token decode 的结果也逐位一致。
 
 ```bash
 python3 tools/export_llm.py --model model/Qwen3-0.6B --output model/Qwen3-0.6B/qwen3-0.6b-q4.nncossllm --outtype q4
@@ -456,7 +456,7 @@ cargo run -p nncoss-llm --release --example bench -- --model model/Qwen3-0.6B/qw
 | 原生 prefill（1024 token） | — | 约 6.1 秒（约 165 tokens/s） |
 | WASM decode（wasmtime，标量） | 约 1.2 tokens/s | 约 1.1–1.3 tokens/s |
 
-“优化前”为本次改动之前的 Q4 实现（每组 f32 scale、f32 激活）。KV Cache 改为按头连续存放并对 Q4 模型使用 f16 之前，prompt 1024 的 decode 为 31 tokens/s，prefill 1024 个 token 约需 9.8 秒。单 token decode 每步需要读取全部约 317 MB 权重，另加随上下文增长的 KV Cache，速度受内存带宽限制。该机实测多线程顺序读带宽峰值约 30–33 GB/s，但受其他程序干扰时平均只有约 19–24 GB/s，对应的 decode 上限约为 75–100 tokens/s，当前已接近实际可用带宽。要稳定超过 100 tokens/s，需要更低比特的权重或带宽更高的硬件，这些均未采用，因为前者会降低质量。
+“优化前”为本次改动之前的 Q4 实现（每组 f32 scale、f32 激活）。表中数字是在机器较空闲时测得的；Q4 内核改为先按 token 分组再逐行之后，在机器空闲时（2026-11-27）交替测量、取中位数：Qwen3-1.7B prefill 256 token 从约 54.5 提高到约 67.5 tokens/s（+24%），单线程 Qwen3-0.6B prefill 256 token 从约 48.2 提高到约 58.4 tokens/s（+21%）；6 线程的 0.6B prefill 512、1024 token 不变（约 170、139 tokens/s），这时瓶颈已不在内核，而在每次矩阵运算的固定开销和线程等待。decode 不变，输出逐位相同。2026-11-26 在远程桌面、编辑器与其他测试同时运行时测得 0.6B 6 线程也提高了 18–31%，那是旧内核在干扰下更慢，不代表空闲时的收益。KV Cache 改为按头连续存放并对 Q4 模型使用 f16 之前，prompt 1024 的 decode 为 31 tokens/s，prefill 1024 个 token 约需 9.8 秒。单 token decode 每步需要读取全部约 317 MB 权重，另加随上下文增长的 KV Cache，速度受内存带宽限制。该机实测多线程顺序读带宽峰值约 30–33 GB/s，但受其他程序干扰时平均只有约 19–24 GB/s，对应的 decode 上限约为 75–100 tokens/s，当前已接近实际可用带宽。要稳定超过 100 tokens/s，需要更低比特的权重或带宽更高的硬件，这些均未采用，因为前者会降低质量。
 
 `Session::generate` 默认启用推测解码：在会话已有的 token 中查找与当前末尾相同的 2–3 个 token 片段，取其后一个 token 作为草稿，与新采样的 token 组成 2 个 token 的批次一起前向，再按草稿验证规则接受或拒绝。贪心时只在草稿等于 argmax 时接受；采样时以目标分布中草稿的概率接受，拒绝时从去掉草稿后重新归一化的分布中采样，因此生成分布与逐 token 采样完全相同。贪心输出与关闭推测解码时逐 token 一致；采样输出的分布不变，但同一种子下随机数的使用顺序不同，具体序列可能不同。`Session::set_speculation(false)` 可关闭该功能；C ABI 的 `decode`／`sample` 逐 token 接口不受影响。2 个 token 的前向约为单步的 1.2 倍，在 7 组真实多轮对话上实测：代码类约快 10–20%，摘要类约 5–10%，开放式对话约 0–10%，整体约 5–8%（测量噪声约 ±6%）。
 
@@ -667,6 +667,7 @@ target/release/nncoss-edit apply --input <模型> --output <新模型> --plan <�
 | 脚本 | 作用 |
 |------|------|
 | `tools/quick_eval.py` | 快速考评，满分 100 分：随机抽 6 道高考客观题、2 道主观题、2 道 ACM 题，每题 10 分。ACM 程序在本机用官方测试数据判题；主观题由评审者按参考答案打分后用 `--finalize` 计分。90 分以上优秀、80 分良好、70 分普通、60 分及格，60 分以下为没学会 |
+| `tools/gguf_to_safetensors.py` | 把 Qwen3 稠密模型的 GGUF 逐个张量精确还原成 f32 safetensors（Hugging Face 张量名），再用 `export_llm.py` 导出，使本项目与其他框架用同一份权重比较；需要 `gguf` 包 |
 | `tools/eval_gaokao.py` | 从 9 个单选题科目各抽 12 道高考题。`--split test` 用于测验，`--split tune` 用于定位改动，两者不重叠；`--split wide` 是与两者都不重叠的大题组（每科 48 道，物理、语文题少，共 373 道），用于分辨较小的差别。可选择是否思考、是否用工具、是否预取检索或把资料写进提问（`--reference`，`--reference-query other` 换成不对题的资料作对照），以及稀疏化、回复开头与“把握不足才查书”等设置，结果写到 `tmp/<标签>/`；`--no-learn` 时各题互不影响，中断后可用 `--resume` 只答剩下的题 |
 | `tools/tool_decision.py` | 在开口位置测量模型选择调用检索的概率，以及各 MLP 神经元与 KV 头对这一选择的梯度归因 |
 | `tools/retrieval_gate.py` | 以模型自己的回答为目标（不用标准答案），定位“检索结果为空时拒答、不再自己推理”这一行为相关的神经元和 KV 头，并在留出的一半题上比较候选改动 |

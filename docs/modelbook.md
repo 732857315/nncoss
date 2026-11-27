@@ -2,7 +2,7 @@
 
 `modelbook/` 保存知识与大脑分离实验用到的外部资料：测验题、课本、算法资料，以及由它们生成的知识库。这些资料只用于测验和检索，不用于训练或改写权重。
 
-可以公开再分发的部分提交到仓库，大文件用 Git LFS 管理。受版权保护或能按下文重新获取、生成的部分只保存在本机，已列入 `.gitignore`。
+可以公开再分发的部分提交到仓库，大文件用 Git LFS 管理，并统一镜像到 Hugging Face 数据集 [w732857315/nncoss-knowledge](https://huggingface.co/datasets/w732857315/nncoss-knowledge)。受版权保护或能按下文重新获取、生成的部分只保存在本机，已列入 `.gitignore`。
 
 范围是幼儿园到高中。课本来源 ChinaTextbook 只有小学、初中、高中，另有五四学制、大学与习题目录：五四学制与六三学制的内容相同，不重复选用；大学教材不在范围内。幼儿园没有全国统一教材，山东省使用的《山东省幼儿园课程指导》（山东省教学研究室与明天出版社编）没有公开的电子版，网上只有来源不明的个人上传，不予采用；幼儿园部分改用教育部公开发布的《3-6岁儿童学习与发展指南》（2012）与《幼儿园教育指导纲要（试行）》（2001），两者规定了 3–6 岁儿童在健康、语言、社会、科学、艺术五个领域的学习与发展目标和教育建议。
 
@@ -22,6 +22,19 @@
 | `knowledge/store-base/` | 课本、幼儿园文本与 OI Wiki 合并后的知识库，`nncoss-know` 直接读取 | 否 | 由上面的段落生成 |
 | `knowledge/store-160/` | 最初 160 册课本与 OI Wiki 的知识库，共 44,913 段；[实验记录](brain-experiments.md)第五章的结果都用它测得 | 否 | 同上 |
 | `sources/` | OI Wiki 与 GAOKAO-Bench 的源码压缩包及解压目录，幼儿园文件原件 | 否 | 各自来源 |
+
+## 已发布镜像
+
+[nncoss-knowledge](https://huggingface.co/datasets/w732857315/nncoss-knowledge) 提供 GAOKAO-Bench 的逐题 JSONL 与原始 JSON、OI Wiki 的 12,138 段、CodeContests 的 165 行测试 Parquet，以及 318 册课本的来源清单。各来源分别保留 Apache-2.0、CC BY-SA 4.0 + SATA、CC BY 4.0 等许可和署名，详见数据集卡及其中 `licenses/`、`checksums.json`。课本 PDF、课本或幼儿园正文、含这些正文的知识库不上传，镜像中的 `textbooks` 配置只含路径、大小和 Git 对象哈希。
+
+在仓库根目录执行以下命令，可按现有目录结构下载开放资料；不会下载课本正文：
+
+```bash
+python3 -m pip install huggingface_hub==0.36.2
+python3 -c "from huggingface_hub import snapshot_download; snapshot_download('w732857315/nncoss-knowledge', repo_type='dataset', local_dir='.', allow_patterns=['modelbook/eval/gaokao/**', 'modelbook/eval/code_contests/test.parquet', 'modelbook/knowledge/oiwiki.jsonl', 'modelbook/knowledge/textbooks-manifest.json'])"
+```
+
+本地 CodeContests 文件已核对为 165 行、63,077,400 字节，SHA-256 为 `aa426cbdb202bf8703b658bcb31fd1878ca7cfd33ca07d3b703dc94ca6a2b651`。`load_dataset` 的配置名、Parquet 显式读取方式和 `store-oiwiki` 建立方法见数据集卡。
 
 ## 复现
 

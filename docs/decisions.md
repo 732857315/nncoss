@@ -45,7 +45,7 @@
 ### 1.6 仓库约定
 
 - 功能代码用 Rust，辅助脚本只用 Python。
-- 模型不上传，只记录来源与生成方法，保证别人能复现。
+- 模型与训练数据不入 Git 仓库；11-27 起经负责人确认可发布到 Hugging Face，仍须记录来源、校验值与使用方式。
 - 外部资料放 `modelbook/`，文档放 `docs/`，临时数据放 `tmp/`，模型放 `model/`。项目相关的内容都放在仓库目录内。
 
 ## 二、改动与原因
@@ -116,6 +116,8 @@
 | 11-26 | 内核循环顺序之后又试的四项，都不采用 | 继续找 prefill 的提速；参考了 ncnn-MoE-Runtime（prefill 解出 8 行权重的一块后对 4 个 token 复用、gate/up 在同一个并行区内、AVX2 内核先还原成 f32 再乘加） | 每次与同一行权重相乘的 token 从 4 个增加到 8 个：单线程 prefill 40.3 → 29.1 tokens/s，累加寄存器超出 AVX2 的 16 个而溢出到内存。prefill 每批 128 个 token：不比 32 个快。线程数 5 或 4：prefill 中位数 102、111 tokens/s，低于 6 个线程的 122。prefill 注意力把每块 f16 的 K/V 先转成 f32 再供各 token 复用：768 token 单线程无差别，2048 token 多线程中位数 47.6 对 61.8 tokens/s，f32 的 K/V 字节数翻倍，抵消了省下的转换。gate/up 同一并行区本项目已经如此；ncnn-MoE-Runtime 的专家缓存、按需加载用于 MoE 模型，对稠密 Qwen3 不适用 |
 | 11-27 | 同一模型在本项目与 ncnn-MoE-Runtime 上的速度对比（控制变量） | 用户提出参考 ncnn-MoE-Runtime，并要求同一模型在两个框架上比较、保证变量一致 | 模型为 MNN-Pocket-0.3B（Qwen3 结构）。权重：对方运行官方 QAT Q4_1 GGUF（约 5.0 bit／权重，192 MB）；本项目把同一文件精确还原后导出 f32（权重与对方完全相同）和 Q4（约 4.25 bit，162 MB）。输入为同一组 token id（18、512、1024 个），各贪心生成 64 个，两边都关掉推测解码，排除预热，两轮交替运行取中位数（负载 2.2–4.4）。对方 ncnn-MoE-Runtime（bc51ff2）在本机用 Apple Clang 构建，没有 OpenMP，只能单线程，实测它的 `--cpu-qnk-q8` 无差别、`--cpu-packed-weights` 只支持 MoE 专家，所以主对比为单线程。结果（prefill / decode tokens/s）：18 token 对方 18.5 / 3.41，本项目 Q4 103.3 / 50.0、f32 54.3 / 13.8；512 token 22.5 / 3.17 对 96.3 / 40.1、47.1 / 10.4；1024 token 18.4 / 2.78 对 83.6 / 32.1、44.8 / 10.9。同核数下本项目 Q4 的 prefill 快 4.5–5.6 倍，decode 快 12–15 倍；权重完全相同、字节数是对方 6 倍的 f32 版 decode 也快 3.3–4 倍，差别不在权重格式。正确性：权重相同时本项目 f32 与对方生成的 64 个 token 在 18、512 token 提示下逐个相同，1024 时第 58 个起才不同（浮点求和顺序）；Q4 版因再量化一次，较早分叉但文本通顺。本项目 6 线程为 decode 109–133、prefill 309–382 tokens/s，约用到 26 GB/s 带宽，接近本机 CPU 上限。用户另在一台 ROG 笔记本上看到对方 decode 523、prefill 2219 tokens/s：那是 `backend hybrid` 在独立显卡上用 Vulkan 运行（进程 CPU 占用 1.4%），Q8 权重约 0.39 GB，523 tokens/s 相当于约 200 GB/s 的显存带宽，是本机 CPU 可用带宽的近 10 倍；本项目目前只有原生 CPU 与 WASM，没有 GPU 后端，差距来自硬件 |
 | 11-27 | 在本机 GPU 上试运行 ncnn-MoE-Runtime：能运行但结果错误，不作速度对比 | 用户要求在本机 GPU 上试 | macOS 没有原生 Vulkan，用官方 MoltenVK（Vulkan 转 Metal，1.4.2）的动态库放在 `tmp/ext/`，经 ncnn 自带的加载器（`NCNN_VULKAN_DRIVER`）载入，未在系统中安装任何东西；对方以 `-DNCNN_MOE_USE_VULKAN=ON -DNCNN_MOE_MOLTENVK_LIBRARY=…` 构建。本机有 AMD Radeon Pro 555X（4 GB）与 Intel UHD 630：Intel 上 MoltenVK 编译对方的一个计算着色器失败；AMD 上对方按显存约 85% 申请一整块 3.64 GB 缓冲，超过 Metal 在该卡上单个缓冲 3 GiB 的上限，加 `--expert-gpu-cache-mb 1024` 后可以启动，28 层注意力都放在 GPU 上。但生成的文本是乱码（CPU 上同一提示输出“长城是中国最著名的古代防御工程……”），速度也只有 prefill 35–120、decode 2.6–4.2 tokens/s。Intel Mac 加 AMD 显卡经 MoltenVK 不是对方支持的配置，这组 GPU 数字无效；用户截图中 523 tokens/s 的 GPU 结果是在 Windows 的独立显卡上用原生 Vulkan 驱动得到的 |
+| 11-27 | 发布 nncoss 模型与 school-r1 训练数据，补充使用文档 | 负责人要求把 school 模型放到对应仓库、训练数据放到 Hugging Face Datasets，并整理文档让别人也能使用 nncoss；取代 11-19“模型不上传”的限制，模型与数据仍不进 Git 仓库 | 已发布 Qwen3-0.6B、Qwen3-1.7B、MNN-Pocket-0.3B 与独立的 school-r1 模型仓库。school 数据只含自编题库和 Qwen3-0.6B 生成的第一轮轨迹：575 条原始样本，经 319 条工具上下文增强与总长度筛选后得到实际训练的 891 条；不含未完成的第二轮或外部题库。school 模型仓库的 8 个文件与数据集仓库的 6 个文件已核对远端存在和大小，两个模型权重的远端 LFS SHA-256 也与本文表格一致。README 增加当前原型的快速开始，模型说明增加下载、原生／WASM 运行和数据集读取方法；公开文件仍标为未纳入 CI 的本地实验产物 |
+| 11-27 | 外部资料整理后发布到 `w732857315/nncoss-knowledge` | 负责人要求上传尚未发布的外部资料并指定数据集仓库；同时需要按具体来源核对许可，不能把公开可下载等同于允许再分发 | 发布 GAOKAO-Bench 原始与逐题 JSONL（客观 1,781、主观 1,030）、OI Wiki 12,138 段、CodeContests 165 行 Parquet，以及 318 册／326 分卷的来源清单，共 47 个文件；各来源分别保留许可与署名。全部仓库配置和 Parquet 均已从远端加载并核对条数。ChinaTextbook 未声明统一再分发许可，故不上传课本 PDF、课本或幼儿园正文及含这些正文的知识库，只公开清单、校验值与获取方法；`docs/modelbook.md` 已补镜像下载说明 |
 
 ## 三、当前基线
 

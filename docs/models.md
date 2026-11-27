@@ -1,8 +1,55 @@
 # 模型
 
-模型文件不随仓库分发，只在本文记录来源和生成方法。按下面的步骤可以在本地复现 `model/` 下的全部文件，每步给出了测试机上得到的文件大小和 SHA-256，便于核对。整个 `model/` 目录都不纳入版本库，中间文件写到同样不入库的 `tmp/`。
+模型文件不随 Git 仓库分发。已发布的 nncoss 模型与 school-r1 训练数据可从 Hugging Face 直接下载；其余模型在下文记录来源和生成方法，并给出测试机上得到的文件大小和 SHA-256，便于核对。整个 `model/` 目录都不纳入版本库，中间文件写到同样不入库的 `tmp/`。
 
-测试机为 Intel Core i7-9750H（6 核 12 线程、16 GiB 内存、macOS）。Python 3.11 依赖见 [tools/knowledge_requirements.txt](../tools/knowledge_requirements.txt)。所有命令都从仓库根目录执行。
+测试机为 Intel Core i7-9750H（6 核 12 线程、16 GiB 内存、macOS），Python 3.11。完整开发依赖见 [tools/knowledge_requirements.txt](../tools/knowledge_requirements.txt)，可用 `python3 -m pip install -r tools/knowledge_requirements.txt` 安装；只运行下面的已发布 Q4 时使用更小的依赖集合。所有命令都从仓库根目录执行。
+
+## 已发布模型与数据集
+
+| 仓库 | 内容 |
+|---|---|
+| [w732857315/nncoss-qwen3-0.6b](https://huggingface.co/w732857315/nncoss-qwen3-0.6b) | Qwen3-0.6B 校准蒸馏 Q4、4 个不推荐的权重改写实验模型，以及 `school-r1/` 下与独立 school 仓库重复的存档副本 |
+| [w732857315/nncoss-qwen3-1.7b](https://huggingface.co/w732857315/nncoss-qwen3-1.7b) | Qwen3-1.7B 未校准最小二乘 Q4 |
+| [w732857315/nncoss-mnn-pocket-0.3b](https://huggingface.co/w732857315/nncoss-mnn-pocket-0.3b) | MNN-Pocket-0.3B 的 nncoss Q4 与由官方 QAT Q4_1 精确还原的 f32 |
+| [w732857315/nncoss-Qwen3-0.6B-school](https://huggingface.co/w732857315/nncoss-Qwen3-0.6B-school) | school-r1 的 nncoss Q4、f32 safetensors、配置、分词器与模型卡 |
+| [w732857315/nncoss-qwen3-0.6b-school-r1-data](https://huggingface.co/datasets/w732857315/nncoss-qwen3-0.6b-school-r1-data) | 891 条实际训练样本、575 条原始保留轨迹，以及 1,161／427 条训练／留出题库 |
+
+以下公开文件来自本文记录的本地实验，未纳入 CI 模型验收；文件大小和 SHA-256 用于核对，不代表相应模型已经通过所有平台与任务测试。
+
+安装推理与下载依赖，并构建原生和 WASM 目标。以下以 `python3` 指向 Python 3.11 为例；在启用 PEP 668 或不允许向环境安装包的系统上，先执行 `python3.11 -m venv tmp/infer-env`，并用 `tmp/infer-env/bin/python` 替代后续命令中的 `python3`：
+
+```bash
+python3 -m pip install huggingface_hub==0.36.2 tokenizers==0.22.2 wasmtime==50.0.1
+cargo build --release
+rustup target add wasm32-unknown-unknown
+cargo build -p nncoss-llm --release --target wasm32-unknown-unknown
+```
+
+下载常用模型。四条命令都使用 `allow_patterns`，避免下载实验改写、f32 school 权重、仓库模型卡等不需要或可能覆盖基座模型同名文件的内容：
+
+```bash
+python3 -c "from huggingface_hub import snapshot_download; snapshot_download('w732857315/nncoss-qwen3-0.6b', local_dir='model/Qwen3-0.6B', allow_patterns=['LICENSE', 'tokenizer.json', 'tokenizer_config.json', 'qwen3-0.6b-q4.nncossllm'])"
+python3 -c "from huggingface_hub import snapshot_download; snapshot_download('w732857315/nncoss-Qwen3-0.6B-school', local_dir='model/Qwen3-0.6B-school-r1', allow_patterns=['LICENSE', '*.json', '*q4.nncossllm'])"
+python3 -c "from huggingface_hub import snapshot_download; snapshot_download('w732857315/nncoss-qwen3-1.7b', local_dir='model/Qwen3-1.7B', allow_patterns=['LICENSE', 'tokenizer.json', 'tokenizer_config.json', 'qwen3-1.7b-q4-ls.nncossllm'])"
+python3 -c "from huggingface_hub import snapshot_download; snapshot_download('w732857315/nncoss-mnn-pocket-0.3b', local_dir='model/MNN-Pocket-0.3B-qat', allow_patterns=['LICENSE', 'tokenizer.json', 'tokenizer_config.json', 'chat_template.jinja', '*.nncossllm'])"
+```
+
+运行 school-r1 Q4；把 `--target native` 改成 `--target wasm` 即使用已构建的 WASM 产物：
+
+```bash
+python3 tools/run_qwen3.py --target native \
+  --model model/Qwen3-0.6B-school-r1/qwen3-0.6b-school-r1-q4.nncossllm \
+  --prompt "用一句话介绍 WebAssembly"
+```
+
+读取训练数据集：
+
+```bash
+python3 -m pip install datasets==3.2.0 pyarrow==17.0.0
+python3 -c "from datasets import load_dataset; data=load_dataset('w732857315/nncoss-qwen3-0.6b-school-r1-data', 'train', split='train'); print(len(data)); print(data[0]['text'])"
+```
+
+数据集另有 `raw` 与 `questions` 配置、字段说明、生成和筛选流程，详见数据集卡。下载后可按下文表格用 `shasum -a 256 <文件>` 等工具核对哈希；完整开发、导出与校准依赖仍以 `tools/knowledge_requirements.txt` 为准。
 
 ## 基础模型
 
@@ -91,6 +138,7 @@ python3 tools/export_llm.py --model model/MNN-Pocket-0.3B-qat --output model/MNN
 `nncoss-edit` 按改动计划改写 Q4 文件中的行 scale 或删除整层，几秒内完成，结果是确定的。用法见 [README](../README.md#知识库与权重改写实验)。目前保留的改写模型：
 
 ```bash
+cargo build -p nncoss-edit --release
 target/release/nncoss-edit apply --input model/Qwen3-0.6B/qwen3-0.6b-q4.nncossllm \
   --output model/edits/qwen3-0.6b-q4-l1n2997-off.nncossllm \
   --edit '{"op": "scale", "target": "mlp", "layer": 1, "index": [2997], "factor": 0.0}'
@@ -155,9 +203,11 @@ target/release/nncoss-edit apply --input model/Qwen3-0.6B/qwen3-0.6b-q4.nncossll
 
 ## 自我学习模型（对照组）
 
-`Qwen3-0.6B-school-r1/` 是在 Qwen3-0.6B 上做一轮拒绝采样自我学习得到的模型，继承 Apache License 2.0。实验过程与测评结果见[实验记录](brain-experiments.md)。
+`Qwen3-0.6B-school-r1/` 是在 Qwen3-0.6B 上做一轮拒绝采样自我学习得到的模型，继承 Apache License 2.0。实验过程与测评结果见[实验记录](brain-experiments.md)。可直接按[已发布模型与数据集](#已发布模型与数据集)下载，不必重新训练或量化。
 
-生成它的是 Python 训练流程。按项目约定，功能代码须用 Rust 实现，所以这套流程已经删除，不再提供复现命令。当时的脚本和经验数据可以在提交 `aa625fd` 中查看。测试机上生成的文件如下：
+生成它的是 Python 训练流程。按项目约定，功能代码须用 Rust 实现，所以这套流程已经从当前开发树删除，不再提供一键复现命令；当时的脚本和原始经验数据可以在提交 `aa625fd` 中查看。整理后的[训练数据集](https://huggingface.co/datasets/w732857315/nncoss-qwen3-0.6b-school-r1-data)包含 575 条原始保留轨迹、实际训练的 891 条增强与筛选后样本，以及训练／留出题库；文本、token ID、损失掩码和统计均已公开。
+
+测试机上生成的模型文件如下；仓库还包含模型卡、`LICENSE`、`config.json`、`generation_config.json`、`tokenizer.json` 与 `tokenizer_config.json`：
 
 | 文件 | 字节数 | SHA-256 |
 |---|---|---|

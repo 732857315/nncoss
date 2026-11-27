@@ -13,7 +13,7 @@ A WebAssembly-based neural network framework for any platform and language, with
 ![deployment](https://img.shields.io/badge/deployment-WASM%20%2B%20native-654ff0)
 ![interface](https://img.shields.io/badge/interface-language%20neutral-dea584)
 
-[项目定位](#项目定位) · [编译流水线](#编译流水线) · [多语言调用](#多语言调用) · [扩展机制](#扩展机制) · [使用流程草案](#使用流程草案) · [引擎](#引擎) · [训练](#训练) · [推理](#推理) · [WASM LLM 原型](#wasm-llm-推理原型) · [知识库与权重改写](#知识库与权重改写实验) · [模型迁移](#模型迁移) · [路线图](#路线图)
+[快速开始](#快速开始) · [项目定位](#项目定位) · [编译流水线](#编译流水线) · [多语言调用](#多语言调用) · [扩展机制](#扩展机制) · [使用流程草案](#使用流程草案) · [引擎](#引擎) · [训练](#训练) · [推理](#推理) · [WASM LLM 原型](#wasm-llm-推理原型) · [知识库与权重改写](#知识库与权重改写实验) · [模型迁移](#模型迁移) · [路线图](#路线图)
 
 </div>
 
@@ -25,9 +25,51 @@ WASM 承载可移植的计算与扩展模块；LLVM 负责优化与目标代码�
 
 「枢」是门轴，也是中枢。吻灵枢想做模型的枢纽：外部模型迁移进来，自己的模型训练出来，最终都能部署出去；同时保持克制，只接管你不想写的部分，点到为止。
 
-> **项目状态**：当前仓库包含设计文档、验收工具、`nncoss-llm` 早期原型，以及基于它的本地对话界面 `nncoss-web`、外部知识库 `nncoss-knowledge` 与权重改写工具 `nncoss-edit`。`nncoss-llm` 已能构建并执行 WASM 与原生 decoder-only 推理，但尚无可安装的完整框架软件包、浏览器宿主示例或已完成验收的公开模型。除 [WASM LLM 原型](#wasm-llm-推理原型)与[知识库与权重改写实验](#知识库与权重改写实验)明确列出的能力外，下文 API、平台与命令仍为设计目标或使用草案。
+> **项目状态**：当前仓库包含设计文档、验收工具、`nncoss-llm` 早期原型，以及基于它的本地对话界面 `nncoss-web`、外部知识库 `nncoss-knowledge` 与权重改写工具 `nncoss-edit`。`nncoss-llm` 已能构建并执行 WASM 与原生 decoder-only 推理，但尚无可安装的完整框架软件包或浏览器 JavaScript 宿主示例。公开模型与训练数据属于本地实验产物，未纳入 CI 模型验收。除[快速开始](#快速开始)、[WASM LLM 原型](#wasm-llm-推理原型)与[知识库与权重改写实验](#知识库与权重改写实验)明确列出的能力外，下文 API、平台与命令仍为设计目标或使用草案。
 >
 > **当前优先级**：框架主线先完成可复现的最小纵向原型，以 f32 张量、标量 CPU 内核和固定结构的 MLP 为边界，验证 WASM 与原生 CPU 的数值一致性，再打通 MNIST 训练闭环。`nncoss-llm` 作为独立实验原型提前验证 LLM 会话、KV Cache 与 WASM ABI，不代表框架 v0.1 已完成；GPU、通用迁移和更多平台仍在核心链路验证后分批推进。
+
+## 快速开始
+
+本段只介绍当前可运行的 LLM 原型。需要 Rust 1.85+、Python 3.11（本机验证版本）以及对应平台的 C/C++ 构建工具；使用 `modelbook/` 中的 Git LFS 资料时另需 Git LFS，仅下载并运行下列模型不需要。x86_64 原生目标在检测到 AVX2 时启用向量化与线程池，其他原生架构和 wasm32 当前使用标量路径。以下以 `python3` 指向 Python 3.11 为例；在启用 PEP 668 或不允许向环境安装包的系统上，先执行 `python3.11 -m venv tmp/infer-env`，并用 `tmp/infer-env/bin/python` 替代后续命令中的 `python3`。
+
+```bash
+git clone https://github.com/732857315/nncoss && cd nncoss
+cargo build --release
+rustup target add wasm32-unknown-unknown
+cargo build -p nncoss-llm --release --target wasm32-unknown-unknown
+python3 -m pip install huggingface_hub==0.36.2 tokenizers==0.22.2 wasmtime==50.0.1
+```
+
+下载已发布的 Qwen3-0.6B 校准蒸馏 Q4 和分词器，不必先在本地执行量化：
+
+```bash
+python3 -c "from huggingface_hub import snapshot_download; snapshot_download('w732857315/nncoss-qwen3-0.6b', local_dir='model/Qwen3-0.6B', allow_patterns=['LICENSE', 'tokenizer.json', 'tokenizer_config.json', 'qwen3-0.6b-q4.nncossllm'])"
+```
+
+原生单次对话：
+
+```bash
+python3 tools/run_qwen3.py --target native \
+  --model model/Qwen3-0.6B/qwen3-0.6b-q4.nncossllm \
+  --prompt "用一句话介绍 WebAssembly"
+```
+
+WASM／wasmtime 单次对话：
+
+```bash
+python3 tools/run_qwen3.py --target wasm \
+  --model model/Qwen3-0.6B/qwen3-0.6b-q4.nncossllm \
+  --prompt "用一句话介绍 WebAssembly"
+```
+
+省略 `--prompt` 可逐行交互输入。`tools/run_qwen3.py` 是辅助宿主脚本，不是独立的 Python 绑定；更多参数见[命令行对话](#命令行对话原生与-wasm)。本地 Web 界面使用原生后端：
+
+```bash
+target/release/nncoss-web
+```
+
+随后打开 `http://127.0.0.1:8765/`。school-r1 模型、其他已发布模型及其训练数据集的下载方法见[模型说明](docs/models.md#已发布模型与数据集)；需要从头下载基座权重、导出或校准时，也在该文中给出。当前没有浏览器 JavaScript WASM 宿主，WASM 推理通过 Python `wasmtime` 辅助宿主执行。
 
 ## 项目定位
 
@@ -357,7 +399,7 @@ console.log("识别结果：", logits.argmax());
 | 调用接口 | Rust API 与版本为 1 的 WASM／原生 C ABI；模型可整块从内存加载，或按声明的总长度分块流式加载；会话独立持有权重生命周期 |
 | 验证 | 原生单元测试；手算 RoPE 旋转（两种布局、多频率）与 GQA 头映射；增量解码与无缓存参考前向在多层 GQA 模型的绑定／独立 LM Head、QKV bias、QK norm 与 RoPE 布局全部组合上对拍；分块加载在全部特性组合、每个二分切点与每个截断长度上与整块加载对拍；同一 tiny decoder 夹具的原生／WASM 数值与错误路径对拍 |
 
-CI 验收覆盖仓库生成的 tiny decoder 和 6 个 Hugging Face 合成小模型。Qwen3-0.6B 的 f32 导出另在本地完成了短序列的原生／WASM／Hugging Face 对拍，见[分块加载与真实模型本地对拍](#分块加载与真实模型本地对拍)；该结果不属于 CI 门禁，也不代表该模型已通过长上下文、Tokenizer 或性能验收，其他公开尺寸的 Llama 或 Qwen 模型尚未验证。架构兼容与模型支持必须分别验证。
+CI 验收覆盖仓库生成的 tiny decoder 和 6 个 Hugging Face 合成小模型。Qwen3-0.6B 的 f32 导出另在本地完成了短序列的原生／WASM／Hugging Face 对拍，见[分块加载与真实模型本地对拍](#分块加载与真实模型本地对拍)；该结果不属于 CI 门禁，也不代表该模型已通过长上下文、Tokenizer 或性能验收。Qwen3-1.7B 与 MNN-Pocket-0.3B 另有本地测评或对比结果（见[决策记录](docs/decisions.md)），同样未纳入 CI；其他公开尺寸的 Llama 或 Qwen 模型尚未验证。架构兼容与模型支持必须分别验证。
 
 ### ncnn 后端与优化边界
 
@@ -400,7 +442,7 @@ python3 tools/check_golden_llm.py
 
 ```bash
 python3 -m pip install -r tools/golden_requirements.txt
-python3 tools/make_golden_llm.py
+python3 tools/make_golden_llm.py --write
 ```
 
 当前生成器使用 Transformers 4.57.6 的顶层 `rope_theta` 配置；Transformers 5 的 `rope_parameters` 格式暂不支持。黄金对拍验证的是所列合成配置，不替代公开模型的真实权重、Tokenizer 与长上下文验收。
@@ -411,7 +453,7 @@ python3 tools/make_golden_llm.py
 
 整块加载要求输入缓冲区与解析后的权重同时驻留内存，且 wasm32 的单次分配不能超过 `isize::MAX`（2 GiB − 1 字节）。分块加载不需要整文件输入缓冲区，最大的单次分配是最大的单个权重张量。
 
-模型文件不随仓库分发，按[模型说明](docs/models.md)下载 Qwen3-0.6B 并导出 `model/Qwen3-0.6B/qwen3-0.6b-f32.nncossllm`（2,384,199,744 字节）。下列命令以 1 MiB 分块把它分别加载到原生动态库与 `wasm32-unknown-unknown` 产物，执行 5 个 token 的 prefill 与 4 步贪心 decode 并比较 logits；`--hf-model` 为可选项，需要 `tools/golden_requirements.txt` 的依赖，用 Hugging Face f32 eager 前向作为参考：
+模型文件不随 Git 仓库分发，可按[模型说明](docs/models.md)下载已发布的 Q4，或下载 Qwen3-0.6B 并导出 `model/Qwen3-0.6B/qwen3-0.6b-f32.nncossllm`（2,384,199,744 字节）。下列命令以 1 MiB 分块把 f32 模型分别加载到原生动态库与 `wasm32-unknown-unknown` 产物，执行 5 个 token 的 prefill 与 4 步贪心 decode 并比较 logits；`--hf-model` 为可选项，需要 `tools/golden_requirements.txt` 的依赖，用 Hugging Face f32 eager 前向作为参考：
 
 ```bash
 python3 tools/check_real_llm.py
@@ -512,6 +554,17 @@ python3 tools/distill_q4_llm.py --model model/Qwen3-0.6B --input tmp/qwen3-0.6b-
 | 最小二乘，无校准 | 0.801 | 0.215 | 1.091 |
 | GPTQ | 0.849 | 0.137 | 1.066 |
 | GPTQ + 蒸馏（当前） | 0.859 | 0.111 | 1.020 |
+
+### 命令行对话（原生与 WASM）
+
+`tools/run_qwen3.py` 是直接输入文字的 Python 辅助宿主，复用 `nncoss-llm` 的原生动态库或 WASM 流式 ABI，不是独立语言绑定。`--target` 默认为 `wasm`，`--tokenizer` 默认为模型同目录的 `tokenizer.json`；不传 `--model` 时默认读取本地导出的 Qwen3-0.6B f32，因此使用已发布 Q4 应显式传入模型路径。
+
+```bash
+python3 tools/run_qwen3.py --target native --model model/Qwen3-0.6B/qwen3-0.6b-q4.nncossllm --prompt "你好" --decode 128
+python3 tools/run_qwen3.py --target wasm --model model/Qwen3-0.6B/qwen3-0.6b-q4.nncossllm
+```
+
+第二条省略 `--prompt`，进入逐行交互。`--think` 允许输出思考过程，`--raw` 改为不套聊天模板的文本补全；`--temperature`、`--top-k`、`--top-p`、`--seed` 控制采样，`--chunk-bytes` 控制模型分块加载的宿主缓冲区。运行 WASM 目标需要 `wasmtime==50.0.1`，两个目标都需要 `tokenizers==0.22.2`。
 
 ### 本地 Web 对话界面
 
@@ -636,6 +689,7 @@ fn load(path: &str) -> Result<Model, Box<dyn std::error::Error>> {
 - **把握不足才查书（单选题）**：`--consult-below P` 先不用工具作答，再在同一会话里追问“你的最终答案是哪个选项？只回答一个字母”，读出模型给 A–D 的概率；最高概率不低于 P 时采用这次回答，否则按其余选项（如 `--prefetch` 或 `--reference`）查资料重新作答。两次作答的记录都留在 transcript 中，`batch` 输出的 `confidence` 与 `consulted` 记录追问的把握和是否查了资料。阈值 0.8 在两组高考题上合计没有净收益（[实验记录 5.6](docs/brain-experiments.md#56-先自己作答没把握才查书)），这一方式只用于实验。
 
 ```bash
+cargo build -p nncoss-knowledge --release
 target/release/nncoss-know ingest --store modelbook/knowledge/store-base --input modelbook/knowledge/oiwiki.jsonl
 target/release/nncoss-know search --store modelbook/knowledge/store-base --query "光合作用 产物"
 target/release/nncoss-know ask --store tmp/store-try --model model/Qwen3-0.6B/qwen3-0.6b-q4.nncossllm \
@@ -656,6 +710,7 @@ target/release/nncoss-know probe --model <模型> --tokenizer <分词器> --inpu
 - 改动后默认用 `nncoss-llm` 的加载器检查模型能否加载，再原子地写出新文件。
 
 ```bash
+cargo build -p nncoss-edit --release
 target/release/nncoss-edit inspect model/Qwen3-0.6B/qwen3-0.6b-q4.nncossllm
 target/release/nncoss-edit apply --input <模型> --output <新模型> --plan <改动.json> --edit '{"op": "drop_layers", "layers": [20]}'
 ```

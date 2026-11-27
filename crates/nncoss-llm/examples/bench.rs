@@ -140,6 +140,7 @@ struct Options {
     greedy: bool,
     tokens: Option<String>,
     generate: bool,
+    print_tokens: bool,
     eos: Vec<u32>,
     kv: Option<KvPrecision>,
     kv_compare: bool,
@@ -157,6 +158,7 @@ fn parse_options() -> Result<Options, String> {
     let mut greedy = false;
     let mut tokens = None;
     let mut generate = false;
+    let mut print_tokens = false;
     let mut eos = Vec::new();
     let mut kv = None;
     let mut kv_compare = false;
@@ -208,6 +210,7 @@ fn parse_options() -> Result<Options, String> {
             }
             "--tokens" => tokens = Some(value()?),
             "--generate" => generate = true,
+            "--print-tokens" => print_tokens = true,
             "--kv-compare" => kv_compare = true,
             "--sparsity" => {
                 sparsity = value()?
@@ -229,7 +232,7 @@ fn parse_options() -> Result<Options, String> {
             }
             "--help" | "-h" => {
                 return Err(
-                    "用法：bench [--preset tiny|small] [--iterations N] [--write-model PATH]\n      bench --model PATH [--prompt N | --tokens FILE] [--decode N] [--greedy] [--kv f32|f16|i8] [--sparsity DROP|attn=…,mlp=…,head=…] [--generate [--eos IDS]] [--iterations N]\n      bench --model PATH --tokens FILE --kv-compare\n      bench --model PATH --tokens FILE --sparsity-compare SPEC [--sparsity-compare SPEC …]"
+                    "用法：bench [--preset tiny|small] [--iterations N] [--write-model PATH]\n      bench --model PATH [--prompt N | --tokens FILE] [--decode N] [--greedy] [--print-tokens] [--kv f32|f16|i8] [--sparsity DROP|attn=…,mlp=…,head=…] [--generate [--eos IDS]] [--iterations N]\n      bench --model PATH --tokens FILE --kv-compare\n      bench --model PATH --tokens FILE --sparsity-compare SPEC [--sparsity-compare SPEC …]"
                         .into(),
                 );
             }
@@ -246,6 +249,7 @@ fn parse_options() -> Result<Options, String> {
         greedy,
         tokens,
         generate,
+        print_tokens,
         eos,
         kv,
         kv_compare,
@@ -370,6 +374,10 @@ fn run_model(path: &str, options: &Options) -> Result<(), String> {
         options.decode as f64 / fastest * 1e3
     );
     println!("token_checksum: {checksum}");
+    if options.print_tokens {
+        let ids: Vec<String> = generated.iter().map(|token| token.to_string()).collect();
+        println!("generated_tokens: {}", ids.join(","));
+    }
     Ok(())
 }
 

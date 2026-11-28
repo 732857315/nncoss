@@ -98,7 +98,7 @@ impl Session {
                 maximum: model.config.max_context,
             });
         }
-        let precision = if model.config.quantized {
+        let precision = if model.config.quantized || model.config.int8 {
             KvPrecision::F16
         } else {
             KvPrecision::F32
@@ -733,6 +733,14 @@ mod tests {
                     )
                     .unwrap(),
                 ),
+                Weight::Q8(_) => Weight::Q8(
+                    crate::q8::Q8Matrix::new(
+                        rows,
+                        columns,
+                        crate::q8::test_support::encode(&vec![0.0; rows * columns], rows, columns),
+                    )
+                    .unwrap(),
+                ),
             };
         }
         let tokens = [1, 2, 3, 0, 4, 2];
@@ -894,7 +902,7 @@ mod tests {
     #[test]
     fn batched_prefill_matches_token_by_token_decode_bit_for_bit() {
         let tokens: Vec<u32> = (0..70).map(|index| (index * 7 + 3) % 23).collect();
-        for model in [LONG.model(), LONG.quantized_model()] {
+        for model in [LONG.model(), LONG.quantized_model(), LONG.int8_model()] {
             let model = Arc::new(model);
             let mut batched = Session::new(model.clone(), 0).unwrap();
             batched.prefill(&tokens).unwrap();
@@ -915,6 +923,50 @@ mod tests {
                 bits(split.last_logits().unwrap()),
                 bits(stepped.last_logits().unwrap())
             );
+        }
+    }
+
+    #[test]
+    fn int8_model_tracks_its_dequantized_weights() {
+        let tokens: Vec<u32> = (0..40).map(|index| (index * 5 + 1) % 23).collect();
+        let int8 = LONG.int8_model();
+        let mut dequantized = LONG.int8_model();
+        dequantized.config.int8 = false;
+        for layer in &mut dequantized.layers {
+            for weight in [
+                &mut layer.q_proj,
+                &mut layer.k_proj,
+                &mut layer.v_proj,
+                &mut layer.o_proj,
+                &mut layer.gate_proj,
+                &mut layer.up_proj,
+                &mut layer.down_proj,
+            ] {
+                *weight = crate::q4::Weight::F32(std::mem::take(weight).into_f32());
+            }
+        }
+        let run = |model: Model| {
+            let mut session = Session::new(Arc::new(model), 0).unwrap();
+            session.prefill(&tokens[..10]).unwrap();
+            let mut logits = Vec::new();
+            for token in &tokens[10..] {
+                session.decode(*token).unwrap();
+                logits.push(session.last_logits().unwrap().to_vec());
+            }
+            logits
+        };
+        let (int8, reference) = (run(int8), run(dequantized));
+        for (step, (int8, reference)) in int8.iter().zip(&reference).enumerate() {
+            let peak = reference
+                .iter()
+                .fold(0.0_f32, |peak, value| peak.max(value.abs()));
+            for (actual, expected) in int8.iter().zip(reference) {
+                // 差别只来自激活的 INT8 量化（每块相对误差约 1/254）。
+                assert!(
+                    (actual - expected).abs() <= 0.03 * peak.max(1.0),
+                    "step {step}: {actual} != {expected}"
+                );
+            }
         }
     }
 

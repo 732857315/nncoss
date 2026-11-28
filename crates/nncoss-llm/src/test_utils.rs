@@ -135,6 +135,25 @@ impl TinySpec {
         model
     }
 
+    /// 7 个投影矩阵改为 INT8，嵌入与 LM Head 保持 f32（与 FLAG_INT8_WEIGHTS 的布局一致）。
+    pub fn int8_model(&self) -> Model {
+        let mut model = self.model();
+        model.config.int8 = true;
+        let config = model.config.clone();
+        let (hidden, q_dim, kv_dim) = (config.hidden_size, config.q_dim(), config.kv_dim());
+        let inner = config.intermediate_size;
+        for layer in &mut model.layers {
+            quantize_int8(&mut layer.q_proj, q_dim, hidden);
+            quantize_int8(&mut layer.k_proj, kv_dim, hidden);
+            quantize_int8(&mut layer.v_proj, kv_dim, hidden);
+            quantize_int8(&mut layer.o_proj, hidden, q_dim);
+            quantize_int8(&mut layer.gate_proj, inner, hidden);
+            quantize_int8(&mut layer.up_proj, inner, hidden);
+            quantize_int8(&mut layer.down_proj, hidden, inner);
+        }
+        model
+    }
+
     pub fn wide_variants() -> Vec<Self> {
         let mut variants = Vec::new();
         for tied in [false, true] {
@@ -160,6 +179,12 @@ fn quantize(weight: &mut Weight, rows: usize, columns: usize) {
     let values = std::mem::take(weight).into_f32();
     let bytes = encode(&values, rows, columns);
     *weight = Weight::Q4(Q4Matrix::new(rows, columns, bytes).unwrap());
+}
+
+fn quantize_int8(weight: &mut Weight, rows: usize, columns: usize) {
+    let values = std::mem::take(weight).into_f32();
+    let bytes = crate::q8::test_support::encode(&values, rows, columns);
+    *weight = Weight::Q8(crate::q8::Q8Matrix::new(rows, columns, bytes).unwrap());
 }
 
 pub(crate) fn tiny_model() -> Model {

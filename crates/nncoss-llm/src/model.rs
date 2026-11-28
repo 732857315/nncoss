@@ -1,6 +1,7 @@
 use std::sync::OnceLock;
 
 use crate::q4::{Weight, matrix_bytes as q4_matrix_bytes};
+use crate::q8::matrix_bytes as q8_matrix_bytes;
 use crate::sparse::ColumnWeights;
 use crate::{Error, MODEL_FORMAT_VERSION, Result};
 
@@ -10,7 +11,10 @@ const FLAG_TIED_EMBEDDINGS: u32 = 1;
 const FLAG_QKV_BIAS: u32 = 2;
 const FLAG_QK_NORM: u32 = 4;
 const FLAG_Q4_WEIGHTS: u32 = 8;
-const KNOWN_FLAGS: u32 = FLAG_TIED_EMBEDDINGS | FLAG_QKV_BIAS | FLAG_QK_NORM | FLAG_Q4_WEIGHTS;
+/// 7 个投影矩阵为 64 元素分块 INT8（见 q8.rs），嵌入、LM Head 与归一化仍为 f32。
+const FLAG_INT8_WEIGHTS: u32 = 32;
+const KNOWN_FLAGS: u32 =
+    FLAG_TIED_EMBEDDINGS | FLAG_QKV_BIAS | FLAG_QK_NORM | FLAG_Q4_WEIGHTS | FLAG_INT8_WEIGHTS;
 const HEADER_LENGTH: usize = 64;
 const VALUE_LENGTH: usize = 4;
 
@@ -50,6 +54,8 @@ pub struct Config {
     pub qkv_bias: bool,
     pub qk_norm: bool,
     pub quantized: bool,
+    /// 投影矩阵为 INT8；与 Q4（`quantized`）互斥。
+    pub int8: bool,
 }
 
 impl Config {
@@ -186,6 +192,9 @@ fn parse_header(bytes: &[u8]) -> Result<Config> {
     if flags & !KNOWN_FLAGS != 0 {
         return Err(Error::Unsupported("模型 flags"));
     }
+    if flags & FLAG_Q4_WEIGHTS != 0 && flags & FLAG_INT8_WEIGHTS != 0 {
+        return Err(Error::InvalidModel("Q4 与 INT8 权重不能同时使用"));
+    }
     let rope_mode = RopeMode::try_from(reader.read_u32()?)?;
     let norm_eps = reader.read_f32()?;
     let rope_theta = reader.read_f32()?;
@@ -205,6 +214,7 @@ fn parse_header(bytes: &[u8]) -> Result<Config> {
         qkv_bias: flags & FLAG_QKV_BIAS != 0,
         qk_norm: flags & FLAG_QK_NORM != 0,
         quantized: flags & FLAG_Q4_WEIGHTS != 0,
+        int8: flags & FLAG_INT8_WEIGHTS != 0,
     };
     config.validate()?;
     Ok(config)
@@ -273,10 +283,20 @@ impl Slot {
         )
     }
 
+    fn is_projection(self) -> bool {
+        self.is_matrix() && !matches!(self, Self::TokenEmbedding | Self::LmHead)
+    }
+
+    fn is_int8(self, config: &Config) -> bool {
+        config.int8 && self.is_projection()
+    }
+
     fn byte_count(self, config: &Config) -> Result<usize> {
         let (rows, columns) = self.shape(config);
         if config.quantized && self.is_matrix() {
             q4_matrix_bytes(rows, columns).ok_or(Error::InvalidModel("Q4 张量尺寸溢出"))
+        } else if self.is_int8(config) {
+            q8_matrix_bytes(rows, columns).ok_or(Error::InvalidModel("INT8 张量尺寸溢出"))
         } else {
             self.value_count(config)?
                 .checked_mul(VALUE_LENGTH)
@@ -347,7 +367,10 @@ pub struct TensorLayout {
     pub byte_count: usize,
     pub rows: usize,
     pub columns: usize,
+    /// Q4 张量。
     pub quantized: bool,
+    /// INT8 张量。
+    pub int8: bool,
 }
 
 pub fn tensor_layout(bytes: &[u8]) -> Result<(Config, Vec<TensorLayout>)> {
@@ -374,6 +397,7 @@ pub fn tensor_layout(bytes: &[u8]) -> Result<(Config, Vec<TensorLayout>)> {
             rows,
             columns,
             quantized: config.quantized && current.is_matrix(),
+            int8: current.is_int8(&config),
         });
         offset = offset
             .checked_add(byte_count)
@@ -393,6 +417,7 @@ struct Tensor {
     rows: usize,
     columns: usize,
     quantized: bool,
+    int8: bool,
     values: Vec<u8>,
 }
 
@@ -416,6 +441,7 @@ impl Tensor {
             rows,
             columns,
             quantized: config.quantized && slot.is_matrix(),
+            int8: slot.is_int8(config),
             values,
         })
     }
@@ -432,6 +458,10 @@ impl Tensor {
         if self.quantized && self.rows * self.columns != 0 {
             let matrix = crate::q4::Q4Matrix::new(self.rows, self.columns, self.values)?;
             return Ok(Weight::Q4(matrix));
+        }
+        if self.int8 && self.rows * self.columns != 0 {
+            let matrix = crate::q8::Q8Matrix::new(self.rows, self.columns, self.values)?;
+            return Ok(Weight::Q8(matrix));
         }
         let mut values = Vec::with_capacity(self.byte_count / VALUE_LENGTH);
         for chunk in self.values.chunks_exact(VALUE_LENGTH) {
@@ -836,6 +866,98 @@ mod tests {
     }
 
     const TRUNCATED: Error = Error::InvalidModel("模型数据被截断");
+
+    const PROJECTIONS: [&str; 7] = [
+        "q_proj",
+        "k_proj",
+        "v_proj",
+        "o_proj",
+        "gate_proj",
+        "up_proj",
+        "down_proj",
+    ];
+
+    /// 把 f32 夹具的 7 个投影矩阵改写成 INT8 布局，其余张量原样保留。
+    fn int8_bytes(spec: &crate::test_utils::TinySpec) -> Vec<u8> {
+        let bytes = spec.bytes();
+        let (_, tensors) = tensor_layout(&bytes).unwrap();
+        let mut output = bytes[..HEADER_LENGTH].to_vec();
+        let flags = u32::from_le_bytes(output[48..52].try_into().unwrap()) | FLAG_INT8_WEIGHTS;
+        output[48..52].copy_from_slice(&flags.to_le_bytes());
+        for tensor in &tensors {
+            let data = &bytes[tensor.offset..tensor.offset + tensor.byte_count];
+            if PROJECTIONS.contains(&tensor.kind) {
+                let values: Vec<f32> = data
+                    .chunks_exact(4)
+                    .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
+                    .collect();
+                output.extend(crate::q8::test_support::encode(
+                    &values,
+                    tensor.rows,
+                    tensor.columns,
+                ));
+            } else {
+                output.extend_from_slice(data);
+            }
+        }
+        output
+    }
+
+    #[test]
+    fn int8_models_load_in_any_chunking_and_mark_only_projections() {
+        use crate::test_utils::TinySpec;
+        for spec in TinySpec::wide_variants() {
+            let bytes = int8_bytes(&spec);
+            let (config, tensors) = tensor_layout(&bytes).unwrap();
+            assert!(config.int8 && !config.quantized);
+            for tensor in &tensors {
+                assert_eq!(
+                    tensor.int8,
+                    PROJECTIONS.contains(&tensor.kind),
+                    "{}",
+                    tensor.kind
+                );
+                assert!(!tensor.quantized);
+            }
+            let last = tensors.last().unwrap();
+            assert_eq!(last.offset + last.byte_count, bytes.len());
+            let expected = spec.int8_model();
+            for chunk in [1, 3, 4, 64, 1000, bytes.len()] {
+                let model = load_chunked(&bytes, bytes.len(), chunk).unwrap();
+                assert_eq!(model.config, expected.config);
+                for (layer, reference) in model.layers.iter().zip(&expected.layers) {
+                    for (weight, reference) in [
+                        (&layer.q_proj, &reference.q_proj),
+                        (&layer.down_proj, &reference.down_proj),
+                        (&layer.gate_proj, &reference.gate_proj),
+                    ] {
+                        assert!(matches!(weight, Weight::Q8(_)));
+                        let bits = |weight: &Weight| {
+                            weight
+                                .clone()
+                                .into_f32()
+                                .iter()
+                                .map(|v| v.to_bits())
+                                .collect::<Vec<_>>()
+                        };
+                        assert_eq!(bits(weight), bits(reference));
+                    }
+                }
+                assert!(matches!(model.token_embedding, Weight::F32(_)));
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_q4_and_int8_flags_together() {
+        let mut bytes = int8_bytes(&crate::test_utils::TinySpec::WIDE);
+        let flags = u32::from_le_bytes(bytes[48..52].try_into().unwrap()) | FLAG_Q4_WEIGHTS;
+        bytes[48..52].copy_from_slice(&flags.to_le_bytes());
+        assert_eq!(
+            Model::from_bytes(&bytes).unwrap_err(),
+            Error::InvalidModel("Q4 与 INT8 权重不能同时使用")
+        );
+    }
 
     fn weight_bytes(model: &Model) -> Vec<u8> {
         let mut tensors: Vec<Vec<f32>> = vec![model.token_embedding.clone().into_f32()];

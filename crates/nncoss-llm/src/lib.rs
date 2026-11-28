@@ -8,6 +8,7 @@ mod model;
 mod ops;
 mod pool;
 mod q4;
+mod q8;
 mod sampler;
 mod session;
 mod sparse;

@@ -393,7 +393,7 @@ console.log("识别结果：", logits.argmax());
 | 能力 | 当前实现 |
 |------|----------|
 | 模型结构 | 单 batch decoder-only；RMSNorm、RoPE、GQA、SwiGLU；可选 QKV bias、QK norm；绑定或独立 LM Head |
-| 数值与算子 | f32 行主序矩阵乘按 16 通道分组求和，x86_64 AVX2 与标量路径逐位一致，同一行权重对批内多个 token 复用并预取下一行；稳定 softmax 与 SiLU；可选 Q4 权重与按组 int8 激活的整数点积；x86_64 AVX2 内核与原生线程池，与标量路径逐位一致；RoPE 与指数函数使用不依赖平台 libm 的实现 |
+| 数值与算子 | f32 行主序矩阵乘按 16 通道分组求和，x86_64 AVX2 与标量路径逐位一致，同一行权重对批内多个 token 复用并预取下一行；稳定 softmax 与 SiLU；可选 Q4 权重或 64 元素分块 INT8 权重，与按组 int8 激活做整数点积；x86_64 AVX2 内核与原生线程池，与标量路径逐位一致；RoPE 与指数函数使用不依赖平台 libm 的实现 |
 | 会话 | 多 token prefill、单 token decode、KV Cache 几何增长与容量复用、reset、EOS 停止 |
 | 采样 | 贪心、temperature、top-k、top-p；可复现的 SplitMix64 随机序列 |
 | 调用接口 | Rust API 与版本为 1 的 WASM／原生 C ABI；模型可整块从内存加载，或按声明的总长度分块流式加载；会话独立持有权重生命周期 |
@@ -401,15 +401,15 @@ console.log("识别结果：", logits.argmax());
 
 CI 验收覆盖仓库生成的 tiny decoder 和 6 个 Hugging Face 合成小模型。Qwen3-0.6B 的 f32 导出另在本地完成了短序列的原生／WASM／Hugging Face 对拍，见[分块加载与真实模型本地对拍](#分块加载与真实模型本地对拍)；该结果不属于 CI 门禁，也不代表该模型已通过长上下文、Tokenizer 或性能验收。Qwen3-1.7B 与 MNN-Pocket-0.3B 另有本地测评或对比结果（见[决策记录](docs/decisions.md)），同样未纳入 CI；其他公开尺寸的 Llama 或 Qwen 模型尚未验证。架构兼容与模型支持必须分别验证。
 
-### ncnn 后端与优化边界
+### 原生实现与对照基准
 
-- **默认复用通用能力**：嵌入、矩阵乘、归一化、注意力和 KV Cache 优先使用 ncnn 已支持的 WASM 实现，不再为部署后端重复编写通用算子。Rust 侧负责版本化 ABI、模型与会话管理；如需额外 C/C++ 桥接，由人类按仓库约定维护。
-- **保留参考后端**：当前 Rust 标量路径作为数值参考和最小验收工具，不作为高性能部署承诺。ncnn 后端接入后，需在同一模型与输入上与参考后端逐层或分阶段对拍。
-- **分离构建能力**：ncnn 的基础、WASM SIMD 与多线程构建分别声明和验收，不能把某一构建的结果外推到全部浏览器。
-- **按热点优化**：先分别测量 prefill 延迟、decode ms/token、tokens/s、峰值内存和模块体积，再针对表现不达标的 GEMM、注意力、KV Cache 或采样路径增加自定义 WASM kernel；通用路径不因预设判断而重写。
-- **优化必须可验收**：自定义 kernel 需保留回退路径，并通过标量参考对拍和同输入基准；至少报告相对 ncnn 基线的延迟、吞吐与内存变化。
+- **原生实现**：常见量化格式与训练、推理、实时进化、传统 CNN 等能力都在本项目中原生实现，不把 ncnn 等外部框架作为默认计算后端。实现方式不设限制，以结果为准。
+- **外部框架作为对照**：ncnn、ncnn_llm、ncnn-MoE-Runtime 与 llama.cpp 用作参考和速度基线，比较时尽量运行同一模型、同一输入与同一线程数；llm.asm、unkernel 只参考代码与优化方法（unkernel 用于 WASM），不做性能比较。
+- **分离构建能力**：原生 SIMD、WASM 标量、WASM SIMD 与多线程分别声明和验收，不能把某一构建的结果外推到全部目标。
+- **按热点优化**：先分别测量 prefill 延迟、decode ms/token、tokens/s、峰值内存和模块体积，再针对不达标的 GEMM、注意力、KV Cache 或采样路径优化。
+- **优化必须可验收**：自定义 kernel 保留标量回退路径，与标量参考逐位或在声明的容差内对拍，并用同输入基准报告延迟、吞吐与内存变化。
 
-当前尚未完成 ncnn 后端接入和性能基准，因此本节为实施边界，不是已有性能结果。
+本机的对照结果记录在[决策记录](docs/decisions.md)。
 
 ### 构建与验收
 
@@ -554,6 +554,14 @@ python3 tools/distill_q4_llm.py --model model/Qwen3-0.6B --input tmp/qwen3-0.6b-
 | 最小二乘，无校准 | 0.801 | 0.215 | 1.091 |
 | GPTQ | 0.849 | 0.137 | 1.066 |
 | GPTQ + 蒸馏（当前） | 0.859 | 0.111 | 1.020 |
+
+### INT8 分块权重
+
+模型 flags 的第 5 位（值 32）表示 INT8 权重：7 个投影矩阵（q、k、v、o、gate、up、down）按每 64 个元素一块量化，嵌入、LM Head、Norm 与 bias 仍为 f32。这与 ncnn 的 weight block quant（8 bit、block_size 64）是同一种量化，可以把 ncnn 模型原样转换过来比较（见[模型说明](docs/models.md)）。每个矩阵依次保存两段数据：`rows × blocks` 个 f32 还原系数，`rows × blocks × 64` 个 int8 码（每行补零到整块）；还原值为 `码 × 还原系数`，码限制在 [-127, 127]。INT8 与 Q4（第 4 位）不能同时使用。
+
+推理时线性层的输入按同样的 64 个元素一块量化为 int8（还原系数为块内 absmax / 127，码四舍五入远离零，与 ncnn 相同）。x86_64 检测到 AVX2 时用 `vpsignb`／`vpmaddubsw`／`vpmaddwd` 计算 int8 × int8 点积，外层每组最多 4 个 token、内层逐行，每行权重读一次供这组 token 共用，并预取后续的权重行；标量路径按相同的 8 条 lane 与求和顺序计算，与 AVX2 路径逐位一致，WASM 使用标量路径。INT8 模型的 KV Cache 默认为 f16。
+
+当前只有 `tools/ncnn_int8_to_nncoss.py` 从 ncnn_llm 的 INT8 Qwen3 模型转换，`export_llm.py` 还不能直接导出 INT8；`nncoss-edit` 拒绝 INT8 模型；WASM 的 INT8 路径能运行，但尚未做 SIMD 优化，也未纳入原生／WASM 对拍。
 
 ### 命令行对话（原生与 WASM）
 

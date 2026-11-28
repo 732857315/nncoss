@@ -241,6 +241,8 @@ impl Q8Matrix {
         let codes = self.row_codes(row).as_ptr().cast::<__m256i>();
         let inputs: [*const __m256i; TOKENS] =
             std::array::from_fn(|token| activations[token].int8.chunks.as_ptr().cast());
+        let magnitudes: [*const __m256i; TOKENS] =
+            std::array::from_fn(|token| activations[token].int8.magnitudes.as_ptr().cast());
         let descales: [*const f32; TOKENS] =
             std::array::from_fn(|token| activations[token].int8.descales.as_ptr());
         let ones = _mm256_set1_epi16(1);
@@ -254,10 +256,11 @@ impl Q8Matrix {
                 for token in 0..TOKENS {
                     let mut sums = _mm256_setzero_si256();
                     for (chunk, weight) in weights.iter().enumerate() {
-                        let input = _mm256_load_si256(inputs[token].add(block * CHUNKS + chunk));
+                        let offset = block * CHUNKS + chunk;
+                        let input = _mm256_load_si256(inputs[token].add(offset));
                         // |a| × (w 带上 a 的符号) = a × w；|a|、|w| ≤ 127，相邻两项之和不会使 i16 饱和。
                         let products = _mm256_maddubs_epi16(
-                            _mm256_sign_epi8(input, input),
+                            _mm256_load_si256(magnitudes[token].add(offset)),
                             _mm256_sign_epi8(*weight, input),
                         );
                         sums = _mm256_add_epi32(sums, _mm256_madd_epi16(products, ones));
@@ -299,6 +302,9 @@ fn finish_row(sum: f32, bias: Option<&[f32]>, row: usize) -> f32 {
 pub(crate) struct Activation8 {
     block: usize,
     chunks: Vec<Chunk>,
+    /// 每个码的绝对值（码在 ±127 内，不会溢出）。AVX2 内核直接拿它做 vpmaddubsw 的无符号操作数，
+    /// 不必对每一行权重重新算一遍。
+    magnitudes: Vec<Chunk>,
     descales: Vec<f32>,
 }
 
@@ -310,15 +316,31 @@ impl Activation8 {
     pub fn quantize(&mut self, input: &[f32], block: usize) {
         assert!(supported_block(block));
         let blocks = blocks(input.len(), block);
+        let chunks = blocks * block / CHUNK;
         self.block = block;
         self.chunks.clear();
-        self.chunks
-            .resize(blocks * block / CHUNK, Chunk([0; CHUNK]));
+        self.chunks.resize(chunks, Chunk([0; CHUNK]));
+        self.magnitudes.clear();
+        self.magnitudes.resize(chunks, Chunk([0; CHUNK]));
         self.descales.clear();
         self.descales.resize(blocks, 0.0);
-        for index in 0..blocks {
-            let end = ((index + 1) * block).min(input.len());
-            self.quantize_block(index, &input[index * block..end]);
+        let full = input.len() / block;
+        #[cfg(target_arch = "x86_64")]
+        let vectorized = std::arch::is_x86_feature_detected!("avx2");
+        #[cfg(not(target_arch = "x86_64"))]
+        let vectorized = false;
+        if vectorized {
+            #[cfg(target_arch = "x86_64")]
+            unsafe {
+                self.quantize_blocks_avx2(&input[..full * block]);
+            }
+        } else {
+            for index in 0..full {
+                self.quantize_block(index, &input[index * block..(index + 1) * block]);
+            }
+        }
+        if full < blocks {
+            self.quantize_block(full, &input[full * block..]);
         }
     }
 
@@ -342,8 +364,78 @@ impl Activation8 {
         for (offset, value) in values.iter().enumerate() {
             let code = (value * scale).round().clamp(-127.0, 127.0) as i8;
             self.chunks[first + offset / CHUNK].0[offset % CHUNK] = code;
+            self.magnitudes[first + offset / CHUNK].0[offset % CHUNK] = code.abs();
         }
         self.descales[index] = peak / 127.0;
+    }
+
+    /// 与 quantize_block 逐位相同：乘法同为 f32，取整用截断加符号修正实现“四舍五入远离零”。
+    #[cfg(target_arch = "x86_64")]
+    #[target_feature(enable = "avx2")]
+    unsafe fn quantize_blocks_avx2(&mut self, input: &[f32]) {
+        use std::arch::x86_64::*;
+
+        let block = self.block;
+        let absolute = _mm256_castsi256_ps(_mm256_set1_epi32(0x7fff_ffff));
+        let sign = _mm256_castsi256_ps(_mm256_set1_epi32(i32::MIN));
+        let half = _mm256_set1_ps(0.5);
+        let one = _mm256_set1_ps(1.0);
+        let upper = _mm256_set1_ps(127.0);
+        let lower = _mm256_set1_ps(-127.0);
+        // packs 按 128 位分半交错，按 32 位重排回原顺序。
+        let natural = _mm256_setr_epi32(0, 4, 1, 5, 2, 6, 3, 7);
+        for index in 0..input.len() / block {
+            unsafe {
+                let source = input.as_ptr().add(index * block);
+                let mut peaks = _mm256_setzero_ps();
+                let mut invalid = _mm256_setzero_ps();
+                for vector in 0..block / 8 {
+                    let value = _mm256_loadu_ps(source.add(vector * 8));
+                    peaks = _mm256_max_ps(peaks, _mm256_and_ps(value, absolute));
+                    // 有限值相减得 +0，无穷大与 NaN 得 NaN。
+                    invalid = _mm256_or_ps(invalid, _mm256_sub_ps(value, value));
+                }
+                let invalid = _mm256_castps_si256(invalid);
+                if _mm256_testz_si256(invalid, invalid) == 0 {
+                    *self.descales.get_unchecked_mut(index) = f32::NAN;
+                    continue;
+                }
+                let mut stored = [0.0_f32; 8];
+                _mm256_storeu_ps(stored.as_mut_ptr(), peaks);
+                let peak = stored.into_iter().fold(0.0_f32, f32::max);
+                if peak < MIN_PEAK {
+                    continue;
+                }
+                let scale = _mm256_set1_ps(127.0 / peak);
+                let first = index * block / CHUNK;
+                for chunk in 0..block / CHUNK {
+                    let integers: [__m256i; 4] = std::array::from_fn(|part| {
+                        let value = _mm256_mul_ps(
+                            _mm256_loadu_ps(source.add(chunk * CHUNK + part * 8)),
+                            scale,
+                        );
+                        let truncated =
+                            _mm256_round_ps::<{ _MM_FROUND_TO_ZERO | _MM_FROUND_NO_EXC }>(value);
+                        let fraction = _mm256_and_ps(_mm256_sub_ps(value, truncated), absolute);
+                        let away = _mm256_and_ps(
+                            _mm256_cmp_ps::<_CMP_GE_OQ>(fraction, half),
+                            _mm256_or_ps(one, _mm256_and_ps(value, sign)),
+                        );
+                        let rounded = _mm256_add_ps(truncated, away);
+                        _mm256_cvtps_epi32(_mm256_max_ps(_mm256_min_ps(rounded, upper), lower))
+                    });
+                    let low = _mm256_packs_epi32(integers[0], integers[1]);
+                    let high = _mm256_packs_epi32(integers[2], integers[3]);
+                    let bytes = _mm256_permutevar8x32_epi32(_mm256_packs_epi16(low, high), natural);
+                    _mm256_store_si256(self.chunks.as_mut_ptr().add(first + chunk).cast(), bytes);
+                    _mm256_store_si256(
+                        self.magnitudes.as_mut_ptr().add(first + chunk).cast(),
+                        _mm256_abs_epi8(bytes),
+                    );
+                }
+                *self.descales.get_unchecked_mut(index) = peak / 127.0;
+            }
+        }
     }
 }
 
@@ -471,6 +563,57 @@ mod tests {
             assert_eq!(activation.chunks[0].0[1], (-scale).round() as i8);
             assert_eq!(activation.chunks[0].0[2], (0.01 * scale).round() as i8);
             assert_eq!(activation.descales[0], 2.54 / 127.0);
+        }
+    }
+
+    #[test]
+    fn vectorized_activation_matches_scalar_quantization() {
+        for block in BLOCKS {
+            for columns in [block, 70, 513, 1024, 3072] {
+                let mut input = pseudo_random(columns, 7 + columns as u64);
+                input[columns / 3] = 250.0;
+                input[0] = -0.0;
+                for (index, value) in input.iter_mut().enumerate().skip(5).step_by(97) {
+                    // 恰好落在 .5 上的值检验“远离零”的取整方向。
+                    *value = (index % 7) as f32 + 0.5;
+                }
+                let mut vectorized = Activation8::default();
+                vectorized.quantize(&input, block);
+                let count = blocks(columns, block);
+                let mut reference = Activation8 {
+                    block,
+                    chunks: vec![Chunk([0; CHUNK]); count * block / CHUNK],
+                    magnitudes: vec![Chunk([0; CHUNK]); count * block / CHUNK],
+                    descales: vec![0.0; count],
+                };
+                for index in 0..count {
+                    let end = ((index + 1) * block).min(columns);
+                    reference.quantize_block(index, &input[index * block..end]);
+                }
+                assert_eq!(
+                    vectorized.chunks, reference.chunks,
+                    "block={block} columns={columns}"
+                );
+                assert_eq!(vectorized.magnitudes, reference.magnitudes);
+                assert_eq!(
+                    vectorized
+                        .descales
+                        .iter()
+                        .map(|v| v.to_bits())
+                        .collect::<Vec<_>>(),
+                    reference
+                        .descales
+                        .iter()
+                        .map(|v| v.to_bits())
+                        .collect::<Vec<_>>()
+                );
+            }
+            let mut invalid = vec![1.0_f32; block * 2];
+            invalid[3] = f32::INFINITY;
+            invalid[block + 1] = f32::NAN;
+            let mut activation = Activation8::default();
+            activation.quantize(&invalid, block);
+            assert!(activation.descales.iter().all(|v| v.is_nan()));
         }
     }
 

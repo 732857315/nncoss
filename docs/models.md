@@ -8,9 +8,9 @@
 
 | 仓库 | 内容 |
 |---|---|
-| [w732857315/nncoss-qwen3-0.6b](https://huggingface.co/w732857315/nncoss-qwen3-0.6b) | Qwen3-0.6B 校准蒸馏 Q4、4 个不推荐的权重改写实验模型，以及 `school-r1/` 下与独立 school 仓库重复的存档副本 |
+| [w732857315/nncoss-qwen3-0.6b](https://huggingface.co/w732857315/nncoss-qwen3-0.6b) | Qwen3-0.6B 校准蒸馏 Q4、同权重速度对比用的 Q8_0 与 INT8 模型及其 Q8_0 GGUF、4 个不推荐的权重改写实验模型，以及 `school-r1/` 下与独立 school 仓库重复的存档副本 |
 | [w732857315/nncoss-qwen3-1.7b](https://huggingface.co/w732857315/nncoss-qwen3-1.7b) | Qwen3-1.7B 未校准最小二乘 Q4 |
-| [w732857315/nncoss-mnn-pocket-0.3b](https://huggingface.co/w732857315/nncoss-mnn-pocket-0.3b) | MNN-Pocket-0.3B 的 nncoss Q4 与由官方 QAT Q4_1 精确还原的 f32 |
+| [w732857315/nncoss-mnn-pocket-0.3b](https://huggingface.co/w732857315/nncoss-mnn-pocket-0.3b) | MNN-Pocket-0.3B 的 nncoss Q4、由官方 QAT Q4_1 精确还原的 f32，以及由官方 Q8_0 GGUF 原样转换的 INT8 |
 | [w732857315/nncoss-Qwen3-0.6B-school](https://huggingface.co/w732857315/nncoss-Qwen3-0.6B-school) | school-r1 的 nncoss Q4、f32 safetensors、配置、分词器与模型卡 |
 | [w732857315/nncoss-qwen3-0.6b-school-r1-data](https://huggingface.co/datasets/w732857315/nncoss-qwen3-0.6b-school-r1-data) | 891 条实际训练样本、575 条原始保留轨迹，以及 1,161／427 条训练／留出题库 |
 
@@ -31,8 +31,18 @@ cargo build -p nncoss-llm --release --target wasm32-unknown-unknown
 python3 -c "from huggingface_hub import snapshot_download; snapshot_download('w732857315/nncoss-qwen3-0.6b', local_dir='model/Qwen3-0.6B', allow_patterns=['LICENSE', 'tokenizer.json', 'tokenizer_config.json', 'qwen3-0.6b-q4.nncossllm'])"
 python3 -c "from huggingface_hub import snapshot_download; snapshot_download('w732857315/nncoss-Qwen3-0.6B-school', local_dir='model/Qwen3-0.6B-school-r1', allow_patterns=['LICENSE', '*.json', '*q4.nncossllm'])"
 python3 -c "from huggingface_hub import snapshot_download; snapshot_download('w732857315/nncoss-qwen3-1.7b', local_dir='model/Qwen3-1.7B', allow_patterns=['LICENSE', 'tokenizer.json', 'tokenizer_config.json', 'qwen3-1.7b-q4-ls.nncossllm'])"
-python3 -c "from huggingface_hub import snapshot_download; snapshot_download('w732857315/nncoss-mnn-pocket-0.3b', local_dir='model/MNN-Pocket-0.3B-qat', allow_patterns=['LICENSE', 'tokenizer.json', 'tokenizer_config.json', 'chat_template.jinja', '*.nncossllm'])"
+python3 -c "from huggingface_hub import snapshot_download; snapshot_download('w732857315/nncoss-mnn-pocket-0.3b', local_dir='model/MNN-Pocket-0.3B-qat', allow_patterns=['LICENSE', 'tokenizer.json', 'tokenizer_config.json', 'chat_template.jinja', 'mnn-pocket-0.3b-qat-*.nncossllm'])"
 ```
+
+下载与其他推理框架同权重比较速度所用的文件（见[速度对比](benchmarks.md)），存放位置与下文 [Q8_0 模型](#q8_0-模型与-llamacppncnn-moe-runtime-同一份权重对比用)、[Qwen3-0.6B INT8](#qwen3-06b-int8与-ncnn_llm-同一模型对比用) 两节一致：
+
+```bash
+python3 -c "from huggingface_hub import snapshot_download; snapshot_download('w732857315/nncoss-qwen3-0.6b', local_dir='model/Qwen3-0.6B-GGUF', allow_patterns=['qwen3-0.6b-q8_0.nncossllm', 'qwen3-0.6b-q8_0.gguf'])"
+python3 -c "from huggingface_hub import snapshot_download; snapshot_download('w732857315/nncoss-qwen3-0.6b', local_dir='model/Qwen3-0.6B-ncnn-int8', allow_patterns=['qwen3-0.6b-ncnn-int8.nncossllm'])"
+python3 -c "from huggingface_hub import snapshot_download; snapshot_download('w732857315/nncoss-mnn-pocket-0.3b', local_dir='model/MNN-Pocket-0.3B-GGUF', allow_patterns=['mnn-pocket-0.3b-q8_0.nncossllm'])"
+```
+
+其中三个 `.nncossllm` 文件使用 INT8 权重，nncoss 从 `main` 分支的提交 `a57947d` 起支持；分词器与上一组命令下载到 `model/Qwen3-0.6B`、`model/MNN-Pocket-0.3B-qat` 的相同。
 
 运行 school-r1 Q4；把 `--target native` 改成 `--target wasm` 即使用已构建的 WASM 产物：
 

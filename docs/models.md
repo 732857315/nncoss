@@ -13,6 +13,8 @@
 | [w732857315/nncoss-mnn-pocket-0.3b](https://huggingface.co/w732857315/nncoss-mnn-pocket-0.3b) | MNN-Pocket-0.3B 的 nncoss Q4、由官方 QAT Q4_1 精确还原的 f32，以及由官方 Q8_0 GGUF 原样转换的 INT8 |
 | [w732857315/nncoss-Qwen3-0.6B-school](https://huggingface.co/w732857315/nncoss-Qwen3-0.6B-school) | school-r1 的 nncoss Q4、f32 safetensors、配置、分词器与模型卡 |
 | [w732857315/nncoss-qwen3-0.6b-school-r1-data](https://huggingface.co/datasets/w732857315/nncoss-qwen3-0.6b-school-r1-data) | 891 条实际训练样本、575 条原始保留轨迹，以及 1,161／427 条训练／留出题库 |
+| [w732857315/nncoss](https://huggingface.co/datasets/w732857315/nncoss)（数据集） | [速度对比](benchmarks.md)的 44 次运行结果（`results.csv`）、各框架基准程序的原始输出与所用提示 |
+| [w732857315/nncoss](https://huggingface.co/w732857315/nncoss)（模型仓库） | 不含权重，只汇总以上模型与数据集的链接 |
 
 以下公开文件来自本文记录的本地实验，未纳入 CI 模型验收；文件大小和 SHA-256 用于核对，不代表相应模型已经通过所有平台与任务测试。
 

@@ -559,7 +559,7 @@ python3 tools/distill_q4_llm.py --model model/Qwen3-0.6B --input tmp/qwen3-0.6b-
 
 模型 flags 的第 5 位（值 32）表示 INT8 权重：7 个投影矩阵（q、k、v、o、gate、up、down）按块量化，每块一个 f32 还原系数，码限制在 [-127, 127]，还原值为 `码 × 还原系数`。默认每 64 个元素一块，与 ncnn 的 weight block quant（8 bit、block_size 64）相同；第 6 位（值 64）把块长改为 32，与 GGUF 的 Q8_0 相同（Q8_0 的 f16 系数无损展开成 f32）；第 7 位（值 128）让嵌入与 LM Head 也用同样的 INT8 分块，否则它们与 Norm、bias 一样为 f32。第 6、7 位只能与第 5 位一起使用，INT8 与 Q4（第 4 位）不能同时使用。每个 INT8 矩阵依次保存两段数据：`rows × blocks` 个 f32 还原系数，`rows × blocks × 块长` 个 int8 码（每行补零到整块）。
 
-推理时线性层的输入按同样的块长量化为 int8（还原系数为块内 absmax / 127，码四舍五入远离零，与 ncnn 和 llama.cpp 相同）。x86_64 检测到 AVX2 时用 `vpsignb`／`vpmaddubsw`／`vpmaddwd` 计算 int8 × int8 点积，外层每组最多 4 个 token、内层逐行，每行权重读一次供这组 token 共用，并预取后续的权重行；标量路径按相同的 8 条 lane 与求和顺序计算，与 AVX2 路径逐位一致，WASM 使用标量路径。INT8 模型的 KV Cache 默认为 f16。
+推理时线性层的输入按同样的块长量化为 int8（还原系数为块内 absmax / 127，码四舍五入远离零，与 ncnn 和 llama.cpp 相同；x86_64 用 AVX2 量化，与标量逐位一致）。载入时 INT8 矩阵改排成面板：每 8 行一组，按列每 4 个一步，一步 32 字节。x86_64 检测到 AVX2 时，每步读一次权重，供最多 4 个 token 共用，每个 token 把 4 个激活码广播到 8 行，用 `vpsignb`／`vpmaddubsw`／`vpmaddwd` 求整数点积，8 个 lane 分别累加 8 行；块末每行乘以 `权重系数 × 激活系数` 后累加。每块的整数点积是精确的，标量路径（包括 WASM）按同样的块顺序累加，与 AVX2 路径逐位一致，也与分组和 token 分块无关。INT8 模型的 KV Cache 默认为 f16。
 
 模型可从两处原样转换（见[模型说明](docs/models.md)）：`tools/ncnn_int8_to_nncoss.py` 读取 ncnn_llm 的 INT8 Qwen3 模型（块长 64），`tools/gguf_to_nncoss.py` 读取 Qwen3 结构的 GGUF（Q8_0 写成块长 32 的 INT8，F32／F16／BF16 写成 f32，嵌入与输出层字节相同时写成共用 LM Head）。`export_llm.py` 还不能直接导出 INT8；`nncoss-edit` 拒绝 INT8 模型；WASM 的 INT8 路径能运行，但尚未做 SIMD 优化，也未纳入原生／WASM 对拍。
 

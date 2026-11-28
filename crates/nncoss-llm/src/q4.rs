@@ -571,9 +571,11 @@ pub(crate) fn linear_many(inputs: &[f32], activations: &mut [Activation], jobs: 
         }
     }
     let total_rows: usize = jobs.iter().map(|job| job.output.len() / tokens).sum();
+    // 8 的倍数：INT8 矩阵按 8 行一组计算，任务从组的边界开始；其他格式逐行计算，不受影响。
     let chunk = total_rows
         .div_ceil(crate::pool::threads() * CHUNKS_PER_THREAD)
-        .max(1);
+        .max(1)
+        .next_multiple_of(8);
     let mut plans: [Option<Plan<'_>>; MAX_JOBS] = [None, None, None];
     let mut tasks = 0;
     let mut weights = 0_usize;

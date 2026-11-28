@@ -11,7 +11,6 @@ use crate::{Error, Result};
 /// 一个 AVX2 寄存器的字节数；每块由 1 个（32 元素）或 2 个（64 元素）这样的分段组成。
 const CHUNK: usize = 32;
 const SCALE_BYTES: usize = 4;
-const LANES: usize = 8;
 const MIN_PEAK: f32 = 1.0e-30;
 #[cfg(target_arch = "x86_64")]
 const PREFETCH_BYTES: usize = 4096;
@@ -32,16 +31,27 @@ pub(crate) fn matrix_bytes(rows: usize, columns: usize, block: usize) -> Option<
         .checked_mul(rows)
 }
 
+/// 每 8 行交错成一个面板，按 k 每 4 个一步：一步 32 字节 = 8 行 × 4 个码。AVX2 内核一次读一步，
+/// 8 个 lane 分别累加 8 行，块末的缩放与累加也一次处理 8 行。
+const PANEL_ROWS: usize = 8;
+const STEP: usize = 4;
+
 #[derive(Debug, Clone)]
 pub(crate) struct Q8Matrix {
     pub rows: usize,
     pub columns: usize,
     block: usize,
     blocks: usize,
-    bytes: Vec<u8>,
+    /// 每行按块补齐后的列数（blocks × block）。
+    width: usize,
+    /// groups × (width / 4) 步，每步 32 字节；补齐的行与列为零。
+    panels: Vec<i8>,
+    /// groups × blocks × 8 个还原系数；补齐的行为零。
+    descales: Vec<f32>,
 }
 
 impl Q8Matrix {
+    /// `bytes` 为文件中的行主序布局（见 matrix_bytes），载入时改排成面板。
     pub fn new(rows: usize, columns: usize, block: usize, bytes: Vec<u8>) -> Result<Self> {
         if !supported_block(block) {
             return Err(Error::Unsupported("INT8 块长"));
@@ -51,79 +61,95 @@ impl Q8Matrix {
         if bytes.len() != expected {
             return Err(Error::InvalidModel("INT8 张量尺寸不匹配"));
         }
-        let matrix = Self {
-            rows,
-            columns,
-            block,
-            blocks: blocks(columns, block),
-            bytes,
-        };
-        for index in 0..rows * matrix.blocks {
-            if !matrix.descale_at(index).is_finite() {
-                return Err(Error::InvalidModel("INT8 还原系数无效"));
-            }
-        }
+        let blocks = blocks(columns, block);
+        let width = blocks * block;
+        let scales = &bytes[..rows * blocks * SCALE_BYTES];
+        let codes = &bytes[rows * blocks * SCALE_BYTES..];
         // -128 会让符号技巧的点积溢出；ncnn 与 llama.cpp 的量化也只产生 [-127, 127]。
-        if matrix.codes().contains(&0x80) {
+        if codes.contains(&0x80) {
             return Err(Error::InvalidModel("INT8 权重码超出 [-127, 127]"));
         }
         for row in 0..rows {
-            if matrix.row_codes(row)[columns..]
+            if codes[row * width + columns..(row + 1) * width]
                 .iter()
                 .any(|code| *code != 0)
             {
                 return Err(Error::InvalidModel("INT8 行末补齐必须为零"));
             }
         }
-        Ok(matrix)
+        let groups = rows.div_ceil(PANEL_ROWS);
+        let steps = width / STEP;
+        let mut panels = Vec::new();
+        panels
+            .try_reserve_exact(groups * steps * PANEL_ROWS * STEP)
+            .map_err(|_| Error::Allocation)?;
+        panels.resize(groups * steps * PANEL_ROWS * STEP, 0_i8);
+        let mut descales = vec![0.0_f32; groups * blocks * PANEL_ROWS];
+        for row in 0..rows {
+            let (group, lane) = (row / PANEL_ROWS, row % PANEL_ROWS);
+            for index in 0..blocks {
+                let offset = (row * blocks + index) * SCALE_BYTES;
+                let descale = f32::from_le_bytes(
+                    scales[offset..offset + SCALE_BYTES]
+                        .try_into()
+                        .expect("validated INT8 descale"),
+                );
+                if !descale.is_finite() {
+                    return Err(Error::InvalidModel("INT8 还原系数无效"));
+                }
+                descales[(group * blocks + index) * PANEL_ROWS + lane] = descale;
+            }
+            let source = &codes[row * width..(row + 1) * width];
+            for step in 0..steps {
+                let target = ((group * steps + step) * PANEL_ROWS + lane) * STEP;
+                for slot in 0..STEP {
+                    panels[target + slot] = source[step * STEP + slot] as i8;
+                }
+            }
+        }
+        Ok(Self {
+            rows,
+            columns,
+            block,
+            blocks,
+            width,
+            panels,
+            descales,
+        })
     }
 
     pub(crate) fn block(&self) -> usize {
         self.block
     }
 
-    fn descale_at(&self, index: usize) -> f32 {
-        let offset = index * SCALE_BYTES;
-        f32::from_le_bytes(
-            self.bytes[offset..offset + SCALE_BYTES]
-                .try_into()
-                .expect("validated INT8 descale"),
-        )
-    }
-
     pub(crate) fn descale(&self, row: usize, block: usize) -> f32 {
-        self.descale_at(row * self.blocks + block)
+        self.descales[((row / PANEL_ROWS) * self.blocks + block) * PANEL_ROWS + row % PANEL_ROWS]
     }
 
-    fn codes(&self) -> &[u8] {
-        &self.bytes[self.rows * self.blocks * SCALE_BYTES..]
-    }
-
-    pub(crate) fn row_codes(&self, row: usize) -> &[i8] {
-        let width = self.blocks * self.block;
-        let bytes = &self.codes()[row * width..(row + 1) * width];
-        // u8 与 i8 的大小和对齐相同。
-        unsafe { std::slice::from_raw_parts(bytes.as_ptr().cast::<i8>(), bytes.len()) }
+    /// 第 `row` 行第 `step` 步的 4 个码。
+    fn step_codes(&self, row: usize, step: usize) -> &[i8] {
+        let steps = self.width / STEP;
+        let start = (((row / PANEL_ROWS) * steps + step) * PANEL_ROWS + row % PANEL_ROWS) * STEP;
+        &self.panels[start..start + STEP]
     }
 
     /// 每一块都是还原系数为零或码全为零时，整个矩阵的还原值都是零。
     pub(crate) fn is_zero(&self) -> bool {
+        let per_block = self.block / STEP;
         (0..self.rows).all(|row| {
-            let codes = self.row_codes(row);
-            (0..self.blocks).all(|block| {
-                self.descale(row, block) == 0.0
-                    || codes[block * self.block..(block + 1) * self.block]
-                        .iter()
-                        .all(|code| *code == 0)
+            (0..self.blocks).all(|index| {
+                self.descale(row, index) == 0.0
+                    || (index * per_block..(index + 1) * per_block)
+                        .all(|step| self.step_codes(row, step).iter().all(|code| *code == 0))
             })
         })
     }
 
     pub fn dequantize_row(&self, row: usize, output: &mut [f32]) {
         debug_assert_eq!(output.len(), self.columns);
-        let codes = self.row_codes(row);
         for (index, value) in output.iter_mut().enumerate() {
-            *value = f32::from(codes[index]) * self.descale(row, index / self.block);
+            let code = self.step_codes(row, index / STEP)[index % STEP];
+            *value = f32::from(code) * self.descale(row, index / self.block);
         }
     }
 
@@ -139,7 +165,7 @@ impl Q8Matrix {
         for activation in activations {
             assert_eq!(activation.int8.block, self.block);
             assert!(activation.int8.descales.len() >= self.blocks);
-            assert!(activation.int8.chunks.len() >= self.blocks * self.block / CHUNK);
+            assert!(activation.int8.chunks.len() * CHUNK >= self.width);
         }
         #[cfg(target_arch = "x86_64")]
         if std::arch::is_x86_feature_detected!("avx2") {
@@ -154,32 +180,30 @@ impl Q8Matrix {
         }
     }
 
-    /// 标量参考：8 条 lane 的划分与 AVX2 路径相同（lane i 是每 32 字节分段中的第 4i..4i+3 个），
-    /// 每块的整数点积精确，浮点累加顺序一致，所以两条路径逐位相同。
+    /// 标量参考：每块的整数点积是精确的（|点积| ≤ 64 × 127 × 127 < 2^24，转成 f32 也精确），
+    /// 再按块的顺序累加 `点积 × (权重系数 × 激活系数)`。AVX2 内核对每一行做同样的运算，
+    /// 与分组和 token 分块无关，所以两条路径逐位相同。
     pub(crate) fn row_scalar(
         &self,
         activation: &Activation8,
         row: usize,
         bias: Option<&[f32]>,
     ) -> f32 {
-        let codes = self.row_codes(row);
-        let chunks = self.block / CHUNK;
-        let mut lanes = [0.0_f32; LANES];
-        for block in 0..self.blocks {
-            let scale = self.descale(row, block) * activation.descales[block];
-            for (lane, total) in lanes.iter_mut().enumerate() {
-                let mut sum = 0_i32;
-                for chunk in block * chunks..(block + 1) * chunks {
-                    let weights = &codes[chunk * CHUNK..(chunk + 1) * CHUNK];
-                    let inputs = &activation.chunks[chunk].0;
-                    for slot in lane * 4..lane * 4 + 4 {
-                        sum += i32::from(weights[slot]) * i32::from(inputs[slot]);
-                    }
+        let per_block = self.block / STEP;
+        let mut total = 0.0_f32;
+        for index in 0..self.blocks {
+            let mut dot = 0_i32;
+            for step in index * per_block..(index + 1) * per_block {
+                let weights = self.step_codes(row, step);
+                for (slot, weight) in weights.iter().enumerate() {
+                    let k = step * STEP + slot;
+                    let input = activation.chunks[k / CHUNK].0[k % CHUNK];
+                    dot += i32::from(*weight) * i32::from(input);
                 }
-                *total += sum as f32 * scale;
             }
+            total += dot as f32 * (self.descale(row, index) * activation.descales[index]);
         }
-        finish_row(sum_lanes(lanes), bias, row)
+        finish_row(total, bias, row)
     }
 
     #[cfg(target_arch = "x86_64")]
@@ -192,32 +216,32 @@ impl Q8Matrix {
         output: *mut f32,
         stride: usize,
     ) {
-        use std::arch::x86_64::*;
-
-        // 与 Q4 相同：外层每组最多 4 个 token，内层逐行，每行权重读一次供这组 token 共用。
-        let row_bytes = self.blocks * self.block;
+        // 外层每组最多 4 个 token，内层逐个 8 行面板：一步权重读一次，供这组 token 共用。
         let mut first = 0;
         while first < activations.len() {
-            let tile = &activations[first..];
-            let width = tile.len().min(4);
-            for (offset, row) in rows.clone().enumerate() {
-                let codes = self.row_codes(row).as_ptr();
-                for line in 0..row_bytes.div_ceil(64) {
-                    _mm_prefetch::<_MM_HINT_T0>(
-                        codes.wrapping_add(PREFETCH_BYTES + line * 64).cast(),
-                    );
-                }
-                let target = unsafe { output.add(first * stride + offset) };
+            let width = (activations.len() - first).min(4);
+            let tile = &activations[first..first + width];
+            for group in rows.start / PANEL_ROWS..rows.end.div_ceil(PANEL_ROWS) {
+                let mut lanes = [[0.0_f32; PANEL_ROWS]; 4];
                 unsafe {
-                    match (width, self.block) {
-                        (1, 64) => self.row_tile_avx2::<1, 2>(tile, row, bias, target, stride),
-                        (2, 64) => self.row_tile_avx2::<2, 2>(tile, row, bias, target, stride),
-                        (3, 64) => self.row_tile_avx2::<3, 2>(tile, row, bias, target, stride),
-                        (_, 64) => self.row_tile_avx2::<4, 2>(tile, row, bias, target, stride),
-                        (1, _) => self.row_tile_avx2::<1, 1>(tile, row, bias, target, stride),
-                        (2, _) => self.row_tile_avx2::<2, 1>(tile, row, bias, target, stride),
-                        (3, _) => self.row_tile_avx2::<3, 1>(tile, row, bias, target, stride),
-                        (_, _) => self.row_tile_avx2::<4, 1>(tile, row, bias, target, stride),
+                    match width {
+                        1 => self.group_avx2::<1>(tile, group, &mut lanes),
+                        2 => self.group_avx2::<2>(tile, group, &mut lanes),
+                        3 => self.group_avx2::<3>(tile, group, &mut lanes),
+                        _ => self.group_avx2::<4>(tile, group, &mut lanes),
+                    }
+                }
+                for (lane, row) in (group * PANEL_ROWS..(group + 1) * PANEL_ROWS).enumerate() {
+                    if row < rows.start || row >= rows.end {
+                        continue;
+                    }
+                    for (token, values) in lanes.iter().enumerate().take(width) {
+                        let value = finish_row(values[lane], bias, row);
+                        unsafe {
+                            output
+                                .add((first + token) * stride + row - rows.start)
+                                .write(value)
+                        };
                     }
                 }
             }
@@ -228,66 +252,70 @@ impl Q8Matrix {
     #[cfg(target_arch = "x86_64")]
     #[target_feature(enable = "avx2")]
     #[inline]
-    unsafe fn row_tile_avx2<const TOKENS: usize, const CHUNKS: usize>(
+    unsafe fn group_avx2<const TOKENS: usize>(
         &self,
         activations: &[Activation],
-        row: usize,
-        bias: Option<&[f32]>,
-        output: *mut f32,
-        stride: usize,
+        group: usize,
+        lanes: &mut [[f32; PANEL_ROWS]; 4],
     ) {
         use std::arch::x86_64::*;
 
-        let codes = self.row_codes(row).as_ptr().cast::<__m256i>();
-        let inputs: [*const __m256i; TOKENS] =
+        let steps = self.width / STEP;
+        let per_block = self.block / STEP;
+        let panel = unsafe { self.panels.as_ptr().add(group * steps * PANEL_ROWS * STEP) };
+        let descales = unsafe { self.descales.as_ptr().add(group * self.blocks * PANEL_ROWS) };
+        let codes: [*const i8; TOKENS] =
             std::array::from_fn(|token| activations[token].int8.chunks.as_ptr().cast());
-        let magnitudes: [*const __m256i; TOKENS] =
+        let magnitudes: [*const i8; TOKENS] =
             std::array::from_fn(|token| activations[token].int8.magnitudes.as_ptr().cast());
-        let descales: [*const f32; TOKENS] =
+        let scales: [*const f32; TOKENS] =
             std::array::from_fn(|token| activations[token].int8.descales.as_ptr());
         let ones = _mm256_set1_epi16(1);
-        let mut lanes = [_mm256_setzero_ps(); TOKENS];
-        for block in 0..self.blocks {
-            unsafe {
-                let weights: [__m256i; CHUNKS] = std::array::from_fn(|chunk| {
-                    _mm256_loadu_si256(codes.add(block * CHUNKS + chunk))
-                });
-                let row_descale = self.descale(row, block);
-                for token in 0..TOKENS {
-                    let mut sums = _mm256_setzero_si256();
-                    for (chunk, weight) in weights.iter().enumerate() {
-                        let offset = block * CHUNKS + chunk;
-                        let input = _mm256_load_si256(inputs[token].add(offset));
-                        // |a| × (w 带上 a 的符号) = a × w；|a|、|w| ≤ 127，相邻两项之和不会使 i16 饱和。
-                        let products = _mm256_maddubs_epi16(
-                            _mm256_load_si256(magnitudes[token].add(offset)),
-                            _mm256_sign_epi8(*weight, input),
-                        );
-                        sums = _mm256_add_epi32(sums, _mm256_madd_epi16(products, ones));
+        let mut totals = [_mm256_setzero_ps(); TOKENS];
+        for index in 0..self.blocks {
+            let mut sums = [_mm256_setzero_si256(); TOKENS];
+            for step in index * per_block..(index + 1) * per_block {
+                unsafe {
+                    let source = panel.add(step * PANEL_ROWS * STEP);
+                    if step % 2 == 0 {
+                        _mm_prefetch::<_MM_HINT_T0>(source.wrapping_add(PREFETCH_BYTES).cast());
                     }
-                    let scale = row_descale * *descales[token].add(block);
-                    lanes[token] = _mm256_add_ps(
-                        lanes[token],
-                        _mm256_mul_ps(_mm256_cvtepi32_ps(sums), _mm256_set1_ps(scale)),
-                    );
+                    let weights = _mm256_loadu_si256(source.cast());
+                    for token in 0..TOKENS {
+                        // 4 个激活码广播到每一行；同一位置的码与各行同一位置的权重相乘。
+                        let input = _mm256_set1_epi32(
+                            codes[token].add(step * STEP).cast::<i32>().read_unaligned(),
+                        );
+                        let magnitude = _mm256_set1_epi32(
+                            magnitudes[token]
+                                .add(step * STEP)
+                                .cast::<i32>()
+                                .read_unaligned(),
+                        );
+                        // |a| × (w 带上 a 的符号) = a × w；|a|、|w| ≤ 127，相邻两项之和不会使 i16 饱和。
+                        let products =
+                            _mm256_maddubs_epi16(magnitude, _mm256_sign_epi8(weights, input));
+                        sums[token] =
+                            _mm256_add_epi32(sums[token], _mm256_madd_epi16(products, ones));
+                    }
                 }
             }
-        }
-        for (token, lanes) in lanes.iter().enumerate() {
-            let mut stored = [0.0_f32; LANES];
-            unsafe {
-                _mm256_storeu_ps(stored.as_mut_ptr(), *lanes);
-                output
-                    .add(token * stride)
-                    .write(finish_row(sum_lanes(stored), bias, row));
+            let row_scales = unsafe { _mm256_loadu_ps(descales.add(index * PANEL_ROWS)) };
+            for token in 0..TOKENS {
+                let scale = _mm256_mul_ps(
+                    row_scales,
+                    _mm256_set1_ps(unsafe { *scales[token].add(index) }),
+                );
+                totals[token] = _mm256_add_ps(
+                    totals[token],
+                    _mm256_mul_ps(_mm256_cvtepi32_ps(sums[token]), scale),
+                );
             }
         }
+        for token in 0..TOKENS {
+            unsafe { _mm256_storeu_ps(lanes[token].as_mut_ptr(), totals[token]) };
+        }
     }
-}
-
-fn sum_lanes(lanes: [f32; LANES]) -> f32 {
-    ((lanes[0] + lanes[4]) + (lanes[2] + lanes[6]))
-        + ((lanes[1] + lanes[5]) + (lanes[3] + lanes[7]))
 }
 
 fn finish_row(sum: f32, bias: Option<&[f32]>, row: usize) -> f32 {

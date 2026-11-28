@@ -41,7 +41,7 @@
 
 | 框架 | prefill 6 线程 | decode 6 线程 | prefill 1 线程 | decode 1 线程 |
 |---|---|---|---|---|
-| **nncoss** | **445.7 / 465.7** | **78.9 / 80.1** | **156.0 / 157.3** | **57.8 / 58.2** |
+| **nncoss** | **465.7 / 444.5** | **78.9 / 80.1** | **156.0 / 157.3** | **57.8 / 58.2** |
 | llama.cpp | 290.4 / 309.3 | 72.2 / 68.7 | 122.4 / 117.3 | 29.7 |
 | ncnn-MoE-Runtime + #28 | 73.8 / 71.0 | 36.9 / 37.3 | 23.1 / 19.2 | 12.9 / 13.3 |
 | ncnn-MoE-Runtime 原版 | 74.0 / 73.8 | 9.6 / 9.2 | 23.1 / 23.2 | 2.4 |
@@ -65,7 +65,7 @@
 
 ## 结论
 
-- **与 llama.cpp 比（同一份 Q8_0 权重）**：nncoss 的 prefill 在 6 线程下是 llama.cpp 的 1.3–1.5 倍，1 线程约为 1.3 倍；decode 在 6 线程下快 9–17%，1 线程约为 llama.cpp 的 1.9–2.0 倍。
+- **与 llama.cpp 比（同一份 Q8_0 权重）**：nncoss 的 prefill 在 6 线程下是 llama.cpp 的 1.3–1.6 倍，1 线程约为 1.3 倍；decode 在 6 线程下快 9–17%，1 线程约为 llama.cpp 的 1.9–2.0 倍。
 - **与 ncnn_llm 比（同一个 INT8 模型）**：
   - 两边的 LM Head 都读 622 MB 的 f32 时，nncoss 的 decode 在 6 线程下约为 ncnn_llm 的 1.6 倍。
   - ncnn_llm 加上 #61 后 LM Head 改读 bf16，每个 token 少读 311 MB，decode 反超 nncoss 约 10%。nncoss 的 INT8 模型目前 LM Head 只能是 f32。

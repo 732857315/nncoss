@@ -1,6 +1,6 @@
 # 与其他推理框架的速度对比
 
-在同一台机器上、用同一份权重，比较 nncoss 与 llama.cpp、ncnn_llm、ncnn-MoE-Runtime 的 prefill 与 decode 速度。结果只代表这台机器和这几个模型，不构成性能承诺。方法与历次结果的来龙去脉见[决策记录](decisions.md)，模型来源与校验值见[模型说明](models.md)。
+在同一台机器上、用同一份权重，比较 nncoss 与 llama.cpp、ncnn_llm、ncnn-MoE-Runtime 的 prefill 与 decode 速度。结果只代表这台机器和这几个模型，不构成性能承诺。方法与历次结果的来龙去脉见[决策记录](decisions.md)，模型来源与校验值见[模型说明](models.md)。每次运行的结果与各框架基准程序的原始输出发布在 Hugging Face 数据集 [w732857315/nncoss](https://huggingface.co/datasets/w732857315/nncoss)。
 
 ## 环境
 

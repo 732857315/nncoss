@@ -11,10 +11,19 @@ const FLAG_TIED_EMBEDDINGS: u32 = 1;
 const FLAG_QKV_BIAS: u32 = 2;
 const FLAG_QK_NORM: u32 = 4;
 const FLAG_Q4_WEIGHTS: u32 = 8;
-/// 7 个投影矩阵为 64 元素分块 INT8（见 q8.rs），嵌入、LM Head 与归一化仍为 f32。
+/// 7 个投影矩阵为分块 INT8（见 q8.rs），默认 64 元素一块；嵌入、LM Head 与归一化默认为 f32。
 const FLAG_INT8_WEIGHTS: u32 = 32;
-const KNOWN_FLAGS: u32 =
-    FLAG_TIED_EMBEDDINGS | FLAG_QKV_BIAS | FLAG_QK_NORM | FLAG_Q4_WEIGHTS | FLAG_INT8_WEIGHTS;
+/// 与 FLAG_INT8_WEIGHTS 一起使用：块长改为 32（GGUF Q8_0）。
+const FLAG_INT8_BLOCK32: u32 = 64;
+/// 与 FLAG_INT8_WEIGHTS 一起使用：嵌入与 LM Head 也用同样的 INT8 分块（GGUF Q8_0 模型的做法）。
+const FLAG_INT8_EMBEDDINGS: u32 = 128;
+const KNOWN_FLAGS: u32 = FLAG_TIED_EMBEDDINGS
+    | FLAG_QKV_BIAS
+    | FLAG_QK_NORM
+    | FLAG_Q4_WEIGHTS
+    | FLAG_INT8_WEIGHTS
+    | FLAG_INT8_BLOCK32
+    | FLAG_INT8_EMBEDDINGS;
 const HEADER_LENGTH: usize = 64;
 const VALUE_LENGTH: usize = 4;
 
@@ -56,6 +65,10 @@ pub struct Config {
     pub quantized: bool,
     /// 投影矩阵为 INT8；与 Q4（`quantized`）互斥。
     pub int8: bool,
+    /// INT8 的块长（32 或 64）；不是 INT8 模型时为 0。
+    pub int8_block: usize,
+    /// 嵌入与 LM Head 也为 INT8。
+    pub int8_embeddings: bool,
 }
 
 impl Config {
@@ -195,6 +208,10 @@ fn parse_header(bytes: &[u8]) -> Result<Config> {
     if flags & FLAG_Q4_WEIGHTS != 0 && flags & FLAG_INT8_WEIGHTS != 0 {
         return Err(Error::InvalidModel("Q4 与 INT8 权重不能同时使用"));
     }
+    if flags & FLAG_INT8_WEIGHTS == 0 && flags & (FLAG_INT8_BLOCK32 | FLAG_INT8_EMBEDDINGS) != 0 {
+        return Err(Error::InvalidModel("INT8 块长与嵌入标志需要 INT8 权重"));
+    }
+    let int8 = flags & FLAG_INT8_WEIGHTS != 0;
     let rope_mode = RopeMode::try_from(reader.read_u32()?)?;
     let norm_eps = reader.read_f32()?;
     let rope_theta = reader.read_f32()?;
@@ -214,7 +231,13 @@ fn parse_header(bytes: &[u8]) -> Result<Config> {
         qkv_bias: flags & FLAG_QKV_BIAS != 0,
         qk_norm: flags & FLAG_QK_NORM != 0,
         quantized: flags & FLAG_Q4_WEIGHTS != 0,
-        int8: flags & FLAG_INT8_WEIGHTS != 0,
+        int8,
+        int8_block: match (int8, flags & FLAG_INT8_BLOCK32 != 0) {
+            (false, _) => 0,
+            (true, true) => 32,
+            (true, false) => 64,
+        },
+        int8_embeddings: flags & FLAG_INT8_EMBEDDINGS != 0,
     };
     config.validate()?;
     Ok(config)
@@ -288,7 +311,7 @@ impl Slot {
     }
 
     fn is_int8(self, config: &Config) -> bool {
-        config.int8 && self.is_projection()
+        config.int8 && (self.is_projection() || (config.int8_embeddings && self.is_matrix()))
     }
 
     fn byte_count(self, config: &Config) -> Result<usize> {
@@ -296,7 +319,8 @@ impl Slot {
         if config.quantized && self.is_matrix() {
             q4_matrix_bytes(rows, columns).ok_or(Error::InvalidModel("Q4 张量尺寸溢出"))
         } else if self.is_int8(config) {
-            q8_matrix_bytes(rows, columns).ok_or(Error::InvalidModel("INT8 张量尺寸溢出"))
+            q8_matrix_bytes(rows, columns, config.int8_block)
+                .ok_or(Error::InvalidModel("INT8 张量尺寸溢出"))
         } else {
             self.value_count(config)?
                 .checked_mul(VALUE_LENGTH)
@@ -418,6 +442,7 @@ struct Tensor {
     columns: usize,
     quantized: bool,
     int8: bool,
+    int8_block: usize,
     values: Vec<u8>,
 }
 
@@ -442,6 +467,7 @@ impl Tensor {
             columns,
             quantized: config.quantized && slot.is_matrix(),
             int8: slot.is_int8(config),
+            int8_block: config.int8_block,
             values,
         })
     }
@@ -460,7 +486,8 @@ impl Tensor {
             return Ok(Weight::Q4(matrix));
         }
         if self.int8 && self.rows * self.columns != 0 {
-            let matrix = crate::q8::Q8Matrix::new(self.rows, self.columns, self.values)?;
+            let matrix =
+                crate::q8::Q8Matrix::new(self.rows, self.columns, self.int8_block, self.values)?;
             return Ok(Weight::Q8(matrix));
         }
         let mut values = Vec::with_capacity(self.byte_count / VALUE_LENGTH);
@@ -879,14 +906,31 @@ mod tests {
 
     /// 把 f32 夹具的 7 个投影矩阵改写成 INT8 布局，其余张量原样保留。
     fn int8_bytes(spec: &crate::test_utils::TinySpec) -> Vec<u8> {
+        int8_bytes_with(spec, 64, false)
+    }
+
+    /// 把 f32 夹具的投影矩阵（`embeddings` 时连同嵌入与 LM Head）改写成给定块长的 INT8 布局。
+    fn int8_bytes_with(
+        spec: &crate::test_utils::TinySpec,
+        block: usize,
+        embeddings: bool,
+    ) -> Vec<u8> {
         let bytes = spec.bytes();
         let (_, tensors) = tensor_layout(&bytes).unwrap();
         let mut output = bytes[..HEADER_LENGTH].to_vec();
-        let flags = u32::from_le_bytes(output[48..52].try_into().unwrap()) | FLAG_INT8_WEIGHTS;
+        let mut flags = u32::from_le_bytes(output[48..52].try_into().unwrap()) | FLAG_INT8_WEIGHTS;
+        if block == 32 {
+            flags |= FLAG_INT8_BLOCK32;
+        }
+        if embeddings {
+            flags |= FLAG_INT8_EMBEDDINGS;
+        }
         output[48..52].copy_from_slice(&flags.to_le_bytes());
         for tensor in &tensors {
             let data = &bytes[tensor.offset..tensor.offset + tensor.byte_count];
-            if PROJECTIONS.contains(&tensor.kind) {
+            let quantize = PROJECTIONS.contains(&tensor.kind)
+                || (embeddings && matches!(tensor.kind, "embed_tokens" | "lm_head"));
+            if quantize {
                 let values: Vec<f32> = data
                     .chunks_exact(4)
                     .map(|chunk| f32::from_le_bytes(chunk.try_into().unwrap()))
@@ -895,6 +939,7 @@ mod tests {
                     &values,
                     tensor.rows,
                     tensor.columns,
+                    block,
                 ));
             } else {
                 output.extend_from_slice(data);
@@ -945,6 +990,62 @@ mod tests {
                 }
                 assert!(matches!(model.token_embedding, Weight::F32(_)));
             }
+        }
+    }
+
+    #[test]
+    fn q8_0_style_models_quantize_embeddings_with_32_element_blocks() {
+        use crate::test_utils::TinySpec;
+        for spec in TinySpec::wide_variants() {
+            let bytes = int8_bytes_with(&spec, 32, true);
+            let (config, tensors) = tensor_layout(&bytes).unwrap();
+            assert!(config.int8 && config.int8_embeddings && config.int8_block == 32);
+            for tensor in &tensors {
+                let expected = PROJECTIONS.contains(&tensor.kind)
+                    || matches!(tensor.kind, "embed_tokens" | "lm_head");
+                assert_eq!(tensor.int8, expected, "{}", tensor.kind);
+            }
+            let last = tensors.last().unwrap();
+            assert_eq!(last.offset + last.byte_count, bytes.len());
+            let expected = spec.int8_model_with(32, true);
+            for chunk in [1, 7, 64, bytes.len()] {
+                let model = load_chunked(&bytes, bytes.len(), chunk).unwrap();
+                assert_eq!(model.config, expected.config);
+                let bits = |weight: &Weight| {
+                    weight
+                        .clone()
+                        .into_f32()
+                        .iter()
+                        .map(|v| v.to_bits())
+                        .collect::<Vec<_>>()
+                };
+                assert!(matches!(model.token_embedding, Weight::Q8(_)));
+                assert_eq!(
+                    bits(&model.token_embedding),
+                    bits(&expected.token_embedding)
+                );
+                assert_eq!(
+                    model.lm_head.as_ref().map(bits),
+                    expected.lm_head.as_ref().map(bits)
+                );
+                assert_eq!(
+                    bits(&model.layers[0].up_proj),
+                    bits(&expected.layers[0].up_proj)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn int8_modifier_flags_require_int8_weights() {
+        for modifier in [FLAG_INT8_BLOCK32, FLAG_INT8_EMBEDDINGS] {
+            let mut bytes = tiny_model_bytes();
+            let flags = u32::from_le_bytes(bytes[48..52].try_into().unwrap()) | modifier;
+            bytes[48..52].copy_from_slice(&flags.to_le_bytes());
+            assert_eq!(
+                Model::from_bytes(&bytes).unwrap_err(),
+                Error::InvalidModel("INT8 块长与嵌入标志需要 INT8 权重")
+            );
         }
     }
 

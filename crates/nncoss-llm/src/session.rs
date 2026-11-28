@@ -733,14 +733,12 @@ mod tests {
                     )
                     .unwrap(),
                 ),
-                Weight::Q8(_) => Weight::Q8(
-                    crate::q8::Q8Matrix::new(
-                        rows,
-                        columns,
-                        crate::q8::test_support::encode(&vec![0.0; rows * columns], rows, columns),
-                    )
-                    .unwrap(),
-                ),
+                Weight::Q8(matrix) => {
+                    let block = matrix.block();
+                    let zeros = vec![0.0; rows * columns];
+                    let bytes = crate::q8::test_support::encode(&zeros, rows, columns, block);
+                    Weight::Q8(crate::q8::Q8Matrix::new(rows, columns, block, bytes).unwrap())
+                }
             };
         }
         let tokens = [1, 2, 3, 0, 4, 2];
@@ -902,7 +900,12 @@ mod tests {
     #[test]
     fn batched_prefill_matches_token_by_token_decode_bit_for_bit() {
         let tokens: Vec<u32> = (0..70).map(|index| (index * 7 + 3) % 23).collect();
-        for model in [LONG.model(), LONG.quantized_model(), LONG.int8_model()] {
+        for model in [
+            LONG.model(),
+            LONG.quantized_model(),
+            LONG.int8_model(),
+            LONG.int8_model_with(32, true),
+        ] {
             let model = Arc::new(model);
             let mut batched = Session::new(model.clone(), 0).unwrap();
             batched.prefill(&tokens).unwrap();
@@ -928,10 +931,23 @@ mod tests {
 
     #[test]
     fn int8_model_tracks_its_dequantized_weights() {
+        for (block, embeddings) in [(64, false), (32, true), (32, false), (64, true)] {
+            int8_variant_tracks_its_dequantized_weights(block, embeddings);
+        }
+    }
+
+    fn int8_variant_tracks_its_dequantized_weights(block: usize, embeddings: bool) {
         let tokens: Vec<u32> = (0..40).map(|index| (index * 5 + 1) % 23).collect();
-        let int8 = LONG.int8_model();
-        let mut dequantized = LONG.int8_model();
+        let int8 = LONG.int8_model_with(block, embeddings);
+        let mut dequantized = LONG.int8_model_with(block, embeddings);
         dequantized.config.int8 = false;
+        dequantized.config.int8_block = 0;
+        dequantized.config.int8_embeddings = false;
+        dequantized.token_embedding =
+            crate::q4::Weight::F32(std::mem::take(&mut dequantized.token_embedding).into_f32());
+        if let Some(head) = &mut dequantized.lm_head {
+            *head = crate::q4::Weight::F32(std::mem::take(head).into_f32());
+        }
         for layer in &mut dequantized.layers {
             for weight in [
                 &mut layer.q_proj,
@@ -964,7 +980,7 @@ mod tests {
                 // 差别只来自激活的 INT8 量化（每块相对误差约 1/254）。
                 assert!(
                     (actual - expected).abs() <= 0.03 * peak.max(1.0),
-                    "step {step}: {actual} != {expected}"
+                    "block={block} embeddings={embeddings} step {step}: {actual} != {expected}"
                 );
             }
         }

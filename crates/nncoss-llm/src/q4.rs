@@ -556,12 +556,18 @@ pub(crate) fn linear_many(inputs: &[f32], activations: &mut [Activation], jobs: 
             activation.quantize(input);
         }
     }
-    if jobs
-        .iter()
-        .any(|job| matches!(job.weight, Weight::Q8(_)) && !job.output.is_empty())
-    {
+    let int8_block = jobs.iter().find_map(|job| match job.weight {
+        Weight::Q8(matrix) if !job.output.is_empty() => Some(matrix.block()),
+        _ => None,
+    });
+    if let Some(block) = int8_block {
+        // 同一次调用中的 INT8 矩阵共用一份激活量化，块长必须相同。
+        assert!(jobs.iter().all(|job| match job.weight {
+            Weight::Q8(matrix) => matrix.block() == block,
+            _ => true,
+        }));
         for (activation, input) in activations.iter_mut().zip(inputs.chunks_exact(columns)) {
-            activation.int8.quantize(input);
+            activation.int8.quantize(input, block);
         }
     }
     let total_rows: usize = jobs.iter().map(|job| job.output.len() / tokens).sum();

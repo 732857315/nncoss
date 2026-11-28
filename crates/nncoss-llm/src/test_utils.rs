@@ -135,21 +135,34 @@ impl TinySpec {
         model
     }
 
-    /// 7 个投影矩阵改为 INT8，嵌入与 LM Head 保持 f32（与 FLAG_INT8_WEIGHTS 的布局一致）。
+    /// 7 个投影矩阵改为 64 元素分块 INT8，嵌入与 LM Head 保持 f32（ncnn 的 INT8 模型）。
     pub fn int8_model(&self) -> Model {
+        self.int8_model_with(64, false)
+    }
+
+    /// 按给定块长量化投影矩阵；`embeddings` 时嵌入与 LM Head 也量化（GGUF Q8_0 模型）。
+    pub fn int8_model_with(&self, block: usize, embeddings: bool) -> Model {
         let mut model = self.model();
         model.config.int8 = true;
+        model.config.int8_block = block;
+        model.config.int8_embeddings = embeddings;
         let config = model.config.clone();
         let (hidden, q_dim, kv_dim) = (config.hidden_size, config.q_dim(), config.kv_dim());
         let inner = config.intermediate_size;
+        if embeddings {
+            quantize_int8(&mut model.token_embedding, config.vocab_size, hidden, block);
+            if let Some(head) = &mut model.lm_head {
+                quantize_int8(head, config.vocab_size, hidden, block);
+            }
+        }
         for layer in &mut model.layers {
-            quantize_int8(&mut layer.q_proj, q_dim, hidden);
-            quantize_int8(&mut layer.k_proj, kv_dim, hidden);
-            quantize_int8(&mut layer.v_proj, kv_dim, hidden);
-            quantize_int8(&mut layer.o_proj, hidden, q_dim);
-            quantize_int8(&mut layer.gate_proj, inner, hidden);
-            quantize_int8(&mut layer.up_proj, inner, hidden);
-            quantize_int8(&mut layer.down_proj, hidden, inner);
+            quantize_int8(&mut layer.q_proj, q_dim, hidden, block);
+            quantize_int8(&mut layer.k_proj, kv_dim, hidden, block);
+            quantize_int8(&mut layer.v_proj, kv_dim, hidden, block);
+            quantize_int8(&mut layer.o_proj, hidden, q_dim, block);
+            quantize_int8(&mut layer.gate_proj, inner, hidden, block);
+            quantize_int8(&mut layer.up_proj, inner, hidden, block);
+            quantize_int8(&mut layer.down_proj, hidden, inner, block);
         }
         model
     }
@@ -181,10 +194,10 @@ fn quantize(weight: &mut Weight, rows: usize, columns: usize) {
     *weight = Weight::Q4(Q4Matrix::new(rows, columns, bytes).unwrap());
 }
 
-fn quantize_int8(weight: &mut Weight, rows: usize, columns: usize) {
+fn quantize_int8(weight: &mut Weight, rows: usize, columns: usize, block: usize) {
     let values = std::mem::take(weight).into_f32();
-    let bytes = crate::q8::test_support::encode(&values, rows, columns);
-    *weight = Weight::Q8(crate::q8::Q8Matrix::new(rows, columns, bytes).unwrap());
+    let bytes = crate::q8::test_support::encode(&values, rows, columns, block);
+    *weight = Weight::Q8(crate::q8::Q8Matrix::new(rows, columns, block, bytes).unwrap());
 }
 
 pub(crate) fn tiny_model() -> Model {

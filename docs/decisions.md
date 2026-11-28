@@ -18,6 +18,14 @@
 
 因此要基于模型实际的网络结构和数据，构建动态的网络：从神经元的共同激活中找出专家，每个 token 用模型自己的部件实时选择要计算的部分。这样做同时减少了每步要读的权重，也就提高了运行效率。
 
+11-28 负责人进一步说明：
+
+- 当前的神经网络基于编解码器和概率，通过文字的顺序和推演，归纳总结人类的动作和行为。归纳总结时，实际上生成了一个全新的传统神经网络，相当于实时训练出一个带固定倾向的网络；归纳出的可能性包含人类的行为、习惯和历史依赖。传统的 CNN 或分类器本质上也一样，唯一的不同是，这里的网络是基于当前信息实时生成、重新训练的特定网络。
+- 所以智能的本质是随时变动：通过实际的变动，实时出现全新的组合结构，来应对看似无穷的信息。
+- 注意力只是表象，能实时应对外界环境才是根本。智能的根本，是通过特定的结构不断改进，并创造出随机应变的结构，也就是可进步的智能。
+- 最根本的结构不是知识，而是组织形式。
+- 当前的 LLM 本质上走错了道路，属于力大砖飞，只是恰好在一部分区间内拼凑出了可进化的网络结构。
+
 ### 1.3 方法：直接改写权重和结构
 
 - 优先直接改写权重与网络结构来优化模型，并提高运行效率，不做梯度训练。11-19 曾偏离到 LoRA 自我学习训练，已停止；训练得到的模型只保留为对照组。
@@ -47,6 +55,14 @@
 - 功能代码用 Rust，辅助脚本只用 Python。
 - 模型与训练数据不入 Git 仓库；11-27 起经负责人确认可发布到 Hugging Face，仍须记录来源、校验值与使用方式。
 - 外部资料放 `modelbook/`，文档放 `docs/`，临时数据放 `tmp/`，模型放 `model/`。项目相关的内容都放在仓库目录内。
+
+### 1.7 原生实现与对照基准
+
+- 常见量化都要在 nncoss 中原生实现，覆盖训练、推理、实时进化与传统 CNN 等（11-28 提出）。此前 README 计划默认复用 ncnn 的通用算子，现改为原生实现。“训练”与 1.3 中“不做梯度训练”的关系尚待负责人确认。
+- nncoss 不限制实现方式，只在乎结果。
+- ncnn 用官方版本，ncnn_llm 与 ncnn-MoE-Runtime 用原作者版本，都可以参考别人的修改，但不轻信别人的说法：先保证原版能运行并实际使用，结论以本机测量为准。修改外部项目时不改它们的测试项，只改进出现异常的核心代码。
+- 最终速度对比：llama.cpp、ncnn 系列与 nncoss 运行同样的模型，模型以 MNN（MNN-Pocket）与 Qwen 为主，也可加入其他轻量模型。llm.asm 与 unkernel 只参考代码（unkernel 用于 WASM 优化），不比较性能。
+- 速度测试优先复用各项目自带的测试与基准，并跑全部测试项。本机速度一小时内会漂移达 50%，只有交替运行的结果才能互相比较。
 
 ## 二、改动与原因
 
@@ -118,6 +134,11 @@
 | 11-27 | 在本机 GPU 上试运行 ncnn-MoE-Runtime：能运行但结果错误，不作速度对比 | 用户要求在本机 GPU 上试 | macOS 没有原生 Vulkan，用官方 MoltenVK（Vulkan 转 Metal，1.4.2）的动态库放在 `tmp/ext/`，经 ncnn 自带的加载器（`NCNN_VULKAN_DRIVER`）载入，未在系统中安装任何东西；对方以 `-DNCNN_MOE_USE_VULKAN=ON -DNCNN_MOE_MOLTENVK_LIBRARY=…` 构建。本机有 AMD Radeon Pro 555X（4 GB）与 Intel UHD 630：Intel 上 MoltenVK 编译对方的一个计算着色器失败；AMD 上对方按显存约 85% 申请一整块 3.64 GB 缓冲，超过 Metal 在该卡上单个缓冲 3 GiB 的上限，加 `--expert-gpu-cache-mb 1024` 后可以启动，28 层注意力都放在 GPU 上。但生成的文本是乱码（CPU 上同一提示输出“长城是中国最著名的古代防御工程……”），速度也只有 prefill 35–120、decode 2.6–4.2 tokens/s。Intel Mac 加 AMD 显卡经 MoltenVK 不是对方支持的配置，这组 GPU 数字无效；用户截图中 523 tokens/s 的 GPU 结果是在 Windows 的独立显卡上用原生 Vulkan 驱动得到的 |
 | 11-27 | 发布 nncoss 模型与 school-r1 训练数据，补充使用文档 | 负责人要求把 school 模型放到对应仓库、训练数据放到 Hugging Face Datasets，并整理文档让别人也能使用 nncoss；取代 11-19“模型不上传”的限制，模型与数据仍不进 Git 仓库 | 已发布 Qwen3-0.6B、Qwen3-1.7B、MNN-Pocket-0.3B 与独立的 school-r1 模型仓库。school 数据只含自编题库和 Qwen3-0.6B 生成的第一轮轨迹：575 条原始样本，经 319 条工具上下文增强与总长度筛选后得到实际训练的 891 条；不含未完成的第二轮或外部题库。school 模型仓库的 8 个文件与数据集仓库的 6 个文件已核对远端存在和大小，两个模型权重的远端 LFS SHA-256 也与本文表格一致。README 增加当前原型的快速开始，模型说明增加下载、原生／WASM 运行和数据集读取方法；公开文件仍标为未纳入 CI 的本地实验产物 |
 | 11-27 | 外部资料整理后发布到 `w732857315/nncoss-knowledge` | 负责人要求上传尚未发布的外部资料并指定数据集仓库；同时需要按具体来源核对许可，不能把公开可下载等同于允许再分发 | 发布 GAOKAO-Bench 原始与逐题 JSONL（客观 1,781、主观 1,030）、OI Wiki 12,138 段、CodeContests 165 行 Parquet，以及 318 册／326 分卷的来源清单，共 47 个文件；各来源分别保留许可与署名。全部仓库配置和 Parquet 均已从远端加载并核对条数。ChinaTextbook 未声明统一再分发许可，故不上传课本 PDF、课本或幼儿园正文及含这些正文的知识库，只公开清单、校验值与获取方法；`docs/modelbook.md` 已补镜像下载说明 |
+| 11-28 | ncnn 系在本机的测评：官方 ncnn 可靠，LLM decode 慢于本项目 | 负责人要求在本机支持并优化 ncnn、ncnn_llm、ncnn-MoE-Runtime，并问 nncoss 选用 ncnn 是否靠谱 | 官方 ncnn（e8a00891）按其 macOS CI 的 OpenMP 参数构建，全部 192 个测试通过；默认 benchncnn 比其自带记录中同型号 MacBook 的结果快（单线程 resnet50 92 对 130 ms）。macOS 把 Intel 的两个超线程算作共用 L2，每线程只得 128 KB（Linux／Windows 为 256 KB）；改正后 benchncnn 几何平均慢 1.2%／1.5%，在 ±3% 噪声内，未采用。ncnn_llm 固定的 futz12 fork（作者已修到 b3e4c5d5）在只有 AVX2 的 CPU 上 INT8 结果仍错误（test_gemm_block_quant、test_multiheadattention_block_quant 失败，Qwen3-0.6B INT8 输出乱码）；在 AVX 层把 wq_int8 的 TILE_N 对齐到 8 后 182/182 通过，默认 benchncnn 前后几何平均 0.996。ncnn_llm 的 LM Head 每 token 读 622 MB 的 f32 嵌入，改用精确的 bf16 副本后 benchllm 的 INT8 decode 13.4 → 18–19 tokens/s（4 线程）。本机 decode 速度：nncoss Q4 Qwen3-0.6B 78–81 tokens/s（11-17 测量），ncnn 自带 benchncnn_llm 的 0.5B INT8 模型 34–43 tokens/s，ncnn_llm 13–19 tokens/s。官方 ncnn 目前没有 4 bit 权重（INT4 的 PR #6890 未合并），每 token 读的字节约为 Q4 的两倍。外部项目的修改都在本地分支，未推送 |
+| 11-28 | 新增 INT8 分块权重（flags 第 5 位），与 ncnn_llm 在同一个 INT8 模型上比较 | 负责人要求用同样的 INT8 模型比较 | 格式与 ncnn weight block quant 相同（64 元素一块、码在 ±127 内），`tools/ncnn_int8_to_nncoss.py` 把 ncnn 模型库的 qwen3_0.6b_int8 逐字节转换（见[模型说明](models.md)）；AVX2 int8×int8 内核与标量路径逐位一致。ncnn_llm 的 benchllm 与本项目的 bench 使用同样的 256 token 提示，贪心生成 64 个，交替两轮（负载 3–12），单位 tokens/s：nncoss prefill 192–245、decode 22.3–27.2；ncnn_llm 原版（同为 f32 LM Head）284–405、15.1–18.3；改用 bf16 LM Head 的 ncnn_llm 301–388、27.2–30.3。同一模型、同样格式时 decode 快 1.4–1.6 倍，prefill 慢约 1.5 倍（INT8 内核每读一遍权重只服务 4 个 token）；两边生成的文本相同。`bench --tokens` 原先按 `--prompt` 的默认值 24 报告 prompt 长度与 prefill 速度，已改为实际长度 |
+| 11-28 | INT8 增加块长 32 与 INT8 嵌入（GGUF Q8_0），在同一份权重上与 llama.cpp、ncnn 系列比较速度 | 负责人要求最终比较 llama.cpp、ncnn 系列与 nncoss 运行同样模型的速度，模型以 MNN 与 Qwen 为主 | flags 第 6 位为块长 32、第 7 位为嵌入与 LM Head 也用 INT8；`tools/gguf_to_nncoss.py` 把 Q8_0 原样转换（见[模型说明](models.md)）。各框架用自带基准：llama.cpp 的 llama-bench（prefill 256 token 从空上下文开始，decode 64 token 在 256 深度）、本项目的 bench、ncnn-MoE-Runtime 的 CLI 指标、ncnn_llm 原版的 benchllm；输入同为 256 token（ncnn-MoE-Runtime 的 CLI 另加聊天模板），贪心，6 与 1 线程，两轮倒序交替（负载 2–7）。tokens/s（prefill／decode，两轮）：MNN-Pocket-0.3B Q8_0 6 线程：llama.cpp 291–308／67.8–71.8，nncoss 267–283／75.0–76.4，ncnn-MoE-Runtime 73／9.5–9.7；1 线程：118–119／29.2–29.7，100–102／45.4–45.9，19–23／2.3–2.4。Qwen3-0.6B Q8_0 6 线程：llama.cpp 173–203／33.6–36.4，nncoss 182–187／36.0–39.2，ncnn-MoE-Runtime 42–46／4.8–5.1；1 线程：64.4／14.3，54.0–54.6／20.7–21.1，9.6–12.5／1.1–1.2。Qwen3-0.6B INT8（ncnn 块长 64）6 线程：ncnn_llm 400–410／16.9–17.0，nncoss 221–233／26.6–26.9；1 线程：103／15.1–15.2，70／14.0。decode 本项目在 6 线程下三组都最快，1 线程比 llama.cpp 快约 50%；prefill 比 llama.cpp 慢 5–15%，比 ncnn_llm 的批量 INT8 GEMM 慢约 45%，是下一步要改进的地方。ncnn-MoE-Runtime 在本机慢 7–15 倍，原因待查 |
+| 11-28 | INT8 内核改为 8 行面板，prefill 超过 llama.cpp | 负责人要求先优化 nncoss；prefill 比 llama.cpp 慢 5–15%、比 ncnn_llm 慢约 45% | 采样分析：1024 token prefill 时 INT8 内核约占一半，工作线程等待约三成（调用线程单线程量化激活），注意力约 15%。反汇编显示内核受指令数限制：每个 (行, token, 块) 除点积外还要 5 条左右的缩放累加指令，约 12 条指令做 32 次乘加。改动：激活量化改用 AVX2 并预存码的绝对值（6 线程 prefill MNN Q8_0 +14%、Qwen3 Q8_0 +6–11%）；INT8 矩阵载入时改排成 8 行一组、每步 4 列的面板，每步读一次权重供最多 4 个 token 共用，8 个 lane 各累加一行，块末的缩放一次处理 8 行；每块整数点积精确，标量与 AVX2 逐位一致。新旧交替两轮，256 token 提示、贪心 64 个，生成的 token 不变（tokens/s，prefill）：Qwen3-0.6B Q8_0 6 线程 188–198 → 259–278、1 线程 51–52 → 83–84；MNN-Pocket-0.3B Q8_0 304–310 → 388–444、100 → 150–152；Qwen3-0.6B INT8 218–236 → 278–307、64–66 → 87–88。1 线程 decode 也快 12–34%，6 线程 decode 受带宽限制不变。与当天同权重的 llama.cpp 相比，Q8_0 prefill 快约 25–40%；INT8 prefill 仍比 ncnn_llm 慢约 25% |
+| 11-28 | 面板内核之后重新与其他框架对比，结果整理成[速度对比](benchmarks.md) | 负责人要求先与别人对比，并把对比记录同步到 GitHub 与 Hugging Face | 同一份权重，各框架用自带基准，256 token 提示、贪心 64 个，6 与 1 线程两轮倒序交替（负载 1.8–7.0），ncnn_llm 与 ncnn-MoE-Runtime 同时测原版与加上本项目 PR 的版本。6 线程 tokens/s（prefill／decode）：MNN-Pocket-0.3B Q8_0 nncoss 446–466／79–80，llama.cpp 290–309／69–72；Qwen3-0.6B Q8_0 nncoss 276／38–41，llama.cpp 180–207／32–36；Qwen3-0.6B INT8 nncoss 307／27–28，ncnn_llm 原版 397–401／17，加上 LM Head 修正 396–397／30。与 llama.cpp 相比 prefill 快 1.3–1.5 倍、decode 6 线程快 12–16%、1 线程约快一倍；与 ncnn_llm 相比 INT8 prefill 仍慢约 25%，decode 在双方 LM Head 都读 f32 时快约 1.6 倍，对方改读 bf16 后慢约 10%，下一步给 INT8 模型加 bf16 或 INT8 的 LM Head |
 
 ## 三、当前基线
 

@@ -404,7 +404,7 @@ impl ColumnWeights {
         fn q4(weight: &Weight) -> Option<&Q4Matrix> {
             match weight {
                 Weight::Q4(matrix) => Some(matrix),
-                Weight::F32(_) => None,
+                Weight::F32(_) | Weight::Q8(_) => None,
             }
         }
         let mut layers = Vec::with_capacity(model.layers.len());

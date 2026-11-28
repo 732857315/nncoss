@@ -393,7 +393,7 @@ console.log("识别结果：", logits.argmax());
 | 能力 | 当前实现 |
 |------|----------|
 | 模型结构 | 单 batch decoder-only；RMSNorm、RoPE、GQA、SwiGLU；可选 QKV bias、QK norm；绑定或独立 LM Head |
-| 数值与算子 | f32 行主序矩阵乘按 16 通道分组求和，x86_64 AVX2 与标量路径逐位一致，同一行权重对批内多个 token 复用并预取下一行；稳定 softmax 与 SiLU；可选 Q4 权重与按组 int8 激活的整数点积；x86_64 AVX2 内核与原生线程池，与标量路径逐位一致；RoPE 与指数函数使用不依赖平台 libm 的实现 |
+| 数值与算子 | f32 行主序矩阵乘按 16 通道分组求和，x86_64 AVX2 与标量路径逐位一致，同一行权重对批内多个 token 复用并预取下一行；稳定 softmax 与 SiLU；可选 Q4 权重或 64 元素分块 INT8 权重，与按组 int8 激活做整数点积；x86_64 AVX2 内核与原生线程池，与标量路径逐位一致；RoPE 与指数函数使用不依赖平台 libm 的实现 |
 | 会话 | 多 token prefill、单 token decode、KV Cache 几何增长与容量复用、reset、EOS 停止 |
 | 采样 | 贪心、temperature、top-k、top-p；可复现的 SplitMix64 随机序列 |
 | 调用接口 | Rust API 与版本为 1 的 WASM／原生 C ABI；模型可整块从内存加载，或按声明的总长度分块流式加载；会话独立持有权重生命周期 |
@@ -401,15 +401,15 @@ console.log("识别结果：", logits.argmax());
 
 CI 验收覆盖仓库生成的 tiny decoder 和 6 个 Hugging Face 合成小模型。Qwen3-0.6B 的 f32 导出另在本地完成了短序列的原生／WASM／Hugging Face 对拍，见[分块加载与真实模型本地对拍](#分块加载与真实模型本地对拍)；该结果不属于 CI 门禁，也不代表该模型已通过长上下文、Tokenizer 或性能验收。Qwen3-1.7B 与 MNN-Pocket-0.3B 另有本地测评或对比结果（见[决策记录](docs/decisions.md)），同样未纳入 CI；其他公开尺寸的 Llama 或 Qwen 模型尚未验证。架构兼容与模型支持必须分别验证。
 
-### ncnn 后端与优化边界
+### 原生实现与对照基准
 
-- **默认复用通用能力**：嵌入、矩阵乘、归一化、注意力和 KV Cache 优先使用 ncnn 已支持的 WASM 实现，不再为部署后端重复编写通用算子。Rust 侧负责版本化 ABI、模型与会话管理；如需额外 C/C++ 桥接，由人类按仓库约定维护。
-- **保留参考后端**：当前 Rust 标量路径作为数值参考和最小验收工具，不作为高性能部署承诺。ncnn 后端接入后，需在同一模型与输入上与参考后端逐层或分阶段对拍。
-- **分离构建能力**：ncnn 的基础、WASM SIMD 与多线程构建分别声明和验收，不能把某一构建的结果外推到全部浏览器。
-- **按热点优化**：先分别测量 prefill 延迟、decode ms/token、tokens/s、峰值内存和模块体积，再针对表现不达标的 GEMM、注意力、KV Cache 或采样路径增加自定义 WASM kernel；通用路径不因预设判断而重写。
-- **优化必须可验收**：自定义 kernel 需保留回退路径，并通过标量参考对拍和同输入基准；至少报告相对 ncnn 基线的延迟、吞吐与内存变化。
+- **原生实现**：常见量化格式与训练、推理、实时进化、传统 CNN 等能力都在本项目中原生实现，不把 ncnn 等外部框架作为默认计算后端。实现方式不设限制，以结果为准。
+- **外部框架作为对照**：ncnn、ncnn_llm、ncnn-MoE-Runtime 与 llama.cpp 用作参考和速度基线，比较时尽量运行同一模型、同一输入与同一线程数；llm.asm、unkernel 只参考代码与优化方法（unkernel 用于 WASM），不做性能比较。
+- **分离构建能力**：原生 SIMD、WASM 标量、WASM SIMD 与多线程分别声明和验收，不能把某一构建的结果外推到全部目标。
+- **按热点优化**：先分别测量 prefill 延迟、decode ms/token、tokens/s、峰值内存和模块体积，再针对不达标的 GEMM、注意力、KV Cache 或采样路径优化。
+- **优化必须可验收**：自定义 kernel 保留标量回退路径，与标量参考逐位或在声明的容差内对拍，并用同输入基准报告延迟、吞吐与内存变化。
 
-当前尚未完成 ncnn 后端接入和性能基准，因此本节为实施边界，不是已有性能结果。
+本机的对照结果记录在[决策记录](docs/decisions.md)。
 
 ### 构建与验收
 
@@ -555,6 +555,14 @@ python3 tools/distill_q4_llm.py --model model/Qwen3-0.6B --input tmp/qwen3-0.6b-
 | GPTQ | 0.849 | 0.137 | 1.066 |
 | GPTQ + 蒸馏（当前） | 0.859 | 0.111 | 1.020 |
 
+### INT8 分块权重
+
+模型 flags 的第 5 位（值 32）表示 INT8 权重：7 个投影矩阵（q、k、v、o、gate、up、down）按块量化，每块一个 f32 还原系数，码限制在 [-127, 127]，还原值为 `码 × 还原系数`。默认每 64 个元素一块，与 ncnn 的 weight block quant（8 bit、block_size 64）相同；第 6 位（值 64）把块长改为 32，与 GGUF 的 Q8_0 相同（Q8_0 的 f16 系数无损展开成 f32）；第 7 位（值 128）让嵌入与 LM Head 也用同样的 INT8 分块，否则它们与 Norm、bias 一样为 f32。第 6、7 位只能与第 5 位一起使用，INT8 与 Q4（第 4 位）不能同时使用。每个 INT8 矩阵依次保存两段数据：`rows × blocks` 个 f32 还原系数，`rows × blocks × 块长` 个 int8 码（每行补零到整块）。
+
+推理时线性层的输入按同样的块长量化为 int8（还原系数为块内 absmax / 127，码四舍五入远离零，与 ncnn 和 llama.cpp 相同；x86_64 用 AVX2 量化，与标量逐位一致）。载入时 INT8 矩阵改排成面板：每 8 行一组，按列每 4 个一步，一步 32 字节。x86_64 检测到 AVX2 时，每步读一次权重，供最多 4 个 token 共用，每个 token 把 4 个激活码广播到 8 行，用 `vpsignb`／`vpmaddubsw`／`vpmaddwd` 求整数点积，8 个 lane 分别累加 8 行；块末每行乘以 `权重系数 × 激活系数` 后累加。每块的整数点积是精确的，标量路径（包括 WASM）按同样的块顺序累加，与 AVX2 路径逐位一致，也与分组和 token 分块无关。INT8 模型的 KV Cache 默认为 f16。
+
+模型可从两处原样转换（见[模型说明](docs/models.md)）：`tools/ncnn_int8_to_nncoss.py` 读取 ncnn_llm 的 INT8 Qwen3 模型（块长 64），`tools/gguf_to_nncoss.py` 读取 Qwen3 结构的 GGUF（Q8_0 写成块长 32 的 INT8，F32／F16／BF16 写成 f32，嵌入与输出层字节相同时写成共用 LM Head）。`export_llm.py` 还不能直接导出 INT8；`nncoss-edit` 拒绝 INT8 模型；WASM 的 INT8 路径能运行，但尚未做 SIMD 优化，也未纳入原生／WASM 对拍。
+
 ### 命令行对话（原生与 WASM）
 
 `tools/run_qwen3.py` 是直接输入文字的 Python 辅助宿主，复用 `nncoss-llm` 的原生动态库或 WASM 流式 ABI，不是独立语言绑定。`--target` 默认为 `wasm`，`--tokenizer` 默认为模型同目录的 `tokenizer.json`；不传 `--model` 时默认读取本地导出的 Qwen3-0.6B f32，因此使用已发布 Q4 应显式传入模型路径。
@@ -600,6 +608,14 @@ python3 tools/bench_wasm_llm.py --preset small
 传入 `--model` 时改为测量真实模型：`--prompt`、`--decode` 设置 token 数，默认使用 temperature 0.6／top-k 20／top-p 0.95 采样，`--greedy` 改为贪心；输出 decode 的中位与最佳 tokens/s。`--tokens FILE` 从文件读取逗号或空白分隔的 prompt token；`--generate` 改为比较关闭与开启推测解码时 `Session::generate` 的速度，`--eos` 指定停止 token，贪心时同时检查两者输出是否一致。`--kv f32|f16|i8` 指定 KV Cache 精度；`--kv-compare` 配合 `--tokens` 以 f32 KV Cache 为参照，逐位置比较 f16 与 int8 的下一个 token 分布。`--sparsity SPEC` 启用 decode 时的输入通道稀疏化；`--sparsity-compare SPEC`（可重复）配合 `--tokens` 以完整计算为参照比较各稀疏设置。`examples/sparse_read.rs` 单独测量按块随机跳读内存时能省下多少时间。
 
 基准用于记录基线与优化前后的对比，结果依赖具体机器，不构成性能承诺，也不纳入 CI 门禁。WASM 脚本的 decode 计时包含 Python 宿主逐 token 调用的开销。
+
+在同一台 Intel Core i7-9750H 上，用逐位相同的权重与 llama.cpp、ncnn_llm、ncnn-MoE-Runtime 比较的结果见[速度对比](docs/benchmarks.md)。下表摘录 6 线程、256 token 提示、贪心生成 64 个 token 时的速度，单位为 tokens/s：
+
+| 模型（同一份权重） | nncoss prefill / decode | 对照 prefill / decode |
+|---|---|---|
+| MNN-Pocket-0.3B Q8_0 | 445–466 / 79–80 | llama.cpp 290–309 / 69–72 |
+| Qwen3-0.6B Q8_0 | 276 / 38–41 | llama.cpp 180–207 / 32–36 |
+| Qwen3-0.6B INT8（ncnn） | 307 / 27–28 | ncnn_llm 397–401 / 17；加上 LM Head 修正后 396–397 / 30 |
 
 ### 导出模型
 

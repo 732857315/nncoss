@@ -62,6 +62,10 @@ fn write_f32(bytes: &mut [u8], offset: usize, value: f32) {
 impl ModelFile {
     pub fn parse(bytes: Vec<u8>) -> Result<Self, String> {
         let (config, tensors) = tensor_layout(&bytes).map_err(|error| error.to_string())?;
+        if config.int8 {
+            // 编辑操作按 f32 或 Q4 的字节布局改写权重，INT8 布局尚未实现。
+            return Err("INT8 模型暂不支持编辑".to_string());
+        }
         let end = tensors
             .last()
             .map(|tensor| tensor.offset + tensor.byte_count)

@@ -1,6 +1,7 @@
 use std::ops::Range;
 
 use crate::pool::{SharedPtr, parallel_for};
+use crate::q8::{Activation8, Q8Matrix};
 use crate::{Error, Result};
 
 pub(crate) const GROUP_SIZE: usize = 32;
@@ -18,6 +19,7 @@ const MAX_JOBS: usize = 3;
 pub(crate) enum Weight {
     F32(Vec<f32>),
     Q4(Q4Matrix),
+    Q8(Q8Matrix),
 }
 
 impl Default for Weight {
@@ -32,6 +34,7 @@ impl Weight {
         match self {
             Self::F32(values) => values.iter().all(|value| *value == 0.0),
             Self::Q4(matrix) => (0..matrix.rows).all(|row| matrix.row_scale(row) == 0.0),
+            Self::Q8(matrix) => matrix.is_zero(),
         }
     }
 
@@ -39,6 +42,15 @@ impl Weight {
         match self {
             Self::F32(values) => values,
             Self::Q4(matrix) => {
+                let mut output = vec![0.0; matrix.rows * matrix.columns];
+                if matrix.columns > 0 {
+                    for (row, values) in output.chunks_exact_mut(matrix.columns).enumerate() {
+                        matrix.dequantize_row(row, values);
+                    }
+                }
+                output
+            }
+            Self::Q8(matrix) => {
                 let mut output = vec![0.0; matrix.rows * matrix.columns];
                 if matrix.columns > 0 {
                     for (row, values) in output.chunks_exact_mut(matrix.columns).enumerate() {
@@ -57,6 +69,7 @@ impl Weight {
                 output.copy_from_slice(&values[row * columns..(row + 1) * columns]);
             }
             Self::Q4(matrix) => matrix.dequantize_row(row, output),
+            Self::Q8(matrix) => matrix.dequantize_row(row, output),
         }
     }
 
@@ -377,6 +390,8 @@ pub(crate) struct Activation {
     codes: Vec<CodeBlock>,
     offsets: Vec<OffsetBlock>,
     scales: Vec<f32>,
+    /// INT8 权重使用的 64 元素分块激活，只在有 INT8 矩阵时量化。
+    pub(crate) int8: Activation8,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -541,10 +556,26 @@ pub(crate) fn linear_many(inputs: &[f32], activations: &mut [Activation], jobs: 
             activation.quantize(input);
         }
     }
+    let int8_block = jobs.iter().find_map(|job| match job.weight {
+        Weight::Q8(matrix) if !job.output.is_empty() => Some(matrix.block()),
+        _ => None,
+    });
+    if let Some(block) = int8_block {
+        // 同一次调用中的 INT8 矩阵共用一份激活量化，块长必须相同。
+        assert!(jobs.iter().all(|job| match job.weight {
+            Weight::Q8(matrix) => matrix.block() == block,
+            _ => true,
+        }));
+        for (activation, input) in activations.iter_mut().zip(inputs.chunks_exact(columns)) {
+            activation.int8.quantize(input, block);
+        }
+    }
     let total_rows: usize = jobs.iter().map(|job| job.output.len() / tokens).sum();
+    // 8 的倍数：INT8 矩阵按 8 行一组计算，任务从组的边界开始；其他格式逐行计算，不受影响。
     let chunk = total_rows
         .div_ceil(crate::pool::threads() * CHUNKS_PER_THREAD)
-        .max(1);
+        .max(1)
+        .next_multiple_of(8);
     let mut plans: [Option<Plan<'_>>; MAX_JOBS] = [None, None, None];
     let mut tasks = 0;
     let mut weights = 0_usize;
@@ -554,6 +585,7 @@ pub(crate) fn linear_many(inputs: &[f32], activations: &mut [Activation], jobs: 
         match job.weight {
             Weight::F32(values) => assert_eq!(values.len(), rows * columns),
             Weight::Q4(matrix) => assert!(matrix.rows == rows && matrix.columns == columns),
+            Weight::Q8(matrix) => assert!(matrix.rows == rows && matrix.columns == columns),
         }
         if let Some(bias) = job.bias {
             assert_eq!(bias.len(), rows);
@@ -593,6 +625,9 @@ pub(crate) fn linear_many(inputs: &[f32], activations: &mut [Activation], jobs: 
                 )
             },
             Weight::Q4(matrix) => unsafe {
+                matrix.compute_rows(activations, start..end, plan.bias, output, plan.rows)
+            },
+            Weight::Q8(matrix) => unsafe {
                 matrix.compute_rows(activations, start..end, plan.bias, output, plan.rows)
             },
         }

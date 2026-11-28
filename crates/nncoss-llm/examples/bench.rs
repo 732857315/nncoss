@@ -350,7 +350,7 @@ fn run_model(path: &str, options: &Options) -> Result<(), String> {
     println!("target: native ({})", std::env::consts::ARCH);
     println!(
         "model: {path} prompt={} decode={} iterations={} sampler={}",
-        options.prompt,
+        prompt.len(),
         options.decode,
         options.iterations,
         if options.greedy {
@@ -365,7 +365,7 @@ fn run_model(path: &str, options: &Options) -> Result<(), String> {
     );
     println!(
         "prefill_ms: {prefill:.2}  prefill_tok_s: {:.1}",
-        options.prompt as f64 / prefill * 1e3
+        prompt.len() as f64 / prefill * 1e3
     );
     println!(
         "decode_ms_per_token: {:.3}  decode_tok_s: {:.1}  best_decode_tok_s: {:.1}",

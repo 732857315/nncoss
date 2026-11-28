@@ -133,6 +133,58 @@ python3 tools/export_llm.py --model model/MNN-Pocket-0.3B-qat --output model/MNN
 
 对比方法与结果见[决策记录](decisions.md)。
 
+### Q8_0 模型（与 llama.cpp、ncnn-MoE-Runtime 同一份权重对比用）
+
+GGUF 的 Q8_0 每 32 个元素一块、每块一个 f16 系数，`tools/gguf_to_nncoss.py` 把它原样写成本项目块长 32 的 INT8（f16 系数无损展开成 f32，int8 码逐字节保留，嵌入与 LM Head 也是 INT8），三个框架因此运行同一份权重。本项目的系数是 f32，每 32 个元素多 2 字节，每个 token 要读的字节约多 6%。
+
+- **MNN-Pocket-0.3B**：直接使用官方的 Q8_0 GGUF（下载方式同上一节，文件名为 `MNN-Pocket-0.3B-Instruct-Q8_0.gguf`）。
+- **Qwen3-0.6B**：官方 GGUF 未在本机下载，改从本机的 Hugging Face 权重（`model/Qwen3-0.6B`）用 llama.cpp（8e23278）自带的转换器导出 BF16 GGUF，再量化成 Q8_0。转换环境需要 transformers 4.51 以上（本机为 4.57.6）、torch（Intel macOS 只有 2.2.2，需 numpy<2）与 sentencepiece 0.2.0；转换器自动使用 llama.cpp 源码中的 gguf-py。
+
+```bash
+python convert_hf_to_gguf.py model/Qwen3-0.6B --outtype bf16 --outfile model/Qwen3-0.6B-GGUF/qwen3-0.6b-bf16.gguf
+llama-quantize model/Qwen3-0.6B-GGUF/qwen3-0.6b-bf16.gguf model/Qwen3-0.6B-GGUF/qwen3-0.6b-q8_0.gguf Q8_0
+python3 tools/gguf_to_nncoss.py model/Qwen3-0.6B-GGUF/qwen3-0.6b-q8_0.gguf model/Qwen3-0.6B-GGUF/qwen3-0.6b-q8_0.nncossllm
+python3 tools/gguf_to_nncoss.py model/MNN-Pocket-0.3B-GGUF/MNN-Pocket-0.3B-Instruct-Q8_0.gguf model/MNN-Pocket-0.3B-GGUF/mnn-pocket-0.3b-q8_0.nncossllm
+```
+
+两个 GGUF 都另存了与嵌入字节完全相同的 `output.weight`，转换时写成共用 LM Head。
+
+| 文件 | 字节数 | SHA-256 |
+|---|---|---|
+| `Qwen3-0.6B-GGUF/qwen3-0.6b-bf16.gguf` | 1,509,347,264 | `39ad5cb0a0a33c358ad29b637ee96e05ef2450d0b2452810653ef3844e2ace3e` |
+| `Qwen3-0.6B-GGUF/qwen3-0.6b-q8_0.gguf` | 804,753,344 | `0586a13343ed9c8d4539087b325a78670a0c5396598118b5d1a71ee82587d44a` |
+| `Qwen3-0.6B-GGUF/qwen3-0.6b-q8_0.nncossllm` | 670,744,640 | `1f70080dc84d5106e9f02c6347d3ad145d999361fca618f09ad64989d2822c1f` |
+| `MNN-Pocket-0.3B-GGUF/MNN-Pocket-0.3B-Instruct-Q8_0.gguf` | 386,751,520 | `31eb5db92b2e02a80e9e3a9316aa83120cbee98e4f4a22ca19015ba601dbd690` |
+| `MNN-Pocket-0.3B-GGUF/mnn-pocket-0.3b-q8_0.nncossllm` | 340,842,048 | `0260e06c3ad08e095b9f22956c8f4ac41b453467bc46abbe13faced6ea0e85ce` |
+
+对比方法与结果见[决策记录](decisions.md)。
+
+### Qwen3-0.6B INT8（与 ncnn_llm 同一模型对比用）
+
+为了与 [ncnn_llm](https://github.com/futz12/ncnn_llm) 在同一个 INT8 模型上比较，本项目不自己量化，而是把 ncnn 模型库中的 `qwen3_0.6b_int8`（ncnn weight block quant：8 bit、每 64 个元素一块、minmax）原样转换成 INT8 格式（见 README 的 [INT8 分块权重](../README.md#int8-分块权重)）。7 个投影矩阵的 int8 码逐字节保留，ncnn 每块的 scale（还原值 = 码 / scale）换成还原系数 1/scale；RMSNorm 权重原样保留；嵌入在 ncnn 中为 bf16，展开成 f32（无损），与 LM Head 共用。
+
+ncnn_llm 从这个模型的 `model.json` 读取 RoPE theta，值为 100000；Qwen3-0.6B 原版 `config.json` 为 1000000。为了让两边计算同一个函数，转换默认使用 ncnn_llm 实际用的 100000，可用 `--rope-theta` 改回原版的值。
+
+```bash
+for f in model.json qwen3_decoder.ncnn.param qwen3_decoder.ncnn.bin qwen3_embed_token.ncnn.bin qwen3_proj_out.ncnn.param; do
+  curl -L -C - -o model/qwen3_0.6b_int8/$f https://mirrors.sdu.edu.cn/ncnn_modelzoo/qwen3_0.6b_int8/$f
+done
+python3 tools/ncnn_int8_to_nncoss.py model/qwen3_0.6b_int8 model/Qwen3-0.6B-ncnn-int8/qwen3-0.6b-ncnn-int8.nncossllm
+```
+
+转换需要 numpy。脚本解析 ncnn 的 param，按层读取 bin，检查每个矩阵的形状，并要求 bin 恰好读完。
+
+| 文件 | 字节数 | SHA-256 |
+|---|---|---|
+| `qwen3_0.6b_int8/model.json` | 1,727 | `33e433565ba3fb4982c8bf854e64f62952a6193ce94c26154f82bc1ae1ed6ee5` |
+| `qwen3_0.6b_int8/qwen3_decoder.ncnn.param` | 69,902 | `c71fac81c6afc3250cd88611dd2ab6c1aabe60a015a086a634b0f9ff0cd6b22d` |
+| `qwen3_0.6b_int8/qwen3_decoder.ncnn.bin` | 468,189,184 | `d625e72d8d4bc2d0557e3f96ccc85720e31b44a3cd78b74d01041e5492fd4c54` |
+| `qwen3_0.6b_int8/qwen3_embed_token.ncnn.bin` | 311,164,932 | `297c38d88b9a0196016090f18ac0b84b8975566233bdafc2f610048d8c64cb5b` |
+| `qwen3_0.6b_int8/qwen3_proj_out.ncnn.param` | 179 | `f541d86b9c837bc2718edfacca1ae5e21607f8bf5fdf0f20612386654cb86ca8` |
+| `Qwen3-0.6B-ncnn-int8/qwen3-0.6b-ncnn-int8.nncossllm` | 1,090,519,104 | `70e18ed6e8f9097d4392144ce06e37edf424bb36d4803b6c83d24cf02c00de31` |
+
+对比方法与结果见[决策记录](decisions.md)。
+
 ## 直接改写权重得到的模型
 
 `nncoss-edit` 按改动计划改写 Q4 文件中的行 scale 或删除整层，几秒内完成，结果是确定的。用法见 [README](../README.md#知识库与权重改写实验)。目前保留的改写模型：

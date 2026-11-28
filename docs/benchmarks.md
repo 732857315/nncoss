@@ -13,7 +13,7 @@
 
 ## 方法
 
-- **同一份权重**：每组对比里各框架运行的权重逐位相同。
+- **同一份权重**：每组对比里各框架运行的权重逐位相同。nncoss 用的三个 `.nncossllm` 文件与 Qwen3-0.6B 的 Q8_0 GGUF 已发布到 Hugging Face，下载命令见[模型说明](models.md#已发布模型与数据集)。
   - **Q8_0 组**：llama.cpp 与 ncnn-MoE-Runtime 直接读 GGUF，nncoss 读由 `tools/gguf_to_nncoss.py` 原样转换的文件。
   - **INT8 组**：ncnn_llm 读 ncnn 模型库的 `qwen3_0.6b_int8`，nncoss 读由 `tools/ncnn_int8_to_nncoss.py` 原样转换的文件。
 - **各用自带的基准**：
@@ -65,10 +65,10 @@
 
 ## 结论
 
-- **与 llama.cpp 比（同一份 Q8_0 权重）**：nncoss 的 prefill 在 6 线程下快约 1.4–1.5 倍，1 线程快约 1.3 倍；decode 在 6 线程下快 12–16%，1 线程约快一倍。
+- **与 llama.cpp 比（同一份 Q8_0 权重）**：nncoss 的 prefill 在 6 线程下是 llama.cpp 的 1.3–1.5 倍，1 线程约为 1.3 倍；decode 在 6 线程下快 9–17%，1 线程约为 llama.cpp 的 1.9–2.0 倍。
 - **与 ncnn_llm 比（同一个 INT8 模型）**：
-  - 两边的 LM Head 都读 622 MB 的 f32 时，nncoss 的 decode 在 6 线程下快约 1.6 倍。
+  - 两边的 LM Head 都读 622 MB 的 f32 时，nncoss 的 decode 在 6 线程下约为 ncnn_llm 的 1.6 倍。
   - ncnn_llm 加上 #61 后 LM Head 改读 bf16，每个 token 少读 311 MB，decode 反超 nncoss 约 10%。nncoss 的 INT8 模型目前 LM Head 只能是 f32。
-  - prefill 仍是 ncnn_llm 快，6 线程约 1.3 倍，1 线程约 1.1 倍。
-- **ncnn-MoE-Runtime**：在这台机器上明显慢。#28 让 decode 快 4–5 倍，但 prefill 仍把量化权重还原成 f32 再做 f32 GEMM，比其他框架慢 4–6 倍。
+  - prefill 仍是 ncnn_llm 快，6 线程约为 nncoss 的 1.3 倍，1 线程约为 1.1 倍。
+- **ncnn-MoE-Runtime**：在这台机器上明显慢。#28 让 decode 提高到原来的 3.8–5.4 倍，但 prefill 仍把量化权重还原成 f32 再做 f32 GEMM，只有其他框架的 1/4 到 1/6 左右。
 - **误差范围**：机器负载变化时，同一格两轮相差可达约 15%，小于这个幅度的差别不应解读。

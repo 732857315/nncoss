@@ -609,6 +609,14 @@ python3 tools/bench_wasm_llm.py --preset small
 
 基准用于记录基线与优化前后的对比，结果依赖具体机器，不构成性能承诺，也不纳入 CI 门禁。WASM 脚本的 decode 计时包含 Python 宿主逐 token 调用的开销。
 
+在同一台 Intel Core i7-9750H 上，用逐位相同的权重与 llama.cpp、ncnn_llm、ncnn-MoE-Runtime 比较的结果见[速度对比](docs/benchmarks.md)。下表摘录 6 线程、256 token 提示、贪心生成 64 个 token 时的速度，单位为 tokens/s：
+
+| 模型（同一份权重） | nncoss prefill / decode | 对照 prefill / decode |
+|---|---|---|
+| MNN-Pocket-0.3B Q8_0 | 445–466 / 79–80 | llama.cpp 290–309 / 69–72 |
+| Qwen3-0.6B Q8_0 | 276 / 38–41 | llama.cpp 180–207 / 32–36 |
+| Qwen3-0.6B INT8（ncnn） | 307 / 27–28 | ncnn_llm 397–401 / 17；加上 LM Head 修正后 396–397 / 30 |
+
 ### 导出模型
 
 `tools/export_llm.py` 将具有常见 Llama／Qwen 权重命名的本地 safetensors 模型转换为 `.nncossllm`。导出环境需要 `torch` 与 `safetensors`：
